@@ -41,7 +41,7 @@ LOCAL_WORK_SIZE = 256 # Optimal size for many modern GPUs (multiple of 32/64)
 # BATCH SIZE FOR WORDS: Increased for better throughput on large wordlists
 WORDS_PER_GPU_BATCH = 100000
 
-# Global Uniqueness Map Parameters (Targeting ~2.1 GB VRAM for 8GB cards)
+# Global Uniqueness Map Parameters (Targeting ~4.2 GB VRAM for 8GB cards)
 GLOBAL_HASH_MAP_BITS = 35
 GLOBAL_HASH_MAP_WORDS = 1 << (GLOBAL_HASH_MAP_BITS - 5)
 GLOBAL_HASH_MAP_BYTES = GLOBAL_HASH_MAP_WORDS * np.uint32(4)
