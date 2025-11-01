@@ -54,19 +54,22 @@ wget https://github.com/A113L/ranker.py/raw/refs/heads/main/ranker.py
 The script is executed via the command line and requires five primary arguments:
 
 ```
-usage: ranker.py [-h] [--top-k TOP_K] wordlist rules cracked output
+usage: ranker.py [-h] -w WORDLIST -r RULES -c CRACKED [-o OUTPUT] [-k TOP_K]
 
-GPU-Accelerated Hashcat Rule Ranking Tool.
-
-positional arguments:
-  wordlist       Path to the base wordlist file.
-  rules          Path to the hashcat rules file.
-  cracked        Path to the cracked passwords list for effectiveness scoring.
-  output         Path for the output optimized rule file (e.g., optimized.rule).
+RANKER v2.8: GPU-Accelerated Hashcat Rule Ranking Tool (PyOpenCL)
 
 options:
-  -h, --help     show this help message and exit
-  --top-k TOP_K  Number of top rules to save in the optimized rule file.
+  -h, --help            show this help message and exit
+  -w WORDLIST, --wordlist WORDLIST
+                        Path to the base wordlist file.
+  -r RULES, --rules RULES
+                        Path to the hashcat rules file (e.g., best64.rule).
+  -c CRACKED, --cracked CRACKED
+                        Path to the list of cracked passwords (used for effectiveness scoring).
+  -o OUTPUT, --output OUTPUT
+                        Base name for the output rule file and ranking CSV.
+  -k TOP_K, --top_k TOP_K
+                        Number of top-ranked rules to include in the optimized output file.
 
 ```
 📊 **Output**
