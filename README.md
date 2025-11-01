@@ -37,7 +37,7 @@ Required Python Packages:
 
 Clone the Repository (or save the script):
 
-wget https://github.com/A113L/ranker.py/raw/refs/heads/main/ranker.py
+```wget https://github.com/A113L/ranker.py/raw/refs/heads/main/ranker.py```
 
 *Verify OpenCL:* Ensure pyopencl is installed and can detect your GPU.
 
