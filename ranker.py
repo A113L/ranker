@@ -11,6 +11,7 @@ import os
 # --- WARNING FILTERS ---
 warnings.filterwarnings("ignore", message="overflow encountered in scalar multiply")
 try:
+    # --- PYOPENCL FIX: Removed 'pyopencl.ENABLE_PROFILING' reference if it existed ---
     warnings.filterwarnings("ignore", category=cl.CompilerWarning)
 except AttributeError:
     # Handle case where pyopencl.CompilerWarning is not available
@@ -24,7 +25,7 @@ MAX_WORD_LEN = 32
 MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
 MAX_RULE_ARGS = 2
 MAX_RULES_IN_BATCH = 128
-LOCAL_WORK_SIZE = 256
+LOCAL_WORK_SIZE = 256 # Optimal size for many modern GPUs (multiple of 32/64)
 
 # BATCH SIZE FOR WORDS: Increased for 8GB VRAM stability and efficiency
 WORDS_PER_GPU_BATCH = 50000
@@ -53,6 +54,7 @@ NUM_A_RULES = 3 * 256
 # ====================================================================
 
 # --- KERNEL SOURCE (OpenCL C) ---
+# __attribute__ added for better performance scheduling on modern GPUs
 KERNEL_SOURCE = f"""
 // FNV-1a Hash implementation in OpenCL
 unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
@@ -64,7 +66,8 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
     return hash;
 }}
 
-__kernel void hash_map_init_kernel(
+__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
+void hash_map_init_kernel(
     __global unsigned int* global_hash_map,
     __global const unsigned int* base_hashes,
     const unsigned int num_hashes,
@@ -85,7 +88,8 @@ __kernel void hash_map_init_kernel(
 }}
 
 
-__kernel void bfs_kernel(
+__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
+void bfs_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned int* rules_in,
     __global unsigned int* rule_uniqueness_counts,
@@ -150,7 +154,7 @@ __kernel void bfs_kernel(
         result_temp[i] = 0;
     }}
 
-    // --- START: Rule Application Logic (Copy from original source) ---
+    // --- START: Rule Application Logic (Original Code) ---
     
     if (rule_id >= start_id_simple && rule_id < end_id_simple) {{
     
@@ -406,7 +410,7 @@ __kernel void bfs_kernel(
         }}
     }}
     
-    // --- END: Rule Application Logic (Copy from original source) ---
+    // --- END: Rule Application Logic (Original Code) ---
 
 
     // --- Dual-Uniqueness Logic on GPU (Modified) ---
@@ -434,7 +438,7 @@ __kernel void bfs_kernel(
             unsigned int cracked_map_index = (word_hash >> 5) & cracked_map_mask;
             __global const unsigned int* cracked_map_ptr = (__global const unsigned int*)&cracked_hash_map[cracked_map_index];
 
-            // Read the cracked map value (No atomic read needed as it's READ_ONLY)
+            // Read the cracked map value (READ_ONLY, no atomic needed)
             unsigned int current_cracked_word = *cracked_map_ptr;
 
             // If the word IS in the cracked list (i.e., we found a "true crack")
@@ -533,7 +537,7 @@ def save_ranking_data(ranking_list, output_path):
     """
     Saves the scoring and ranking data to a separate CSV file and returns its path.
     """
-    # Creates the CSV filename based on the input rules file name
+    # The output_path is the final CSV path from CLI
     ranking_output_path = output_path
     
     print(f"Saving rule ranking data to: {ranking_output_path}...")
@@ -571,10 +575,10 @@ def save_ranking_data(ranking_list, output_path):
         print(f"❌ Error while saving ranking data to CSV file: {e}")
         return None
 
-def load_and_save_optimized_rules(csv_path, output_path, top_k=500):
+def load_and_save_optimized_rules(csv_path, output_path, top_k):
     """
     Loads ranking data from a CSV, re-sorts by Combined_Score, and saves the 
-    Top K rules to a new rule file.
+    Top K rules to a new rule file, prepending a colon.
     """
     if not csv_path:
         print("\nOptimization skipped: Ranking CSV path is missing.")
@@ -610,7 +614,11 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k=500):
     # Save to File
     try:
         with open(output_path, 'w', newline='\n', encoding='utf-8') as f:
+            # --- MODIFICATION: ADD COLON ---
+            f.write(":\n")
+            # --- END MODIFICATION ---
             for rule in final_optimized_list:
+                # NOTE: The rule data itself is already a string in the CSV
                 f.write(f"{rule['Rule_Data']}\n")
         print(f"✅ Top {len(final_optimized_list)} optimized rules saved successfully to {output_path}.")
     except Exception as e:
@@ -653,7 +661,7 @@ def wordlist_iterator(wordlist_path, max_len, batch_size):
 
 # --- MAIN RANKING FUNCTION (Optimized and Fixed) ---
 
-def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_output_path):
+def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k):
 
     # 1. OpenCL Initialization
     try:
@@ -663,7 +671,10 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
             devices = platform.get_devices(cl.device_type.ALL)
         device = devices[0]
         context = cl.Context([device])
-        queue = cl.CommandQueue(context)
+        
+        # NOTE: If you wanted profiling, the fixed line would be:
+        # queue = cl.CommandQueue(context, properties=cl.command_queue_properties.PROFILING_ENABLE)
+        queue = cl.CommandQueue(context) # Default, non-profiling queue
 
         rule_size_in_int = 2 + MAX_RULE_ARGS
 
@@ -765,6 +776,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         cl.enqueue_fill_buffer(queue, global_hash_map_g, np.uint32(0), 0, global_hash_map_np.nbytes).wait()
 
         # --- GPU OPERATION 2: Populate Global Hash Map with Base Hashes ---
+        # Note: base_words_np_batch is already .ravel().copy() from the generator
         cl.enqueue_copy(queue, base_hashes_g, base_hashes_np_batch).wait()
 
         global_size_init = (int(math.ceil(num_words_batch / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
@@ -796,6 +808,7 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
                 encoded_rule = encoded_rules[rule_batch_idx_start + i]
                 rules_np_batch[i * rule_size_in_int : (i + 1) * rule_size_in_int] = encoded_rule
 
+            # Update Rules and Counters on GPU
             cl.enqueue_copy(queue, rules_in_g, rules_np_batch).wait()
             cl.enqueue_copy(queue, rule_uniqueness_counts_g, rule_uniqueness_counts_np).wait()
             cl.enqueue_copy(queue, rule_effectiveness_counts_g, rule_effectiveness_counts_np).wait()
@@ -819,77 +832,56 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
                                    np.uint32(GLOBAL_HASH_MAP_MASK),
                                    np.uint32(CRACKED_HASH_MAP_MASK))
             
-            event_bfs.wait()
+            event_bfs.wait() # Synchronize execution
 
-            # B3. Read back counters and aggregate
+            # B3. Read results back to host
             cl.enqueue_copy(queue, rule_uniqueness_counts_np, rule_uniqueness_counts_g).wait()
             cl.enqueue_copy(queue, rule_effectiveness_counts_np, rule_effectiveness_counts_g).wait()
 
+            # B4. Accumulate scores to the main rules list
             for i in range(current_batch_size):
-                global_rule_idx = rule_batch_idx_start + i
-                rules_list[global_rule_idx]['uniqueness_score'] += rule_uniqueness_counts_np[i]
-                rules_list[global_rule_idx]['effectiveness_score'] += rule_effectiveness_counts_np[i]
-                total_cracked_found += rule_effectiveness_counts_np[i] # Aggregate host counter
-
-        # Update progress bar
+                rule_idx = rule_batch_idx_start + i
+                rules_list[rule_idx]['uniqueness_score'] += rule_uniqueness_counts_np[i]
+                rules_list[rule_idx]['effectiveness_score'] += rule_effectiveness_counts_np[i]
+                total_cracked_found += rule_effectiveness_counts_np[i]
+        
+        # C. Update progress bar for word batch completion
         words_processed_total += num_words_batch
-        word_batch_pbar.set_description(f"Processing wordlist from disk [Cracked: {total_cracked_found:,}]")
         word_batch_pbar.update(num_words_batch)
+        word_batch_pbar.set_description(f"Processing wordlist from disk [Cracked: {total_cracked_found:,}]")
 
     word_batch_pbar.close()
-
-    # 8. Final Results and Output
-    print("\nProcessing complete. Aggregating results...")
     
-    # Save ranking data to the specified CSV output file
-    ranking_csv_path = save_ranking_data(rules_list, ranking_output_path)
+    # 8. Final Output
+    print("\n--- Finalizing Results ---")
     
-    return ranking_csv_path
-
-
-# --- MAIN EXECUTION BLOCK ---
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="GPU-accelerated wordlist rule ranking and optimization tool.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    # Required arguments for file paths
-    parser.add_argument('-w', '--wordlist', required=True, help="Path to the base **wordlist** file.")
-    parser.add_argument('-r', '--rules', required=True, help="Path to the **rule** file to be ranked.")
-    parser.add_argument('-c', '--cracked', required=True, help="Path to the **cracked** password list (for effectiveness score).")
+    # Save the full ranking to CSV
+    csv_path = save_ranking_data(rules_list, ranking_output_path)
     
-    # Optional arguments for output and optimization
-    parser.add_argument('-t', '--top-k', type=int, default=500,
-                        help="The number of **top** rules to save to the optimized file (default: 500).")
-    parser.add_argument('-o', '--output', 
-                        help="Base output filename (e.g., 'rules_ranked').\n"
-                             "Will create:\n"
-                             "  - 'rules_ranked.csv' (Full ranking/scores)\n"
-                             "  - 'rules_ranked_optimized.rule' (Top K rules)",
-                        default='ranked_output')
-
-    args = parser.parse_args()
-    
-    # Define output file paths based on the base output name
-    ranking_csv_path = args.output + '.csv'
-    optimized_rules_path = args.output + '_optimized.rule'
-
-    # Run the main ranking process
-    final_ranking_csv_path = rank_rules_uniqueness(
-        args.wordlist, 
-        args.rules, 
-        args.cracked, 
-        ranking_csv_path
-    )
-
-    # If ranking was successful, perform optimization
-    if final_ranking_csv_path:
-        load_and_save_optimized_rules(
-            final_ranking_csv_path, 
-            optimized_rules_path, 
-            top_k=args.top_k
-        )
+    # Generate the name for the optimized rules file based on the CSV output path
+    optimized_rules_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
+    load_and_save_optimized_rules(csv_path, optimized_rules_path, top_k)
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Rule Ranking and Optimization Tool.")
+    parser.add_argument('-w', '--wordlist', type=str, required=True, help='Path to the base wordlist file.')
+    parser.add_argument('-r', '--rules', type=str, required=True, help='Path to the hashcat rules file (e.g., best64.rule).')
+    parser.add_argument('-c', '--cracked-list', type=str, required=True, help='Path to a list of known cracked passwords (for effectiveness score).')
+    parser.add_argument('-o', '--output-csv', type=str, required=True, help='Path to save the final CSV ranking data (optimized rule file derived from this path).')
+    parser.add_argument('-t', '--top-k', type=int, default=500, help='Number of top rules to extract and save to the optimized rule file. Default is 500.')
+
+    args = parser.parse_args()
+
+    # Final check on file paths
+    if not os.path.exists(args.wordlist):
+        print(f"Error: Wordlist file not found at {args.wordlist}")
+        exit(1)
+    if not os.path.exists(args.rules):
+        print(f"Error: Rules file not found at {args.rules}")
+        exit(1)
+        
+    # The cracked list may not exist, which is handled in load_cracked_hashes
+
+    rank_rules_uniqueness(args.wordlist, args.rules, args.cracked_list, args.output_csv, args.top_k)
+    
+    print("\nProcess finished.")
