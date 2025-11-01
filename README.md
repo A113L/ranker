@@ -96,4 +96,4 @@ This file should be used in subsequent cracking attempts for maximal efficiency.
 
 **Credits:**
 
-0xVavaldi for inspiration
+0xVavaldi for inspiration - https://github.com/0xVavaldi
