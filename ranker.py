@@ -15,7 +15,7 @@ from time import time
 # and effectiveness against a list of cracked passwords, leveraging PyOpenCL
 # for high-performance GPU processing.
 #
-# Features: Full Hashcat rule support including Group B rules (p, {, }, [, ], x, O, i, o, ', z, Z, q)
+# Features: Full Hashcat rule support including Group B rules and new comprehensive rules
 # ====================================================================
 
 # --- WARNING FILTERS ---
@@ -32,7 +32,7 @@ except AttributeError:
 # ====================================================================
 MAX_WORD_LEN = 32
 MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
-MAX_RULE_ARGS = 3  # Increased for new rules that need 3 arguments
+MAX_RULE_ARGS = 4  # Increased for new rules that need more arguments
 MAX_RULES_IN_BATCH = 128
 LOCAL_WORK_SIZE = 256
 
@@ -50,8 +50,10 @@ START_ID_S = 30
 NUM_S_RULES = 256 * 256
 START_ID_A = 30 + NUM_S_RULES
 NUM_A_RULES = 3 * 256
-START_ID_NEW = START_ID_A + NUM_A_RULES
-NUM_NEW_RULES = 545  # Count of new Group B rules
+START_ID_GROUPB = START_ID_A + NUM_A_RULES
+NUM_GROUPB_RULES = 13  # p, {, }, [, ], x, O, i, o, ', z, Z, q
+START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
+NUM_NEW_RULES = 13  # K, *NM, LN, RN, +N, -N, .N, ,N, yN, YN, E, eX, 3NX
 # ====================================================================
 
 # --- KERNEL SOURCE (OpenCL C) with Comprehensive Hashcat Rules ---
@@ -134,6 +136,8 @@ void bfs_kernel(
     unsigned int end_id_s = start_id_s + {NUM_S_RULES};
     unsigned int start_id_A = {START_ID_A};
     unsigned int end_id_A = start_id_A + {NUM_A_RULES};
+    unsigned int start_id_groupB = {START_ID_GROUPB};
+    unsigned int end_id_groupB = start_id_groupB + {NUM_GROUPB_RULES};
     unsigned int start_id_new = {START_ID_NEW};
     unsigned int end_id_new = start_id_new + {NUM_NEW_RULES};
 
@@ -147,6 +151,7 @@ void bfs_kernel(
     unsigned int rule_id = current_rule_ptr_int[0];
     unsigned int rule_args_int = current_rule_ptr_int[1]; // Arguments packed in uint32
     unsigned int rule_args_int2 = current_rule_ptr_int[2]; // Additional arguments for 3-arg rules
+    unsigned int rule_args_int3 = current_rule_ptr_int[3]; // Additional arguments for 4-arg rules
 
     unsigned int word_len = 0;
     for (unsigned int i = 0; i < max_word_len; i++) {{
@@ -167,6 +172,8 @@ void bfs_kernel(
     unsigned char arg1 = (unsigned char)((rule_args_int >> 8) & 0xFF);
     unsigned char arg2 = (unsigned char)((rule_args_int >> 16) & 0xFF);
     unsigned char arg3 = (unsigned char)(rule_args_int2 & 0xFF);
+    unsigned char arg4 = (unsigned char)((rule_args_int2 >> 8) & 0xFF);
+    unsigned char arg5 = (unsigned char)((rule_args_int2 >> 16) & 0xFF);
 
     // --- START: Comprehensive Rule Application Logic ---
     if (rule_id >= start_id_simple && rule_id < end_id_simple) {{
@@ -412,8 +419,8 @@ void bfs_kernel(
             out_len = temp_idx;
         }}
     }}
-    // --- START NEW GROUP B RULES ---
-    else if (rule_id >= start_id_new && rule_id < end_id_new) {{ 
+    // --- START GROUP B RULES ---
+    else if (rule_id >= start_id_groupB && rule_id < end_id_groupB) {{ 
         
         for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
         out_len = word_len;
@@ -616,7 +623,172 @@ void bfs_kernel(
         }}
 
     }}
-    // --- END NEW GROUP B RULES ---
+    // --- END GROUP B RULES ---
+    
+    // --- START NEW COMPREHENSIVE RULES ---
+    else if (rule_id >= start_id_new && rule_id < end_id_new) {{ 
+        
+        for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
+        out_len = word_len;
+
+        unsigned char cmd = arg0;
+        unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
+        unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
+        unsigned char X = arg2;
+        unsigned char separator = arg1;
+
+        if (cmd == 'K') {{ // 'K' (Swap last two characters)
+            if (word_len >= 2) {{
+                result_temp[word_len - 1] = current_word_ptr[word_len - 2];
+                result_temp[word_len - 2] = current_word_ptr[word_len - 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '*') {{ // '*NM' (Swap character at position N with character at position M)
+            if (N != 0xFFFFFFFF && M != 0xFFFFFFFF && N < word_len && M < word_len && N != M) {{
+                unsigned char temp = result_temp[N];
+                result_temp[N] = result_temp[M];
+                result_temp[M] = temp;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'L') {{ // 'LN' (Bitwise shift left character @ N)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_temp[N] = current_word_ptr[N] << 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'R') {{ // 'RN' (Bitwise shift right character @ N)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_temp[N] = current_word_ptr[N] >> 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '+') {{ // '+N' (ASCII increment character @ N by 1)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_temp[N] = current_word_ptr[N] + 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '-') {{ // '-N' (ASCII decrement character @ N by 1)
+            if (N != 0xFFFFFFFF && N < word_len) {{
+                result_temp[N] = current_word_ptr[N] - 1;
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == '.') {{ // '.N' (Replace character @ N with value at @ N plus 1)
+            if (N != 0xFFFFFFFF && N + 1 < word_len) {{
+                result_temp[N] = current_word_ptr[N + 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == ',') {{ // ',N' (Replace character @ N with value at @ N minus 1)
+            if (N != 0xFFFFFFFF && N > 0 && N < word_len) {{
+                result_temp[N] = current_word_ptr[N - 1];
+                changed_flag = true;
+            }}
+        }}
+        else if (cmd == 'y') {{ // 'yN' (Duplicate first N characters)
+            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
+                unsigned int total_len = word_len + N;
+                if (total_len < max_output_len) {{
+                    // Shift original word right by N positions
+                    for (int i = word_len - 1; i >= 0; i--) {{
+                        result_temp[i + N] = result_temp[i];
+                    }}
+                    // Duplicate first N characters at the beginning
+                    for (unsigned int i = 0; i < N; i++) {{
+                        result_temp[i] = current_word_ptr[i];
+                    }}
+                    out_len = total_len;
+                    changed_flag = true;
+                }}
+            }}
+        }}
+        else if (cmd == 'Y') {{ // 'YN' (Duplicate last N characters)
+            if (N != 0xFFFFFFFF && N > 0 && N <= word_len) {{
+                unsigned int total_len = word_len + N;
+                if (total_len < max_output_len) {{
+                    // Append last N characters
+                    for (unsigned int i = 0; i < N; i++) {{
+                        result_temp[word_len + i] = current_word_ptr[word_len - N + i];
+                    }}
+                    out_len = total_len;
+                    changed_flag = true;
+                }}
+            }}
+        }}
+        else if (cmd == 'E') {{ // 'E' (Title case)
+            // First lowercase everything
+            for (unsigned int i = 0; i < word_len; i++) {{
+                unsigned char c = current_word_ptr[i];
+                if (c >= 'A' && c <= 'Z') {{
+                    result_temp[i] = c + 32;
+                }} else {{
+                    result_temp[i] = c;
+                }}
+            }}
+            
+            // Then uppercase first letter and letters after spaces
+            bool capitalize_next = true;
+            for (unsigned int i = 0; i < word_len; i++) {{
+                if (capitalize_next && result_temp[i] >= 'a' && result_temp[i] <= 'z') {{
+                    result_temp[i] = result_temp[i] - 32;
+                    changed_flag = true;
+                }}
+                capitalize_next = (result_temp[i] == ' ');
+            }}
+            out_len = word_len;
+        }}
+        else if (cmd == 'e') {{ // 'eX' (Title case with custom separator)
+            // First lowercase everything
+            for (unsigned int i = 0; i < word_len; i++) {{
+                unsigned char c = current_word_ptr[i];
+                if (c >= 'A' && c <= 'Z') {{
+                    result_temp[i] = c + 32;
+                }} else {{
+                    result_temp[i] = c;
+                }}
+            }}
+            
+            // Then uppercase first letter and letters after custom separator
+            bool capitalize_next = true;
+            for (unsigned int i = 0; i < word_len; i++) {{
+                if (capitalize_next && result_temp[i] >= 'a' && result_temp[i] <= 'z') {{
+                    result_temp[i] = result_temp[i] - 32;
+                    changed_flag = true;
+                }}
+                capitalize_next = (result_temp[i] == separator);
+            }}
+            out_len = word_len;
+        }}
+        else if (cmd == '3') {{ // '3NX' (Toggle case after Nth instance of separator char)
+            unsigned int separator_count = 0;
+            unsigned int target_count = N;
+            unsigned char sep_char = X;
+            
+            if (target_count != 0xFFFFFFFF) {{
+                for (unsigned int i = 0; i < word_len; i++) {{
+                    if (current_word_ptr[i] == sep_char) {{
+                        separator_count++;
+                        if (separator_count == target_count && i + 1 < word_len) {{
+                            // Toggle the case of the character after the separator
+                            unsigned char c = current_word_ptr[i + 1];
+                            if (c >= 'a' && c <= 'z') {{
+                                result_temp[i + 1] = c - 32;
+                                changed_flag = true;
+                            }} else if (c >= 'A' && c <= 'Z') {{
+                                result_temp[i + 1] = c + 32;
+                                changed_flag = true;
+                            }}
+                            break;
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+    // --- END NEW COMPREHENSIVE RULES ---
 
     // --- Dual-Uniqueness Logic on GPU ---
     if (changed_flag && out_len > 0) {{
@@ -645,6 +817,10 @@ void bfs_kernel(
     }}
 }}
 """
+
+# [The rest of your Python helper functions remain exactly the same...]
+# fnv1a_hash_32_cpu, get_word_count, load_rules, load_cracked_hashes, 
+# encode_rule, save_ranking_data, load_and_save_optimized_rules, wordlist_iterator
 
 # --- HELPER FUNCTIONS (Python) ---
 
@@ -716,11 +892,13 @@ def encode_rule(rule_str, rule_id, max_args):
     encoded[0] = np.uint32(rule_id)
     rule_chars = rule_str.encode('latin-1')
     args_int = 0
+    args_int2 = 0
     
     # Enhanced encoding for comprehensive rule support
     arg0 = 0
     arg1 = 0
     arg2 = 0
+    arg3 = 0
 
     if rule_str:
         # First character is the command
@@ -734,13 +912,21 @@ def encode_rule(rule_str, rule_id, max_args):
         # Third character (if exists)  
         if len(rule_chars) >= 3:
             arg2 = np.uint32(rule_chars[2])  # Directly use the byte value
+            
+        # Fourth character (if exists) - for rules like '3NX'
+        if len(rule_chars) >= 4:
+            arg3 = np.uint32(rule_chars[3])  # Directly use the byte value
     
     # Pack arguments into integers
     args_int |= arg0
     args_int |= (arg1 << 8)
     args_int |= (arg2 << 16)
     
+    args_int2 |= arg3
+    # Add more if needed for additional arguments
+    
     encoded[1] = np.uint32(args_int)
+    encoded[2] = np.uint32(args_int2)
     
     return encoded
 
