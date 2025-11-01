@@ -1,4 +1,4 @@
-🚀 **GPU-Accelerated Password Rule Ranker**
+🚀 **GPU-Accelerated Hashcat Rule Ranking Tool**
 
 The ranker.py script is a high-performance, GPU-accelerated tool designed to evaluate and rank Hashcat password generation rules. It uses PyOpenCL and NumPy to efficiently process massive wordlists and rule sets by leveraging parallel execution on the GPU.
 
