@@ -93,3 +93,6 @@ This CSV contains all processed rules, their scores, and the final ranking.
 This file is a ready-to-use Hashcat rule file containing the top K rules from the ranking, guaranteed to include the mandatory identity rule (:) at the top for maximum coverage.
 
 This file should be used in subsequent cracking attempts for maximal efficiency.
+
+**Credits:**
+0xVavaldi for inspiration
