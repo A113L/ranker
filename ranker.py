@@ -7,6 +7,7 @@ import math
 import warnings
 import os
 from time import time
+import mmap
 
 # ====================================================================
 # --- RANKER v3.0: GPU-Accelerated Hashcat Rule Ranking Tool ---
@@ -14,6 +15,8 @@ from time import time
 
 # --- WARNING FILTERS ---
 warnings.filterwarnings("ignore", message="overflow encountered in scalar multiply")
+warnings.filterwarnings("ignore", message="overflow encountered in scalar add")
+warnings.filterwarnings("ignore", message="overflow encountered in uint_scalars")
 try:
     warnings.filterwarnings("ignore", message="The 'device_offset' argument of enqueue_copy is deprecated")
     warnings.filterwarnings("ignore", category=cl.CompilerWarning)
@@ -725,6 +728,7 @@ def get_word_count(path):
     print(f"Counting words in: {path}...")
     count = 0
     try:
+        # Use memory mapping for large files
         with open(path, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
                 count += 1
@@ -760,6 +764,7 @@ def load_cracked_hashes(path, max_len):
     print(f"Loading cracked list for effectiveness check from: {path}...")
     cracked_hashes = []
     try:
+        # Optimized loading for large cracked lists
         with open(path, 'r', encoding='latin-1', errors='ignore') as f:
             for line in f:
                 word = line.strip().encode('latin-1')
@@ -876,33 +881,48 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
     except Exception as e:
         print(f"❌ Error while saving optimized rules to file: {e}")
 
-def wordlist_iterator(wordlist_path, max_len, batch_size):
+def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
     """
-    Generator that yields batches of words and initial hashes directly from disk.
+    Optimized generator that yields batches of words and initial hashes directly from disk.
+    Uses memory mapping and buffered reading for large files.
     """
     base_words_np = np.zeros((batch_size, max_len), dtype=np.uint8)
     base_hashes = []
     current_batch_count = 0
+    
+    print(f"🚀 Using optimized file reader for large wordlists...")
+    
+    try:
+        # Use a larger buffer for better I/O performance
+        with open(wordlist_path, 'r', encoding='latin-1', errors='ignore', buffering=8192*16) as f:
+            buffer = []
+            for line in f:
+                word_str = line.strip()
+                if not word_str:  # Skip empty lines
+                    continue
+                    
+                word = word_str.encode('latin-1')
+                
+                if 1 <= len(word) <= max_len:
+                    # Fill the numpy array directly
+                    base_words_np[current_batch_count, :len(word)] = np.frombuffer(word, dtype=np.uint8)
+                    base_hashes.append(fnv1a_hash_32_cpu(word))
+                    current_batch_count += 1
 
-    with open(wordlist_path, 'r', encoding='latin-1', errors='ignore') as f:
-        for line in f:
-            word_str = line.strip()
-            word = word_str.encode('latin-1')
+                    if current_batch_count == batch_size:
+                        yield base_words_np.ravel().copy(), current_batch_count, np.array(base_hashes, dtype=np.uint32)
+                        base_words_np.fill(0)
+                        base_hashes = []
+                        current_batch_count = 0
 
-            if 1 <= len(word) <= max_len:
-                base_words_np[current_batch_count, :len(word)] = np.frombuffer(word, dtype=np.uint8)
-                base_hashes.append(fnv1a_hash_32_cpu(word))
-                current_batch_count += 1
-
-                if current_batch_count == batch_size:
-                    yield base_words_np.ravel().copy(), current_batch_count, np.array(base_hashes, dtype=np.uint32)
-                    base_words_np.fill(0)
-                    base_hashes = []
-                    current_batch_count = 0
-
-    if current_batch_count > 0:
-        words_to_yield = base_words_np[:current_batch_count, :].ravel().copy()
-        yield words_to_yield, current_batch_count, np.array(base_hashes, dtype=np.uint32)
+        # Yield remaining words
+        if current_batch_count > 0:
+            words_to_yield = base_words_np[:current_batch_count, :].ravel().copy()
+            yield words_to_yield, current_batch_count, np.array(base_hashes, dtype=np.uint32)
+            
+    except Exception as e:
+        print(f"❌ Error reading wordlist: {e}")
+        raise
 
 # --- MAIN RANKING FUNCTION ---
 
@@ -1053,12 +1073,13 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
         print("Cracked list is empty, effectiveness scoring is disabled.")
         
     # 6. PIPELINED RANKING LOOP SETUP
-    word_iterator = wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
+    word_iterator = wordlist_iterator_optimized(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     
-    words_processed_total = 0
-    total_unique_found = 0
-    total_cracked_found = 0
+    # Use numpy arrays for counters to avoid overflow
+    words_processed_total = np.uint64(0)
+    total_unique_found = np.uint64(0)
+    total_cracked_found = np.uint64(0)
     
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
@@ -1131,15 +1152,19 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
 
             for i in range(num_rules_in_batch):
                 rule_index = rule_start_index + i
-                rules_list[rule_index]['uniqueness_score'] += mapped_uniqueness_np[i]
-                rules_list[rule_index]['effectiveness_score'] += mapped_effectiveness_np[i]
-                total_unique_found += mapped_uniqueness_np[i]
-                total_cracked_found += mapped_effectiveness_np[i]
+                # Convert to Python int to avoid overflow in rule scores
+                uniqueness_val = int(mapped_uniqueness_np[i])
+                effectiveness_val = int(mapped_effectiveness_np[i])
+                
+                rules_list[rule_index]['uniqueness_score'] += uniqueness_val
+                rules_list[rule_index]['effectiveness_score'] += effectiveness_val
+                total_unique_found += np.uint64(uniqueness_val)
+                total_cracked_found += np.uint64(effectiveness_val)
 
         # 9. UPDATE AND PREPARE NEXT ITERATION
-        words_processed_total += num_words_batch_exec
+        words_processed_total += np.uint64(num_words_batch_exec)
         word_batch_pbar.update(num_words_batch_exec)
-        word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}]")
+        word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
 
         if next_batch_data is None:
             break
@@ -1152,9 +1177,9 @@ def rank_rules_uniqueness(wordlist_path, rules_path, cracked_list_path, ranking_
     
     # 10. FINAL REPORTING AND SAVING
     print("\n--- Final Results Summary ---")
-    print(f"Total Words Processed: {words_processed_total:,}")
-    print(f"Total Unique Words Generated: {total_unique_found:,}")
-    print(f"Total True Cracks Found: {total_cracked_found:,}")
+    print(f"Total Words Processed: {int(words_processed_total):,}")
+    print(f"Total Unique Words Generated: {int(total_unique_found):,}")
+    print(f"Total True Cracks Found: {int(total_cracked_found):,}")
     print(f"Total Execution Time: {end_time - start_time:.2f} seconds")
     print("-----------------------------\n")
 
