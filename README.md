@@ -94,7 +94,7 @@ This file is a ready-to-use Hashcat rule file containing the top K rules from th
 
 This file should be used in subsequent cracking attempts for maximal efficiency.
 
-https://hcrulestools.pages.dev/ranker.static_workflow
+https://hcrt.pages.dev/ranker.static_workflow
 
 **Credits:**
 
