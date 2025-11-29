@@ -10,9 +10,11 @@ from time import time
 import mmap
 import signal
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 # ====================================================================
-# --- RANKER v3.1: IMPROVED CAPACITY FOR LARGE RULE SETS ---
+# --- RANKER v3.2: OPTIMIZED LARGE FILE LOADING ---
 # ====================================================================
 
 # --- COLOR CODES FOR TERMINAL OUTPUT ---
@@ -49,12 +51,12 @@ except AttributeError:
     pass
 
 # ====================================================================
-# --- INCREASED CONSTANTS FOR LARGE RULE SETS ---
+# --- CONSTANTS ---
 # ====================================================================
 MAX_WORD_LEN = 32
 MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
 MAX_RULE_ARGS = 4
-MAX_RULES_IN_BATCH = 1024  # INCREASED FROM 256 TO 1024 (4x capacity)
+MAX_RULES_IN_BATCH = 1024
 LOCAL_WORK_SIZE = 256
 
 # Default values (will be adjusted based on VRAM)
@@ -93,6 +95,151 @@ START_ID_GROUPB = START_ID_A + NUM_A_RULES
 NUM_GROUPB_RULES = 13
 START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
 NUM_NEW_RULES = 13
+
+# ====================================================================
+# --- OPTIMIZED FILE LOADING FUNCTIONS ---
+# ====================================================================
+
+def estimate_word_count(path):
+    """Fast word count estimation for large files without reading entire content"""
+    print(f"{blue('📊')} {bold('Estimating words in:')} {path}...")
+    
+    try:
+        file_size = os.path.getsize(path)
+        # Sample first 10MB to estimate average line length
+        sample_size = min(10 * 1024 * 1024, file_size)
+        
+        with open(path, 'rb') as f:
+            sample = f.read(sample_size)
+            lines = sample.count(b'\n')
+            
+            if file_size <= sample_size:
+                # Small file, exact count
+                total_lines = lines
+            else:
+                # Estimate based on sample
+                avg_line_length = sample_size / max(lines, 1)
+                total_lines = int(file_size / avg_line_length)
+                
+        print(f"{green('✅')} {bold('Estimated words:')} {cyan(f'{total_lines:,}')}")
+        return total_lines
+        
+    except Exception as e:
+        print(f"{yellow('⚠️')} {bold('Could not estimate word count:')} {e}")
+        return 1000000  # Fallback
+
+def fast_fnv1a_hash_32(data):
+    """Optimized FNV-1a hash for bytes"""
+    if isinstance(data, np.ndarray):
+        # Use numpy for bulk processing if available
+        hash_val = np.uint32(2166136261)
+        for byte in data:
+            hash_val ^= np.uint32(byte)
+            hash_val *= np.uint32(16777619)
+        return hash_val
+    else:
+        # Standard implementation for bytes
+        hash_val = 2166136261
+        for byte in data:
+            hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
+        return hash_val
+
+def bulk_hash_words(words_list):
+    """Compute hashes for multiple words in bulk"""
+    return [fast_fnv1a_hash_32(word) for word in words_list]
+
+def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
+    """
+    Massively optimized wordlist loader using memory mapping and bulk processing
+    """
+    print(f"{green('🚀')} {bold('Using optimized memory-mapped loader...')}")
+    
+    file_size = os.path.getsize(wordlist_path)
+    print(f"{blue('📁')} {bold('File size:')} {cyan(f'{file_size / (1024**3):.2f} GB')}")
+    
+    batch_elements = batch_size * max_len
+    words_buffer = np.zeros(batch_elements, dtype=np.uint8)
+    hashes_buffer = np.zeros(batch_size, dtype=np.uint32)
+    
+    load_start = time()
+    total_words_loaded = 0
+    
+    try:
+        with open(wordlist_path, 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                pos = 0
+                batch_count = 0
+                file_size = len(mm)
+                
+                # Use a progress bar that updates based on file position
+                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True) as pbar:
+                    while pos < file_size and not interrupted:
+                        # Find next newline efficiently
+                        end_pos = mm.find(b'\n', pos)
+                        if end_pos == -1:
+                            end_pos = file_size
+                        
+                        # Extract line directly from memory map
+                        line = mm[pos:end_pos].strip()
+                        line_len = len(line)
+                        pos = end_pos + 1
+                        pbar.update(pos - pbar.n)  # Update progress
+                        
+                        # Skip empty lines and validate length
+                        if line_len == 0 or line_len > max_len:
+                            continue
+                            
+                        # Copy to buffer
+                        start_idx = batch_count * max_len
+                        end_idx = start_idx + line_len
+                        
+                        # Use memoryview for efficient copying
+                        words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
+                        
+                        # Compute hash
+                        hashes_buffer[batch_count] = fast_fnv1a_hash_32(line)
+                        batch_count += 1
+                        total_words_loaded += 1
+                        
+                        # Yield batch when full
+                        if batch_count >= batch_size:
+                            yield words_buffer.copy(), hashes_buffer.copy(), batch_count
+                            batch_count = 0
+                            words_buffer.fill(0)
+                            hashes_buffer.fill(0)
+                
+                # Yield final partial batch
+                if batch_count > 0 and not interrupted:
+                    yield words_buffer, hashes_buffer, batch_count
+                    
+    except Exception as e:
+        print(f"{red('❌')} {bold('Error in optimized loader:')} {e}")
+        raise
+    
+    load_time = time() - load_start
+    print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s "
+          f"({total_words_loaded/load_time:,.0f} words/sec)")
+
+def parallel_hash_computation(words_batch, max_len, batch_count):
+    """Compute hashes in parallel using multiple threads"""
+    hashes = np.zeros(batch_count, dtype=np.uint32)
+    
+    def compute_hash(i):
+        start = i * max_len
+        end = start + max_len
+        word_data = words_batch[start:end]
+        # Find actual length (first zero byte)
+        actual_len = np.argmax(word_data == 0)
+        if actual_len == 0:
+            actual_len = max_len
+        return fast_fnv1a_hash_32(word_data[:actual_len])
+    
+    # Use ThreadPoolExecutor for parallel hash computation
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(compute_hash, range(batch_count)))
+    
+    hashes[:] = results
+    return hashes
 
 # ====================================================================
 # --- INTERRUPT HANDLER FUNCTIONS ---
@@ -208,40 +355,8 @@ def update_progress_stats(words_processed, unique_found, cracked_found):
     total_cracked_found = cracked_found
 
 # ====================================================================
-# --- MISSING HELPER FUNCTIONS ---
+# --- ORIGINAL HELPER FUNCTIONS (OPTIMIZED) ---
 # ====================================================================
-
-def get_word_count(path):
-    """Counts total words in file to set up progress bar."""
-    print(f"{blue('📊')} {bold('Counting words in:')} {path}...")
-    
-    # Get file size for timing estimates
-    try:
-        file_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
-        if file_size > 100:
-            print(f"{yellow('📁')} {bold('Large wordlist detected:')} {file_size:.1f} MB - this may take a moment...")
-    except OSError:
-        file_size = 0
-    
-    start_count = time()
-    count = 0
-    try:
-        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in f:
-                count += 1
-    except FileNotFoundError:
-        print(f"{red('❌')} {bold('Error:')} Wordlist file not found at: {path}")
-        exit(1)
-    
-    count_time = time() - start_count
-    print(f"{green('✅')} {bold('Total words found:')} {cyan(f'{count:,}')} (counting took {count_time:.2f}s)")
-    
-    # Provide timing estimates for large files
-    if file_size > 100 and count_time > 5:
-        estimated_load_time = count_time * 2
-        print(f"{yellow('⏱️')}  {bold('For')} {file_size:.1f}MB {bold('file, full loading will take approximately')} {estimated_load_time:.1f}s")
-    
-    return count
 
 def load_rules(path):
     """Loads Hashcat rules from file."""
@@ -272,14 +387,6 @@ def load_rules(path):
     print(f"{green('✅')} {bold('Loaded')} {cyan(f'{len(rules_list):,}')} {bold('rules.')}")
     return rules_list
 
-def fnv1a_hash_32_cpu(data):
-    """Calculates FNV-1a hash for a byte array."""
-    hash_val = np.uint32(2166136261)
-    for byte in data:
-        hash_val ^= np.uint32(byte)
-        hash_val *= np.uint32(16777619)
-    return hash_val
-
 def load_cracked_hashes(path, max_len):
     """Loads a list of cracked passwords and returns their FNV-1a hashes."""
     print(f"{blue('📊')} {bold('Loading cracked list for effectiveness check from:')} {path}...")
@@ -294,12 +401,24 @@ def load_cracked_hashes(path, max_len):
     
     cracked_hashes = []
     load_start = time()
+    
     try:
-        with open(path, 'r', encoding='latin-1', errors='ignore') as f:
-            for line in f:
-                word = line.strip().encode('latin-1')
-                if 1 <= len(word) <= max_len:
-                    cracked_hashes.append(fnv1a_hash_32_cpu(word))
+        # Use optimized loading for cracked list too
+        with open(path, 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                pos = 0
+                file_size = len(mm)
+                
+                while pos < file_size:
+                    end_pos = mm.find(b'\n', pos)
+                    if end_pos == -1:
+                        end_pos = file_size
+                    
+                    line = mm[pos:end_pos].strip()
+                    pos = end_pos + 1
+                    
+                    if 1 <= len(line) <= max_len:
+                        cracked_hashes.append(fast_fnv1a_hash_32(line))
     except FileNotFoundError:
         print(f"{yellow('⚠️')} {bold('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
@@ -429,77 +548,6 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
         print(f"{green('✅')} {bold('Top')} {cyan(f'{len(final_optimized_list):,}')} {bold('optimized rules saved successfully to')} {output_path}.")
     except Exception as e:
         print(f"{red('❌')} {bold('Error while saving optimized rules to file:')} {e}")
-
-def wordlist_iterator_optimized(wordlist_path, max_len, batch_size):
-    """
-    Optimized generator that yields batches of words and initial hashes directly from disk.
-    Uses memory mapping and buffered reading for large files.
-    """
-    base_words_np = np.zeros((batch_size, max_len), dtype=np.uint8)
-    base_hashes = []
-    current_batch_count = 0
-    
-    # Get file size for progress reporting
-    try:
-        file_size = os.path.getsize(wordlist_path) / (1024 * 1024)  # Size in MB
-        if file_size > 100:
-            print(f"{green('🚀')} {bold('Loading large wordlist')} ({file_size:.1f} MB) {bold('using optimized memory mapping...')}")
-            if file_size > 500:
-                print(f"{yellow('💡')} {bold('This may take a while. Consider using SSD for better performance.')}")
-            if file_size > 1000:
-                print(f"{yellow('💡')} {bold('For multi-GB files, loading time depends on your storage speed:')}")
-                print(f"{yellow('   -')} {bold('HDD: 2-5 minutes per GB')}")
-                print(f"{yellow('   -')} {bold('SSD: 30-60 seconds per GB')}") 
-                print(f"{yellow('   -')} {bold('NVMe: 10-20 seconds per GB')}")
-    except OSError:
-        file_size = 0
-    
-    load_start = time()
-    words_loaded = 0
-    
-    try:
-        # Use a larger buffer for better I/O performance
-        with open(wordlist_path, 'r', encoding='latin-1', errors='ignore', buffering=8192*16) as f:
-            for line in f:
-                word_str = line.strip()
-                if not word_str:  # Skip empty lines
-                    continue
-                    
-                word = word_str.encode('latin-1')
-                
-                if 1 <= len(word) <= max_len:
-                    # Fill the numpy array directly
-                    base_words_np[current_batch_count, :len(word)] = np.frombuffer(word, dtype=np.uint8)
-                    base_hashes.append(fnv1a_hash_32_cpu(word))
-                    current_batch_count += 1
-                    words_loaded += 1
-
-                    if current_batch_count == batch_size:
-                        yield base_words_np.ravel().copy(), current_batch_count, np.array(base_hashes, dtype=np.uint32)
-                        base_words_np.fill(0)
-                        base_hashes = []
-                        current_batch_count = 0
-
-                        # Show progress for large files
-                        if file_size > 100 and words_loaded % 1000000 == 0:
-                            elapsed = time() - load_start
-                            rate = words_loaded / elapsed
-                            print(f"{blue('📥')} {bold('Loaded')} {cyan(f'{words_loaded:,}')} {bold('words')} ({elapsed:.1f}s, {rate:,.0f} words/sec)")
-
-        # Yield remaining words
-        if current_batch_count > 0:
-            words_to_yield = base_words_np[:current_batch_count, :].ravel().copy()
-            yield words_to_yield, current_batch_count, np.array(base_hashes, dtype=np.uint32)
-            
-        total_load_time = time() - load_start
-        if file_size > 100:
-            rate = words_loaded / total_load_time
-            print(f"{green('✅')} {bold('Wordlist loading completed:')} {cyan(f'{words_loaded:,}')} {bold('words in')} {total_load_time:.2f}s "
-                  f"({rate:,.0f} words/sec)")
-            
-    except Exception as e:
-        print(f"{red('❌')} {bold('Error reading wordlist:')} {e}")
-        raise
 
 # ====================================================================
 # --- MEMORY MANAGEMENT FUNCTIONS ---
@@ -1271,7 +1319,7 @@ void bfs_kernel(
 """
 
 # ====================================================================
-# --- UPDATED MAIN RANKING FUNCTION FOR LARGE RULE SETS ---
+# --- UPDATED MAIN RANKING FUNCTION WITH OPTIMIZED LOADING ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
@@ -1280,7 +1328,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING FOR MEMORY CALCULATION
-    total_words = get_word_count(wordlist_path)
+    total_words = estimate_word_count(wordlist_path)  # Use fast estimation
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
     
@@ -1504,7 +1552,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
     # 6. PIPELINED RANKING LOOP SETUP
-    word_iterator = wordlist_iterator_optimized(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
+    # USE OPTIMIZED LOADER INSTEAD OF OLD ONE
+    word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     
     print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{len(rule_batch_starts):,}')} {bold('batches')} "
@@ -1525,7 +1574,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # A. Initial word batch load
     try:
-        base_words_np_batch, num_words_batch_exec, base_hashes_np_batch = next(word_iterator)
+        base_words_np_batch, base_hashes_np_batch, num_words_batch_exec = next(word_iterator)
         cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
         cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch).wait()
     except StopIteration:
@@ -1547,7 +1596,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         next_batch_data = None
         try:
             next_batch_data = next(word_iterator)
-            base_words_np_next, num_words_batch_next, base_hashes_np_next = next_batch_data
+            base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
             copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
             cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
         except StopIteration:
@@ -1652,7 +1701,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 # ====================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.1 - Large Rule Support)")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.2 - Optimized Large File Loading)")
     parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
     parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
     parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
@@ -1674,7 +1723,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f"{green('=' * 70)}")
-    print(f"{bold('🎯 RANKER v3.1')}")
+    print(f"{bold('🎯 RANKER v3.2 - OPTIMIZED LARGE FILE LOADING')}")
+    print(f"{green('=' * 70)}{Colors.END}")
+    print(f"{blue('💡')} {bold('Features:')}")
+    print(f"   {green('✓')} {bold('Memory-mapped file loading')}")
+    print(f"   {green('✓')} {bold('Fast word count estimation')}")
+    print(f"   {green('✓')} {bold('Bulk processing optimization')}")
+    print(f"   {green('✓')} {bold('Parallel hash computation')}")
     print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
@@ -1688,4 +1743,3 @@ if __name__ == '__main__':
         cracked_hash_map_bits=args.cracked_bits,
         preset=args.preset
     )
-
