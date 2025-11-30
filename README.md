@@ -32,14 +32,6 @@ RANKER is a high-performance GPU-accelerated tool that ranks Hashcat rules based
 
 - 🔧 Auto-Tuning: Dynamic parameter optimization
 
-📈 **Performance Breakthrough**
-
-Metric	        Before v3.2	After v3.2	Improvement
-Words/Second	8,000 w/s	170,000 w/s	21.25x
-1M Words	    125 seconds	6 seconds	20.8x faster
-10M Words	    21 minutes	59 seconds	21.4x faster
-File Loading	2-5 minutes	10-30 seconds	10x faster
-
 🛠 **Installation**
 
 *Requirements*
