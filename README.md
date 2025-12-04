@@ -1,171 +1,64 @@
 **RANKER v3.2**
 
-- GPU-Accelerated Hashcat Rule Ranking Tool with Memory-Mapped File Loading
+# GPU-Accelerated Hashcat Rule Ranker
 
-- Historic Performance Achievement: 21x Speed Boost - 8,000 → 170,000 words/second on RTX 3060 Ti
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![OpenCL](https://img.shields.io/badge/OpenCL-GPU%20Accelerated-green)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 
-```
-📁 File size: 0.52 GB
-Loading wordlist: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 554M/554M [06:03<00:00, 1.52MB/s]
-Processing wordlist from disk [Unique: 389,904,114 | Cracked: 118,724,863]:  92%|████████████████████████▉  | 57200000/62041432 [06:03<00:28, 170930.55 word/s]
-✅ Optimized loading completed: 57,242,219 words in 363.98s (157,267 words/sec)████████████████████████████████████████████▉| 554M/554M [06:03<00:00, 3.09MB/s]
-✅ Wordlist fully loaded. Continuing with remaining rule batches...
-Processing wordlist from disk [Unique: 389,904,114 | Cracked: 118,724,863]:  92%|████████████████████████▉  | 57242219/62041432 [06:03<00:30, 157267.00 word/s]
-Rule batches processed: 100%|██████████████████████████████████████████████████████████████████████████████████████████| 1241/1241 [06:03<00:00,  3.41 batch/s]
-```
-🎯 **What is RANKER?**
+A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules based on uniqueness and effectiveness scores.
 
-RANKER is a high-performance GPU-accelerated tool that ranks Hashcat rules based on their effectiveness and uniqueness against your target wordlists and cracked passwords.
+## ✨ Features
 
-✨ **Key Features**
-- 🚀 Blazing Fast: 170,000+ words/second on RTX 3060 Ti (21x improvement)
+- **🚀 GPU Acceleration**: Uses OpenCL for massively parallel rule processing
+- **📊 Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
+- **💾 Memory Efficient**: Optimized memory-mapped file loading for large datasets
+- **⏱️ Continuous Processing**: Processes entire wordlists without interruption
+- **🛡️ Interrupt Protection**: Saves progress on Ctrl+C for resumable processing
+- **🎯 Smart Presets**: Auto-configures based on GPU memory and dataset size
 
-- 💾 Memory-Mapped Loading: 10-50x faster file processing with mmap
+[![mermaid-20251204-d36b4d.png](https://i.postimg.cc/Z53wqDm5/mermaid-20251204-d36b4d.png)](https://postimg.cc/jDxHgcCp)
 
-- 🎮 GPU Acceleration: OpenCL-powered parallel processing
+**Combine Score = Effectiveness*10+Uniqueness**
 
-- 🧠 Smart VRAM Management: Automatic optimization for any GPU
+## 📋 Requirements
 
-- 📊 Comprehensive Rule Support: 100,000+ Hashcat rules
-
-- ⚡ Bulk Processing: 200,000+ words per GPU batch
-
-- 🔧 Auto-Tuning: Dynamic parameter optimization
-
-🛠 **Installation**
-
-*Requirements*
-
-- Python 3.8+
-
-- PyOpenCL
-
-- NumPy
-
-- NVIDIA/AMD/Intel GPU with OpenCL support
-
-- 4GB+ VRAM recommended
-
-**Quick Install**
-
-```
+```bash
 pip install pyopencl numpy tqdm
-git clone https://github.com/A1131/ranker.git
-cd ranker
+🚀 Quick Start
+bash
+# Basic usage
+python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv
+
+# Save top 1000 optimized rules
+python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv -k 1000
+
+# Use high memory preset for large datasets
+python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt --preset high_memory
+📝 Usage
+bash
+python ranker_v3.2.py [-h] -w WORDLIST -r RULES -c CRACKED 
+                     [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE]
+                     [--global-bits GLOBAL_BITS] [--cracked-bits CRACKED_BITS]
+                     [--preset {low_memory,medium_memory,high_memory,recommend}]
 ```
+🎯 **How It Works**
 
-🚀 **Usage**
+- Loading: Memory-mapped loading of wordlist and rules
+- Processing: GPU processes each rule against each word
 
-*Basic Usage*
+Scoring:
 
-```
-python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt -o output.csv -k 10000
-```
-
-*Advanced Usage with Auto-Optimization*
-
-```
-python ranker.py \
-  -w rockyou.txt \
-  -r best64.rule \
-  -c cracked_passwords.txt \
-  -o rule_ranking.csv \
-  -k 5000 \
-  --preset auto
-```
-
-**Command Line Arguments**
-
-```
--w, --wordlist	Base wordlist path	Required
--r, --rules	Hashcat rules file	Required
--c, --cracked	Cracked passwords file	Required
--o, --output	Output CSV path	ranker_output.csv
--k, --topk	Top K rules to save	1000
---preset	Performance preset	auto
-```
-
-Performance Presets
-
-RANKER automatically detects your GPU and optimizes parameters:
-
-```
---preset auto: (Recommended) Auto-calculated based on VRAM
---preset low_memory: For GPUs with < 4GB VRAM
---preset medium_memory: For GPUs with 4-8GB VRAM
---preset high_memory: For GPUs with > 8GB VRAM
-```
+- Uniqueness: Counts how many unique new words each rule generates
+- Effectiveness: Counts how many cracked passwords each rule produces
+- Ranking: Combines scores and ranks rules by effectiveness
+- Output: Saves ranked list and optionally top-K optimized rules
 
 📊 **Output Files**
 
-- output.csv: Detailed ranking with scores and metadata
-- output_optimized.rule: Top K optimized rules for Hashcat
-
-**Output Columns**
-
-- Rank: Rule ranking position
-- Combined_Score: (10 × Effectiveness) + Uniqueness
-- Effectiveness_Score: Matches in cracked list
-- Uniqueness_Score: New words not in base wordlist
-- Rule_Data: Original Hashcat rule
-
-🔧 **Technical Innovations**
-
-*Memory-Mapped File Loading*
-
-```
-with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-    # Direct file access - no Python I/O overhead
-```
-
-*GPU Optimization*
-
-- 256-thread work groups aligned with GPU architecture
-- Double buffering for zero GPU idle time
-- Bulk processing (200k words/batch)
-
-**Smart Memory Management**
-
-- Automatic VRAM detection and optimization
-- 15% safety margin for stability
-- Retry logic for memory allocation
-
-**Historic Achievement**
-
-First tool to achieve 170,000 words/second on RTX 3060 Ti - previously required high-end workstation GPUs. This represents a 21x performance improvement through software optimization alone.
-
-📈 **Real-World Impact**
-
-```
-# Before: Multi-day process
-100 million words × 100,000 rules = "Weekend project"
-
-# After: Interactive tool  
-100 million words × 100,000 rules = "Lunch break task"
-```
-
-🐛 **Troubleshooting**
-
-Common Issues
-
-*OpenCL not found:*
-
-```
-# Install GPU drivers
-sudo apt update && sudo apt install ocl-icd-libopencl1
-```
-
-*Memory allocation errors:*
-
-```
-# Use low memory preset
-python ranker.py --preset low_memory -w wordlist.txt -r rules.txt -c cracked.txt
-```
-
-*Slow file loading:*
-
-- Ensure files are on SSD storage
-- Use binary file formats when possible
+- results.csv: Full ranking data with scores for all rules
+- results_optimized.rule: Optimized rule file (if -k specified)
+- results_INTERRUPTED.csv: Intermediate results if processing is interrupted
 
 📄 **Licence**
 
@@ -177,10 +70,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - PyOpenCL developers for GPU bindings
 - Cybersecurity researchers worldwide
 - 0xVavaldi for inspiration - https://github.com/0xVavaldi
-
-⭐ Star this repo if you find it useful!
-
-*RANKER v3.2 - Democratizing high-performance rule analysis for security professionals worldwide.* 🚀
 
 **Website**
 
