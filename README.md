@@ -28,16 +28,16 @@ pip install pyopencl numpy tqdm
 🚀 Quick Start
 bash
 # Basic usage
-python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv
+python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv
 
 # Save top 1000 optimized rules
-python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv -k 1000
+python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv -k 1000
 
 # Use high memory preset for large datasets
-python ranker_v3.2.py -w wordlist.txt -r rules.txt -c cracked.txt --preset high_memory
+python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt --preset high_memory
 📝 Usage
 bash
-python ranker_v3.2.py [-h] -w WORDLIST -r RULES -c CRACKED 
+python ranker.py [-h] -w WORDLIST -r RULES -c CRACKED 
                      [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE]
                      [--global-bits GLOBAL_BITS] [--cracked-bits CRACKED_BITS]
                      [--preset {low_memory,medium_memory,high_memory,recommend}]
