@@ -10,9 +10,10 @@ from time import time
 import mmap
 import signal
 import sys
+from datetime import datetime, timedelta
 
 # ====================================================================
-# --- RANKER v3.2: OPTIMIZED LARGE FILE LOADING ---
+# --- RANKER v3.2: OPTIMIZED LARGE FILE LOADING WITH IMPROVED ETA ---
 # ====================================================================
 
 # --- COLOR CODES FOR TERMINAL OUTPUT ---
@@ -93,6 +94,194 @@ START_ID_GROUPB = START_ID_A + NUM_A_RULES
 NUM_GROUPB_RULES = 13
 START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
 NUM_NEW_RULES = 13
+
+# ====================================================================
+# --- PROGRESS TRACKING CLASS ---
+# ====================================================================
+
+class ProgressTracker:
+    """Enhanced progress tracking with accurate ETA calculations"""
+    
+    def __init__(self, total_words, total_rules, max_rules_per_batch):
+        self.total_words = total_words
+        self.total_rules = total_rules
+        self.max_rules_per_batch = max_rules_per_batch
+        
+        # Calculate total work units
+        self.total_word_batches = math.ceil(total_words / DEFAULT_WORDS_PER_GPU_BATCH)
+        self.total_rule_batches = math.ceil(total_rules / max_rules_per_batch)
+        self.total_work_units = self.total_word_batches * self.total_rule_batches
+        
+        # State tracking
+        self.start_time = time()
+        self.word_batches_completed = 0
+        self.rule_batches_completed = 0
+        self.total_work_completed = 0
+        
+        # Performance metrics
+        self.word_batch_times = []
+        self.rule_batch_times = []
+        self.words_processed = 0
+        self.uniques_found = 0
+        self.cracked_found = 0
+        
+        # Progress bars
+        self.main_pbar = None
+        self.detail_pbar = None
+        
+        # Statistics
+        self.last_update_time = self.start_time
+        self.last_work_count = 0
+        self.work_rate_history = []
+    
+    def start(self):
+        """Initialize progress bars"""
+        print(f"{blue('📊')} {bold('Estimated total work:')}")
+        print(f"   {bold('Word batches:')} {cyan(f'{self.total_word_batches:,}')}")
+        print(f"   {bold('Rule batches:')} {cyan(f'{self.total_rule_batches:,}')}")
+        print(f"   {bold('Total iterations:')} {cyan(f'{self.total_work_units:,}')} (words × rules)")
+        
+        # Main progress bar for overall progress
+        self.main_pbar = tqdm(
+            total=self.total_work_units,
+            desc=f"{bold('⚡ Overall Progress')}",
+            unit=" iter",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+            position=0
+        )
+        
+        # Detailed progress bar for current operation
+        self.detail_pbar = tqdm(
+            total=self.total_rule_batches,
+            desc=f"{bold('📋 Processing rule batches')}",
+            unit=" batch",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            position=1,
+            leave=False
+        )
+    
+    def update_word_batch_start(self, word_batch_idx, batch_size):
+        """Called when starting a new word batch"""
+        self.current_word_batch_idx = word_batch_idx
+        self.current_word_batch_size = batch_size
+        self.word_batch_start_time = time()
+        
+        # Update description
+        self.main_pbar.set_description(f"{bold('⚡ Overall Progress')} | Word batch {word_batch_idx+1}/{self.total_word_batches}")
+    
+    def update_word_batch_complete(self, words_processed, uniques, cracked):
+        """Called when a word batch is complete"""
+        word_batch_time = time() - self.word_batch_start_time
+        self.word_batch_times.append(word_batch_time)
+        
+        self.word_batches_completed += 1
+        self.words_processed += words_processed
+        self.uniques_found += uniques
+        self.cracked_found += cracked
+        
+        # Reset rule batch progress for next word batch
+        self.detail_pbar.n = 0
+        self.detail_pbar.refresh()
+    
+    def update_rule_batch_complete(self, rule_batch_idx, total_rule_batches):
+        """Called when a rule batch is complete"""
+        current_time = time()
+        rule_batch_time = current_time - self.last_update_time if self.last_update_time else 0
+        
+        if rule_batch_time > 0:
+            self.rule_batch_times.append(rule_batch_time)
+        
+        self.rule_batches_completed += 1
+        self.total_work_completed += 1
+        
+        # Update detail bar
+        self.detail_pbar.update(1)
+        self.detail_pbar.set_description(
+            f"{bold('📋 Rules for word batch')} {self.current_word_batch_idx+1}/{self.total_word_batches} "
+            f"| Batch {rule_batch_idx+1}/{total_rule_batches}"
+        )
+        
+        # Update main bar with enhanced ETA
+        self.main_pbar.update(1)
+        
+        # Calculate dynamic ETA
+        work_since_last = self.total_work_completed - self.last_work_count
+        time_since_last = current_time - self.last_update_time
+        
+        if work_since_last > 0 and time_since_last > 0:
+            current_rate = work_since_last / time_since_last
+            self.work_rate_history.append(current_rate)
+            
+            # Use moving average for stability
+            if len(self.work_rate_history) > 10:
+                self.work_rate_history.pop(0)
+            
+            avg_rate = sum(self.work_rate_history) / len(self.work_rate_history)
+            
+            if avg_rate > 0:
+                remaining_work = self.total_work_units - self.total_work_completed
+                eta_seconds = remaining_work / avg_rate
+                
+                # Format ETA
+                if eta_seconds < 60:
+                    eta_str = f"{eta_seconds:.0f}s"
+                elif eta_seconds < 3600:
+                    eta_str = f"{eta_seconds/60:.0f}m"
+                elif eta_seconds < 86400:
+                    eta_str = f"{eta_seconds/3600:.1f}h"
+                else:
+                    eta_str = f"{eta_seconds/86400:.1f}d"
+                
+                # Update postfix with detailed info
+                postfix = (
+                    f"ETA: {eta_str} | "
+                    f"Words: {self.words_processed:,} | "
+                    f"Uniq: {self.uniques_found:,} | "
+                    f"Cracked: {self.cracked_found:,}"
+                )
+                self.main_pbar.set_postfix_str(postfix)
+        
+        self.last_update_time = current_time
+        self.last_work_count = self.total_work_completed
+    
+    def get_performance_stats(self):
+        """Get performance statistics"""
+        if not self.word_batch_times:
+            return {}
+        
+        avg_word_batch_time = sum(self.word_batch_times) / len(self.word_batch_times)
+        avg_rule_batch_time = sum(self.rule_batch_times) / max(len(self.rule_batch_times), 1)
+        
+        return {
+            'avg_word_batch_time': avg_word_batch_time,
+            'avg_rule_batch_time': avg_rule_batch_time,
+            'words_per_second': self.words_processed / (time() - self.start_time),
+            'work_units_per_second': self.total_work_completed / (time() - self.start_time)
+        }
+    
+    def close(self):
+        """Close progress bars"""
+        if self.main_pbar:
+            self.main_pbar.close()
+        if self.detail_pbar:
+            self.detail_pbar.close()
+    
+    def print_summary(self):
+        """Print progress summary"""
+        elapsed = time() - self.start_time
+        
+        print(f"\n{green('📊')} {bold('Progress Summary:')}")
+        print(f"   {bold('Word batches completed:')} {cyan(f'{self.word_batches_completed:,}/{self.total_word_batches:,}')} "
+              f"({self.word_batches_completed/self.total_word_batches*100:.1f}%)")
+        print(f"   {bold('Rule batches completed:')} {cyan(f'{self.rule_batches_completed:,}/{self.total_rule_batches:,}')} "
+              f"({self.rule_batches_completed/self.total_rule_batches*100:.1f}%)")
+        print(f"   {bold('Total work completed:')} {cyan(f'{self.total_work_completed:,}/{self.total_work_units:,}')} "
+              f"({self.total_work_completed/self.total_work_units*100:.1f}%)")
+        print(f"   {bold('Time elapsed:')} {cyan(f'{elapsed:.1f}s')}")
+        
+        stats = self.get_performance_stats()
+        if stats:
+            print(f"   {bold('Performance:')} {cyan(f'{stats['work_units_per_second']:.1f}')} work units/sec")
 
 # ====================================================================
 # --- OPTIMIZED FILE LOADING FUNCTIONS ---
@@ -480,7 +669,7 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
         return
 
     # FIXED: Include ALL rules from CSV, don't filter by score
-    print(f"{blue('📊')} {bold('Loaded')} {cyan(f'{len(ranked_data):,}')} {bold('total rules from CSV')}")
+    print(f"{blue('📊')} {bold('Loaded')} {cyan(f'{len(ranked_data):,}')} {bold('total rules from CSV')")
 
     ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
     
@@ -1278,7 +1467,7 @@ void bfs_kernel(
 """
 
 # ====================================================================
-# --- UPDATED MAIN RANKING FUNCTION WITH CONTINUOUS RULE PROCESSING ---
+# --- UPDATED MAIN RANKING FUNCTION WITH ENHANCED PROGRESS TRACKING ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
@@ -1293,6 +1482,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     
     # Setup interrupt handler BEFORE starting processing
     setup_interrupt_handler(rules_list, ranking_output_path, top_k)
+    
+    # Initialize progress tracker
+    progress = ProgressTracker(total_words, total_rules, MAX_RULES_IN_BATCH)
     
     # Check if we're dealing with a large rule set
     if total_rules > 100000:
@@ -1509,11 +1701,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
-    # Main progress bars
-    word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
-    # Change the rule batch progress bar to show per-word-batch progress
-    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches for current word batch", unit=" batch", leave=False, position=1)
-
+    # Start progress tracking
+    progress.start()
+    
     # Debug counters (only used if debug flag is True)
     if debug:
         print(f"{yellow('🔍')} {bold('Debug mode enabled')}")
@@ -1528,12 +1718,11 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         if interrupted:
             break
             
+        # Update progress for new word batch
+        progress.update_word_batch_start(word_batch_idx, num_words_batch_exec)
+        
         # Copy current word batch to GPU
         cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch).wait()
-        
-        # Reset rule batch progress bar for each new word batch
-        rule_batch_pbar.n = 0
-        rule_batch_pbar.refresh()
         
         if debug:
             word_batches_processed += 1
@@ -1586,6 +1775,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
 
             # Update rule scores
+            current_uniques = 0
+            current_cracked = 0
+            
             for i in range(num_rules_in_batch):
                 rule_index = rule_start_index + i
                 # Convert to Python int to avoid overflow in rule scores
@@ -1594,18 +1786,25 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 
                 rules_list[rule_index]['uniqueness_score'] += uniqueness_val
                 rules_list[rule_index]['effectiveness_score'] += effectiveness_val
-                total_unique_found += np.uint64(uniqueness_val)
-                total_cracked_found += np.uint64(effectiveness_val)
+                
+                current_uniques += uniqueness_val
+                current_cracked += effectiveness_val
+            
+            total_unique_found += np.uint64(current_uniques)
+            total_cracked_found += np.uint64(current_cracked)
 
-            rule_batch_pbar.update(1)
+            # Update progress
+            progress.update_rule_batch_complete(rule_batch_idx, total_rule_batches)
+            
             if debug:
                 rule_batches_processed += 1
 
         # 9. UPDATE PROGRESS FOR CURRENT WORD BATCH
         words_processed_total += np.uint64(num_words_batch_exec)
         total_words_loaded += num_words_batch_exec
-        word_batch_pbar.update(num_words_batch_exec)
-        word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
+        
+        # Update word batch completion
+        progress.update_word_batch_complete(num_words_batch_exec, current_uniques, current_cracked)
         
         # Update progress stats for interrupt handler
         update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
@@ -1619,8 +1818,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         words_per_sec = total_words_loaded / load_time
         print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s ({words_per_sec:,.0f} words/sec)")
     
-    word_batch_pbar.close()
-    rule_batch_pbar.close()
+    # Close progress bars
+    progress.close()
     
     # Debug summary (only if debug flag is True)
     if debug:
@@ -1645,6 +1844,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     print(f"{blue('🎯')} {bold('Total Unique Words Generated:')} {cyan(f'{int(total_unique_found):,}')}")
     print(f"{blue('🔓')} {bold('Total True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
     print(f"{blue('⏱️')}  {bold('Total Execution Time:')} {cyan(f'{end_time - start_time:.2f} seconds')}")
+    
+    # Print progress summary
+    progress.print_summary()
+    
     print(f"{green('=' * 60)}{Colors.END}\n")
 
     csv_path = save_ranking_data(rules_list, ranking_output_path)
@@ -1657,7 +1860,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 # ====================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.2 - Optimized Large File Loading)")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.2 - Enhanced Progress Tracking)")
     parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
     parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
     parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
@@ -1683,13 +1886,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     print(f"{green('=' * 70)}")
-    print(f"{bold('🎯 RANKER v3.2 - OPTIMIZED LARGE FILE LOADING')}")
+    print(f"{bold('🎯 RANKER v3.2 - ENHANCED PROGRESS TRACKING')}")
     print(f"{green('=' * 70)}{Colors.END}")
     print(f"{blue('💡')} {bold('Features:')}")
+    print(f"   {green('✓')} {bold('Accurate ETA calculation')}")
+    print(f"   {green('✓')} {bold('Comprehensive progress tracking')}")
+    print(f"   {green('✓')} {bold('Real-time performance metrics')}")
     print(f"   {green('✓')} {bold('Memory-mapped file loading')}")
-    print(f"   {green('✓')} {bold('Fast word count estimation')}")
-    print(f"   {green('✓')} {bold('Bulk processing optimization')}")
-    print(f"   {green('✓')} {bold('Continuous rule processing across all word batches')}")
     if args.debug:
         print(f"   {yellow('🔍')} {bold('Debug mode: ENABLED')}")
     print(f"{green('=' * 70)}{Colors.END}")
