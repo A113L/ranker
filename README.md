@@ -12,9 +12,6 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 
 - **🚀 GPU Acceleration**: Uses OpenCL for massively parallel rule processing
 - **📊 Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
-- **💾 Memory Efficient**: Optimized memory-mapped file loading for large datasets
-- **⏱️ Continuous Processing**: Processes entire wordlists without interruption
-- **🛡️ Interrupt Protection**: Saves progress on Ctrl+C for resumable processing
 - **🎯 Smart Presets**: Auto-configures based on GPU memory and dataset size
 
 [![mermaid-20251204-d36b4d.png](https://i.postimg.cc/Z53wqDm5/mermaid-20251204-d36b4d.png)](https://postimg.cc/jDxHgcCp)
@@ -75,7 +72,6 @@ Examples:
 ```
 🎯 **How It Works**
 
-- Loading: Memory-mapped loading of wordlist and rules
 - Processing: GPU processes each rule against each word
 
 Scoring:
