@@ -10,8 +10,6 @@ from time import time
 import mmap
 import signal
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 # ====================================================================
 # --- RANKER v3.2: OPTIMIZED LARGE FILE LOADING ---
@@ -810,7 +808,6 @@ void bfs_kernel(
     unsigned int rule_id = current_rule_ptr_int[0];
     unsigned int rule_args_int = current_rule_ptr_int[1];
     unsigned int rule_args_int2 = current_rule_ptr_int[2];
-    unsigned int rule_args_int3 = current_rule_ptr_int[3];
 
     unsigned int word_len = 0;
     for (unsigned int i = 0; i < max_word_len; i++) {{
@@ -1083,7 +1080,7 @@ void bfs_kernel(
         unsigned char cmd = arg0;
         unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
         unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
-        unsigned char X = arg2;
+        unsigned char X = arg3;
 
         if (cmd == 'p') {{ // 'p' (Duplicate N times)
             if (N != 0xFFFFFFFF) {{
@@ -1215,7 +1212,7 @@ void bfs_kernel(
         unsigned char cmd = arg0;
         unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
         unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
-        unsigned char X = arg2;
+        unsigned char X = arg3;
 
         if (cmd == 'K') {{ // 'K' (Swap last two characters)
             if (word_len >= 2) {{
@@ -1286,7 +1283,7 @@ void bfs_kernel(
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
                                words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
-                               preset=None):
+                               preset=None, debug=False):
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING FOR MEMORY CALCULATION
@@ -1322,8 +1319,22 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{blue('💾')} {bold('Total VRAM:')} {cyan(f'{total_vram / (1024**3):.1f} GB')}")
         print(f"{blue('💾')} {bold('Available VRAM:')} {cyan(f'{available_vram / (1024**3):.1f} GB')}")
         
-        # Handle preset parameter specification
-        if preset:
+        # Handle manual parameter specification FIRST
+        using_manual_params = False
+        manual_global_bits = None
+        manual_cracked_bits = None
+        
+        if global_hash_map_bits is not None or cracked_hash_map_bits is not None:
+            using_manual_params = True
+            manual_global_bits = global_hash_map_bits if global_hash_map_bits is not None else DEFAULT_GLOBAL_HASH_MAP_BITS
+            manual_cracked_bits = cracked_hash_map_bits if cracked_hash_map_bits is not None else DEFAULT_CRACKED_HASH_MAP_BITS
+            
+            print(f"{blue('🔧')} {bold('Using manually specified parameters:')}")
+            print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{manual_global_bits} bits')}")
+            print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{manual_cracked_bits} bits')}")
+        
+        # Handle preset parameter specification (manual params take priority)
+        if preset and not using_manual_params:
             recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count, total_rules)
             
             if preset == "recommend":
@@ -1334,52 +1345,33 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 preset_config = recommendations[preset]
                 print(f"{blue('🔧')} {bold('Using')} {cyan(preset_config['description'])}")
                 words_per_gpu_batch = preset_config['batch_size']
-                global_hash_map_bits = preset_config['global_bits']
-                cracked_hash_map_bits = preset_config['cracked_bits']
+                manual_global_bits = preset_config['global_bits']
+                manual_cracked_bits = preset_config['cracked_bits']
             else:
                 print(f"{red('❌')} {bold('Unknown preset:')} {cyan(preset)}. {bold('Available presets:')} {list(recommendations.keys())}")
                 return
         
-        # Handle manual parameter specification
-        using_manual_params = False
-        if words_per_gpu_batch is not None or global_hash_map_bits is not None or cracked_hash_map_bits is not None:
-            using_manual_params = True
-            print(f"{blue('🔧')} {bold('Using manually specified parameters:')}")
-            
-            # Set defaults for any unspecified manual parameters
-            if words_per_gpu_batch is None:
-                words_per_gpu_batch = DEFAULT_WORDS_PER_GPU_BATCH
-            if global_hash_map_bits is None:
-                global_hash_map_bits = DEFAULT_GLOBAL_HASH_MAP_BITS
-            if cracked_hash_map_bits is None:
-                cracked_hash_map_bits = DEFAULT_CRACKED_HASH_MAP_BITS
-                
-            print(f"   {blue('-')} {bold('Batch size:')} {cyan(f'{words_per_gpu_batch:,}')}")
-            print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_hash_map_bits} bits')}")
-            print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_hash_map_bits} bits')}")
-            
-            # Validate manual parameters against available VRAM
-            global_map_bytes = (1 << (global_hash_map_bits - 5)) * np.uint32().itemsize
-            cracked_map_bytes = (1 << (cracked_hash_map_bits - 5)) * np.uint32().itemsize
-            total_map_memory = global_map_bytes + cracked_map_bytes
-            
-            # Memory requirements for batch processing
-            word_batch_bytes = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-            rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
-            counter_bytes = MAX_RULES_IN_BATCH * np.uint32().itemsize * 2
-            
-            total_batch_memory = word_batch_bytes + rule_batch_bytes + counter_bytes + total_map_memory
-            
-            if total_batch_memory > available_vram:
-                print(f"{yellow('⚠️')}  {bold('Warning: Manual parameters exceed available VRAM!')}")
-                print(f"   {bold('Required:')} {cyan(f'{total_batch_memory / (1024**3):.2f} GB')}")
-                print(f"   {bold('Available:')} {cyan(f'{available_vram / (1024**3):.2f} GB')}")
-                print(f"   {bold('Consider reducing batch size or hash map bits')}")
-        else:
+        # If no manual or preset parameters, use auto-calculated
+        if not using_manual_params and not preset:
             # Auto-calculate optimal parameters with large rule set consideration
-            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
+            words_per_gpu_batch, manual_global_bits, manual_cracked_bits = calculate_optimal_parameters_large_rules(
                 available_vram, total_words, cracked_hashes_count, total_rules
             )
+        
+        # Apply the determined parameters
+        global_hash_map_bits = manual_global_bits
+        cracked_hash_map_bits = manual_cracked_bits
+        
+        # If batch size wasn't specified, use auto-calculated
+        if words_per_gpu_batch is None:
+            words_per_gpu_batch, _, _ = calculate_optimal_parameters_large_rules(
+                available_vram, total_words, cracked_hashes_count, total_rules
+            )
+        
+        print(f"{blue('🔧')} {bold('Final configuration:')}")
+        print(f"   {blue('-')} {bold('Batch size:')} {cyan(f'{words_per_gpu_batch:,} words')}")
+        print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_hash_map_bits} bits')}")
+        print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_hash_map_bits} bits')}")
 
         # Calculate derived constants
         GLOBAL_HASH_MAP_WORDS = 1 << (global_hash_map_bits - 5)
@@ -1416,7 +1408,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     # 4. OPENCL BUFFER SETUP WITH RETRY LOGIC
     mf = cl.mem_flags
 
-    # Define counters_size here - this was the missing variable
+    # Define counters_size
     counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
 
     # Define buffer specifications for retry logic
@@ -1430,7 +1422,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
         },
-        # Rule input buffer (INCREASED CAPACITY)
+        # Rule input buffer
         'rules_in': {
             'flags': mf.READ_ONLY,
             'size': MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
@@ -1445,7 +1437,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             'flags': mf.READ_ONLY,
             'size': cracked_hash_map_np.nbytes
         },
-        # Rule Counters (INCREASED CAPACITY)
+        # Rule Counters
         'rule_uniqueness_counts': {
             'flags': mf.READ_WRITE,
             'size': counters_size
@@ -1519,7 +1511,14 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     
     # Main progress bars
     word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
-    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches processed", unit=" batch", leave=False)
+    # Change the rule batch progress bar to show per-word-batch progress
+    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches for current word batch", unit=" batch", leave=False, position=1)
+
+    # Debug counters (only used if debug flag is True)
+    if debug:
+        print(f"{yellow('🔍')} {bold('Debug mode enabled')}")
+        word_batches_processed = 0
+        rule_batches_processed = 0
 
     # 7. MAIN PROCESSING LOOP - PROCESS ALL WORD BATCHES
     load_start_time = time()
@@ -1535,6 +1534,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         # Reset rule batch progress bar for each new word batch
         rule_batch_pbar.n = 0
         rule_batch_pbar.refresh()
+        
+        if debug:
+            word_batches_processed += 1
         
         # 8. PROCESS ALL RULE BATCHES FOR CURRENT WORD BATCH
         for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
@@ -1596,6 +1598,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 total_cracked_found += np.uint64(effectiveness_val)
 
             rule_batch_pbar.update(1)
+            if debug:
+                rule_batches_processed += 1
 
         # 9. UPDATE PROGRESS FOR CURRENT WORD BATCH
         words_processed_total += np.uint64(num_words_batch_exec)
@@ -1605,6 +1609,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         
         # Update progress stats for interrupt handler
         update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
+        
+        # Print debug info periodically (only if debug flag is True)
+        if debug and word_batches_processed % 10 == 0:
+            print(f"{yellow('🔍')} {bold('Debug:')} {cyan(f'{word_batches_processed}')} {bold('word batches,')} {cyan(f'{rule_batches_processed}')} {bold('rule batches processed')}")
 
     load_time = time() - load_start_time
     if total_words_loaded > 0:
@@ -1613,6 +1621,13 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     
     word_batch_pbar.close()
     rule_batch_pbar.close()
+    
+    # Debug summary (only if debug flag is True)
+    if debug:
+        print(f"{yellow('🔍')} {bold('Debug Summary:')}")
+        print(f"   {bold('Word batches processed:')} {cyan(f'{word_batches_processed:,}')}")
+        print(f"   {bold('Rule batches processed:')} {cyan(f'{rule_batches_processed:,}')}")
+        print(f"   {bold('Total words loaded:')} {cyan(f'{total_words_loaded:,}')}")
     
     # Check if we were interrupted
     if interrupted:
@@ -1661,6 +1676,10 @@ if __name__ == '__main__':
     parser.add_argument('--preset', type=str, default=None,
                        help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
     
+    # Debug flag
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug output with detailed processing information')
+    
     args = parser.parse_args()
 
     print(f"{green('=' * 70)}")
@@ -1671,6 +1690,8 @@ if __name__ == '__main__':
     print(f"   {green('✓')} {bold('Fast word count estimation')}")
     print(f"   {green('✓')} {bold('Bulk processing optimization')}")
     print(f"   {green('✓')} {bold('Continuous rule processing across all word batches')}")
+    if args.debug:
+        print(f"   {yellow('🔍')} {bold('Debug mode: ENABLED')}")
     print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
@@ -1682,5 +1703,6 @@ if __name__ == '__main__':
         words_per_gpu_batch=args.batch_size,
         global_hash_map_bits=args.global_bits,
         cracked_hash_map_bits=args.cracked_bits,
-        preset=args.preset
+        preset=args.preset,
+        debug=args.debug
     )
