@@ -25,22 +25,53 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 
 ```bash
 pip install pyopencl numpy tqdm
-🚀 Quick Start
-bash
-# Basic usage
-python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv
 
-# Save top 1000 optimized rules
-python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt -o results.csv -k 1000
-
-# Use high memory preset for large datasets
-python ranker.py -w wordlist.txt -r rules.txt -c cracked.txt --preset high_memory
 📝 Usage
 bash
-python ranker.py [-h] -w WORDLIST -r RULES -c CRACKED 
-                     [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE]
-                     [--global-bits GLOBAL_BITS] [--cracked-bits CRACKED_BITS]
-                     [--preset {low_memory,medium_memory,high_memory,recommend}]
+python3 rankerv3.py -h
+usage: rankerv3.py [-h] -w WORDLIST -r RULES -c CRACKED [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS] [--cracked-bits CRACKED_BITS]
+                   [--preset {low_memory,medium_memory,high_memory,aggressive,balanced}] [--target-device TARGET_DEVICE] [--force-nvidia] [--force-amd] [--skip-rule-encoding]
+                   [--disable-double-buffering] [--disable-progress-bars] [--benchmark-mode] [--list-presets]
+
+Ultra-optimized GPU rule ranking
+
+options:
+  -h, --help            show this help message and exit
+  -w WORDLIST, --wordlist WORDLIST
+                        Path to the base wordlist file
+  -r RULES, --rules RULES
+                        Path to the Hashcat rules file to rank
+  -c CRACKED, --cracked CRACKED
+                        Path to a list of cracked passwords for effectiveness scoring
+  -o OUTPUT, --output OUTPUT
+                        Path to save the final ranking CSV (default: ranker_output.csv)
+  -k TOPK, --topk TOPK  Number of top rules to save to optimized .rule file (default: 1000)
+  --batch-size BATCH_SIZE
+                        Number of words to process in each GPU batch (default: auto-calculate)
+  --global-bits GLOBAL_BITS
+                        Bits for global hash map size (default: auto-calculate)
+  --cracked-bits CRACKED_BITS
+                        Bits for cracked hash map size (default: auto-calculate)
+  --preset {low_memory,medium_memory,high_memory,aggressive,balanced}
+                        Use preset configuration for easy setup
+  --target-device TARGET_DEVICE
+                        Target specific GPU device (e.g., "RTX 3060 Ti")
+  --force-nvidia        Force use of NVIDIA platform
+  --force-amd           Force use of AMD platform
+  --skip-rule-encoding  Skip parallel rule encoding optimization
+  --disable-double-buffering
+                        Disable double buffering for word loading
+  --disable-progress-bars
+                        Disable all progress bars for cleaner output
+  --benchmark-mode      Enable detailed performance benchmarking
+  --list-presets        List available performance presets and exit
+
+Examples:
+  rankerv3.py -w wordlist.txt -r rules.rule -c cracked.txt -o output.csv
+  rankerv3.py -w wordlist.txt -r rules.rule -c cracked.txt -o output.csv -k 5000
+  rankerv3.py -w wordlist.txt -r rules.rule -c cracked.txt -o output.csv --preset aggressive
+  rankerv3.py -w wordlist.txt -r rules.rule -c cracked.txt -o output.csv --batch-size 200000 --global-bits 34
+
 ```
 🎯 **How It Works**
 
