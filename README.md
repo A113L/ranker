@@ -14,7 +14,7 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 - **📊 Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
 - **🎯 Smart Presets**: Auto-configures based on GPU memory and dataset size
 
-[![mermaid-20251204-d36b4d.png](https://i.postimg.cc/Z53wqDm5/mermaid-20251204-d36b4d.png)](https://postimg.cc/jDxHgcCp)
+[![mermaid-20251213-642c5b.png](https://i.postimg.cc/qBssNdW3/mermaid-20251213-642c5b.png)](https://postimg.cc/w3Byrnqq)
 
 **Combine Score = Effectiveness*10+Uniqueness**
 
