@@ -191,59 +191,132 @@ def precompute_rule_batches(rules_list, batch_size=1024, num_threads=4):
     return batches, encoded_batches
 
 # ====================================================================
-# --- SIMPLIFIED WORDLIST LOADER ---
+# --- MEMORY MAPPED WORDLIST LOADER ---
 # ====================================================================
 
-def simplified_wordlist_loader(wordlist_path, max_len=32, batch_size=170000):
-    """
-    Simple but fast wordlist loader that doesn't use progress bars
-    """
-    try:
-        with open(wordlist_path, 'rb') as f:
-            # Read entire file at once for maximum speed
-            content = f.read()
+class MemoryMappedWordlist:
+    """Memory-mapped wordlist loader for efficient file access"""
+    
+    def __init__(self, filepath, max_word_len=32, batch_size=100000):
+        self.filepath = filepath
+        self.max_word_len = max_word_len
+        self.batch_size = batch_size
+        self.mmapped_file = None
+        self.word_positions = []
+        self.total_words = 0
+        self.total_batches = 0
+        self.current_batch = 0
         
-        print(f"{green('📖')} {bold('Wordlist loaded:')} {cyan(f'{len(content) / (1024**2):.1f} MB')}")
+    def __enter__(self):
+        """Initialize memory mapping and scan file"""
+        print(f"{blue('🗺️')}  {bold('Memory mapping wordlist...')}")
         
-        # Split into lines
-        lines = content.split(b'\n')
-        total_lines = len(lines)
-        print(f"{green('📊')} {bold('Total words:')} {cyan(f'{total_lines:,}')}")
+        # Open file and create memory map
+        self.file_obj = open(self.filepath, 'rb')
+        self.mmapped_file = mmap.mmap(self.file_obj.fileno(), 0, access=mmap.ACCESS_READ)
         
-        # Process in batches
-        for i in range(0, total_lines, batch_size):
-            batch_end = min(i + batch_size, total_lines)
-            batch_lines = lines[i:batch_end]
-            batch_count = len(batch_lines)
-            
-            if batch_count == 0:
-                break
-            
-            # Create word buffer
-            words_buffer = np.zeros(batch_count * max_len, dtype=np.uint8)
-            hashes_buffer = np.zeros(batch_count, dtype=np.uint32)
-            
-            # Process each word
-            for idx, line in enumerate(batch_lines):
-                if not line:
-                    continue
+        # Scan file to find word positions and count
+        print(f"{blue('🔍')} {bold('Scanning wordlist...')}")
+        
+        pos = 0
+        file_size = len(self.mmapped_file)
+        
+        with tqdm(total=file_size, desc="Scanning words", unit="B") as pbar:
+            while pos < file_size:
+                # Find next newline
+                next_newline = self.mmapped_file.find(b'\n', pos)
+                if next_newline == -1:  # Last line
+                    next_newline = file_size
                 
-                # Copy word
-                line_len = min(len(line), max_len)
-                word_start = idx * max_len
-                words_buffer[word_start:word_start + line_len] = np.frombuffer(line, dtype=np.uint8, count=line_len)
+                word_start = pos
+                word_end = next_newline
+                word_length = word_end - word_start
                 
-                # Compute hash
-                hash_val = 2166136261
-                for byte in line[:line_len]:
-                    hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
-                hashes_buffer[idx] = hash_val
+                # Only store valid words
+                if 1 <= word_length <= self.max_word_len:
+                    self.word_positions.append((word_start, word_length))
+                
+                pos = next_newline + 1  # Skip newline
+                pbar.update(word_end - word_start + 1)
+        
+        self.total_words = len(self.word_positions)
+        self.total_batches = (self.total_words + self.batch_size - 1) // self.batch_size
+        
+        print(f"{green('✅')} {bold('Wordlist mapped:')} {cyan(f'{self.total_words:,}')} words in {cyan(f'{self.total_batches}')} batches")
+        print(f"   {bold('File size:')} {cyan(f'{file_size / (1024**2):.1f} MB')}")
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up memory mapping"""
+        if self.mmapped_file:
+            self.mmapped_file.close()
+        if self.file_obj:
+            self.file_obj.close()
+    
+    def __iter__(self):
+        """Iterate through word batches"""
+        self.current_batch = 0
+        return self
+    
+    def __next__(self):
+        """Get next batch of words"""
+        if self.current_batch >= self.total_batches:
+            raise StopIteration
+        
+        # Calculate batch range
+        start_idx = self.current_batch * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.total_words)
+        batch_word_count = end_idx - start_idx
+        
+        # Prepare buffers
+        words_buffer = np.zeros(batch_word_count * self.max_word_len, dtype=np.uint8)
+        hashes_buffer = np.zeros(batch_word_count, dtype=np.uint32)
+        
+        # Process batch
+        for i in range(batch_word_count):
+            word_idx = start_idx + i
+            word_start, word_length = self.word_positions[word_idx]
             
-            yield words_buffer, hashes_buffer, batch_count
+            # Copy word from memory map
+            word_data = self.mmapped_file[word_start:word_start + word_length]
+            word_start_offset = i * self.max_word_len
+            words_buffer[word_start_offset:word_start_offset + word_length] = np.frombuffer(word_data, dtype=np.uint8)
             
-    except Exception as e:
-        print(f"{red('❌')} {bold('Error loading wordlist:')} {e}")
-        raise
+            # Compute hash
+            hash_val = 2166136261
+            for byte in word_data:
+                hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
+            hashes_buffer[i] = hash_val
+        
+        self.current_batch += 1
+        
+        return words_buffer, hashes_buffer, batch_word_count
+    
+    def get_word_count(self):
+        """Get total number of words"""
+        return self.total_words
+    
+    def get_batch_count(self):
+        """Get total number of batches"""
+        return self.total_batches
+
+def create_wordlist_batches(wordlist_path, max_word_len=32, batch_size=100000):
+    """Generator function that yields word batches using memory mapping"""
+    with MemoryMappedWordlist(wordlist_path, max_word_len, batch_size) as wordlist:
+        total_batches = wordlist.get_batch_count()
+        
+        # Create progress bar for word batches
+        with tqdm(total=total_batches, desc="Processing word batches", unit="batch") as pbar:
+            for batch_idx, (words_buffer, hashes_buffer, word_count) in enumerate(wordlist):
+                yield words_buffer, hashes_buffer, word_count
+                
+                # Update progress
+                pbar.update(1)
+                pbar.set_postfix({
+                    'words': f'{word_count:,}',
+                    'total': f'{(batch_idx + 1) * batch_size:,}'
+                })
 
 # ====================================================================
 # --- MEMORY MANAGEMENT FUNCTIONS ---
@@ -467,7 +540,7 @@ def get_optimized_kernel_source(config):
     start_id_new = config['start_id_new']
     num_new_rules = config['num_new_rules']
     
-    # FULL OPTIMIZED KERNEL SOURCE
+    # FULL OPTIMIZED KERNEL SOURCE WITH CORRECT CONST QUALIFIERS
     kernel_source = f"""
 // ====================================================================
 // ULTRA-OPTIMIZED RULE PROCESSING KERNEL 
@@ -507,15 +580,15 @@ unsigned int char_to_pos_fast(unsigned char c) {{
     return 0xFFFFFFFF;
 }}
 
-// Main kernel - optimized  compute architecture
+// Main kernel - optimized compute architecture
 __kernel __attribute__((reqd_work_group_size({local_work_size}, 1, 1)))
 void bfs_kernel_optimized(
-    __global const unsigned char* base_words_in,
-    __global const unsigned int* rules_in,
-    __global unsigned int* rule_uniqueness_counts,
-    __global unsigned int* rule_effectiveness_counts,
-    __global unsigned int* global_hash_map,
-    __global const unsigned int* cracked_hash_map,
+    __global const unsigned char* base_words_in,           // READ-ONLY: Input words
+    __global const unsigned int* rules_in,                 // READ-ONLY: Input rules
+    __global unsigned int* rule_uniqueness_counts,         // WRITABLE: Unique word counter
+    __global unsigned int* rule_effectiveness_counts,      // WRITABLE: Cracked password counter
+    __global unsigned int* global_hash_map,                // WRITABLE: Global uniqueness tracking
+    __global const unsigned int* cracked_hash_map,         // READ-ONLY: Pre-populated cracked passwords
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
     const unsigned int max_word_len,
@@ -941,7 +1014,7 @@ void bfs_kernel_optimized(
             // This prevents duplicate counting across batches
             atomic_or(global_map_ptr, check_bit);
             
-            // Update uniqueness counter
+            // Update uniqueness counter (WRITABLE buffer)
             atomic_inc(&rule_uniqueness_counts[rule_batch_idx]);
             
             // Check cracked hash map (effectiveness)
@@ -950,6 +1023,7 @@ void bfs_kernel_optimized(
             unsigned int cracked_word = *cracked_map_ptr;
             
             if (cracked_word & check_bit) {{
+                // Update effectiveness counter (WRITABLE buffer)
                 atomic_inc(&rule_effectiveness_counts[rule_batch_idx]);
             }}
         }}
@@ -963,7 +1037,7 @@ void bfs_kernel_optimized(
 # ====================================================================
 
 def create_optimized_buffers(context, queue, config):
-    """Create OpenCL buffers optimized  memory architecture"""
+    """Create OpenCL buffers optimized for memory architecture"""
     mf = cl.mem_flags
     
     # Calculate buffer sizes based on configuration
@@ -973,7 +1047,7 @@ def create_optimized_buffers(context, queue, config):
     rule_size_in_int = config['rule_size_in_int']
     hash_map_size = config['hash_map_size']
     
-    print(f"{blue('💾')} {bold('Optimizing buffer allocation ...')}")
+    print(f"{blue('💾')} {bold('Optimizing buffer allocation...')}")
     
     # Calculate required memory
     word_buffer_size = words_per_batch * max_word_len * np.uint8().itemsize
@@ -998,16 +1072,16 @@ def create_optimized_buffers(context, queue, config):
         buffers[f'base_hashes_{i}'] = cl.Buffer(context, mf.READ_ONLY,
                                                hash_buffer_size)
     
-    # Rule buffer
+    # Rule buffer (READ_ONLY - rules don't change during kernel execution)
     buffers['rules_in'] = cl.Buffer(context, mf.READ_ONLY, rule_buffer_size)
     
-    # Counters
+    # Counters (READ_WRITE - modified by kernel with atomic operations)
     buffers['rule_uniqueness_counts'] = cl.Buffer(context, mf.READ_WRITE, counter_size)
     buffers['rule_effectiveness_counts'] = cl.Buffer(context, mf.READ_WRITE, counter_size)
     
     # Hash maps
-    buffers['global_hash_map'] = cl.Buffer(context, mf.READ_WRITE, hash_map_size)
-    buffers['cracked_hash_map'] = cl.Buffer(context, mf.READ_ONLY, hash_map_size)
+    buffers['global_hash_map'] = cl.Buffer(context, mf.READ_WRITE, hash_map_size)  # Modified by kernel
+    buffers['cracked_hash_map'] = cl.Buffer(context, mf.READ_ONLY, hash_map_size)  # Read-only after init
     
     print(f"{green('✅')} {bold('Buffers created successfully')}")
     return buffers
@@ -1110,7 +1184,7 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
                           skip_rule_encoding=False, disable_double_buffering=False,
                           disable_progress_bars=False, benchmark_mode=False):
     """
-    Main optimized pipeline for GPU rule ranking
+    Main optimized pipeline for GPU rule ranking with memory mapping
     """
     print(f"{green('=' * 70)}")
     print(f"{bold('⚡ ULTRA-OPTIMIZED RULE RANKING PIPELINE ')}")
@@ -1143,7 +1217,6 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
     
     # Get GPU memory info for parameter calculation
     total_vram, available_vram = get_gpu_memory_info(device)
-    total_words = 0  # Will be calculated from wordlist
     
     # 3. Configuration
     if preset:
@@ -1158,16 +1231,13 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
             get_performance_profile_info()
             return 0
     
+    # Get wordlist info using memory mapping
+    print(f"{blue('🗺️')}  {bold('Analyzing wordlist...')}")
+    with MemoryMappedWordlist(wordlist_path, MAX_WORD_LEN, batch_size or 100000) as wordlist:
+        total_words = wordlist.get_word_count()
+    
     # Auto-calculate parameters if not specified
     if batch_size is None or global_bits is None or cracked_bits is None:
-        # We need to estimate word count for proper calculation
-        try:
-            with open(wordlist_path, 'rb') as f:
-                content = f.read()
-                total_words = len(content.split(b'\n'))
-        except:
-            total_words = 1000000  # Default estimate
-        
         batch_size, global_bits, cracked_bits = calculate_optimal_parameters(
             available_vram, total_words, len(cracked_hashes), len(rules_list)
         )
@@ -1201,6 +1271,7 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
     }
     
     print(f"{blue('📊')} {bold('Final configuration:')}")
+    print(f"   {bold('Wordlist size:')} {cyan(f'{total_words:,}')} words")
     print(f"   {bold('Batch size:')} {cyan(f'{batch_size:,}')}")
     print(f"   {bold('Global hash map:')} {cyan(f'{global_bits} bits')}")
     print(f"   {bold('Cracked hash map:')} {cyan(f'{cracked_bits} bits')}")
@@ -1269,7 +1340,7 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
     else:
         print(f"{yellow('⚠️')}  {bold('No cracked hashes loaded')}")
     
-    # 8. Main processing loop
+    # 8. Main processing loop with memory mapping
     print(f"{green('🚀')} {bold('Starting processing pipeline...')}")
     
     performance_stats = {
@@ -1282,38 +1353,25 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
         'total_kernel_time': 0.0
     }
     
-    # Load wordlist
-    print(f"{blue('📖')} {bold('Loading wordlist...')}")
-    word_loader = simplified_wordlist_loader(
-        wordlist_path,
-        max_len=config['max_word_len'],
-        batch_size=config['batch_size']
-    )
+    # Setup progress tracking
+    total_rule_batches = len(rule_batches)
+    total_word_batches = (total_words + batch_size - 1) // batch_size
+    total_iterations = total_rule_batches * total_word_batches
     
-    # Create a list to store word batches
-    word_batches = []
-    try:
-        while True:
-            word_batch = next(word_loader)
-            word_batches.append(word_batch)
-    except StopIteration:
-        pass
-    
-    total_word_batches = len(word_batches)
-    total_words = sum(batch_count for _, _, batch_count in word_batches)
-    
-    print(f"{green('✅')} {bold('Wordlist loaded:')} {cyan(f'{total_word_batches}')} batches, {cyan(f'{total_words:,}')} total words")
-    
-    # Setup progress bars
-    if disable_progress_bars:
-        print(f"{blue('⚡')} {bold('Progress bars disabled - running in silent mode')}")
-        main_pbar = None
-    else:
-        total_work_units = len(rule_batches)
-        main_pbar = tqdm(total=total_work_units, desc="Processing rules", unit="batch", disable=disable_progress_bars)
+    print(f"{blue('📊')} {bold('Processing plan:')}")
+    print(f"   {bold('Rule batches:')} {cyan(f'{total_rule_batches:,}')}")
+    print(f"   {bold('Word batches:')} {cyan(f'{total_word_batches:,}')}")
+    print(f"   {bold('Total iterations:')} {cyan(f'{total_iterations:,}')}")
     
     # Initialize global hash map
     cl.enqueue_copy(queue, buffers['global_hash_map'], global_map_np).wait()
+    
+    # Create overall progress bar if enabled
+    if not disable_progress_bars:
+        overall_pbar = tqdm(total=total_rule_batches, desc="Processing rules", unit="batch", 
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+    else:
+        overall_pbar = None
     
     # Process each rule batch with ALL word batches
     for rule_batch_idx, ((start_idx, end_idx), encoded_rules) in enumerate(zip(rule_batches, encoded_rule_batches)):
@@ -1329,8 +1387,16 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
         cl.enqueue_fill_buffer(queue, buffers['rule_effectiveness_counts'],
                               np.uint32(0), 0, counter_size)
         
+        # Create memory-mapped wordlist for this rule batch
+        wordlist_gen = create_wordlist_batches(
+            wordlist_path,
+            max_word_len=config['max_word_len'],
+            batch_size=config['batch_size']
+        )
+        
         # Process this rule batch against ALL word batches
-        for word_batch_idx, (words_np, hashes_np, word_count) in enumerate(word_batches):
+        word_batch_idx = 0
+        for words_np, hashes_np, word_count in wordlist_gen:
             # Copy word data to GPU
             if disable_double_buffering:
                 # Use single buffer if double buffering disabled
@@ -1382,13 +1448,13 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
             words_per_sec = word_count / total_time if total_time > 0 else 0
             performance_stats['batch_speeds'].append(words_per_sec)
             
-            if not disable_progress_bars and main_pbar:
+            word_batch_idx += 1
+            
+            # Update overall progress - SIMPLIFIED DESCRIPTION
+            if overall_pbar:
                 avg_speed = sum(performance_stats['batch_speeds'][-5:]) / min(5, len(performance_stats['batch_speeds']))
-                main_pbar.set_description(
-                    f"Rule batch {rule_batch_idx+1}/{len(rule_batches)} | "
-                    f"Word batch {word_batch_idx+1}/{len(word_batches)} | "
-                    f"Speed: {avg_speed:,.0f} w/s"
-                )
+                # Simplified description without word count
+                overall_pbar.set_description(f"Batch {rule_batch_idx+1}/{total_rule_batches} | {avg_speed:,.0f} w/s")
         
         # After processing ALL word batches for this rule batch, read results
         uniqueness_counts = np.zeros(num_rules, dtype=np.uint32)
@@ -1411,14 +1477,16 @@ def run_optimized_pipeline(wordlist_path, rules_path, cracked_path,
         performance_stats['unique_found'] += batch_unique
         performance_stats['cracked_found'] += batch_cracked
         
-        if not disable_progress_bars:
-            print(f"\n{green('✅')} Rule batch {rule_batch_idx+1}: +{batch_unique:,} unique, +{batch_cracked:,} cracked")
+        # Update overall progress bar - NO POSTFIX
+        if overall_pbar:
+            overall_pbar.update(1)
         
-        if main_pbar:
-            main_pbar.update(1)
+        # Show batch completion message
+        if not disable_progress_bars:
+            print(f"{green('✅')} Rule batch {rule_batch_idx+1}: +{batch_unique:,} unique, +{batch_cracked:,} cracked")
     
-    if main_pbar:
-        main_pbar.close()
+    if overall_pbar:
+        overall_pbar.close()
     
     # 9. Final results
     total_time = time() - start_time
