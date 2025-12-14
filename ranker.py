@@ -1771,10 +1771,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     num_words_batch_exec = 0
     
     # Create progress bars with proper formatting and ETA
-    word_batch_pbar = tqdm(total=total_words, desc="Processing word batches", unit=" word", 
+    word_batch_pbar = tqdm(total=total_words, desc="Wordlist progress", unit=" word", 
                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
                           position=0)
-    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Processing rule batches", unit=" batch", 
+    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches processed", unit=" batch", 
                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                           position=1)
 
@@ -1910,12 +1910,18 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             total_unique_found += batch_unique_found
             total_cracked_found += batch_cracked_found
             
-            # Update progress bars
+            # Update progress bars with dynamic counters
             words_processed_so_far = words_processed_total + word_batch_data['count'] * (rule_batch_idx + 1) / total_rule_batches
             word_batch_pbar.n = min(int(words_processed_so_far), total_words)
+            word_batch_pbar.set_description(
+                f"Wordlist: {int(words_processed_so_far):,}/{total_words:,} [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}]"
+            )
             
             # Update rule batch progress
             rule_batch_pbar.update(1)
+            rule_batch_pbar.set_description(
+                f"Rules: {rule_batch_idx+1}/{total_rule_batches} (Word batch: {word_batch_idx+1}/{total_word_batches})"
+            )
             
             # Update interrupt handler stats
             update_progress_stats(words_processed_so_far, total_unique_found, total_cracked_found)
@@ -1924,7 +1930,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         words_processed_total += word_batch_data['count']
         processed_word_batches += 1
         
-        # Update word batch progress
+        # Update word batch progress bar
         word_batch_pbar.update(word_batch_data['count'])
         
         # Reset rule batch progress for next word batch
