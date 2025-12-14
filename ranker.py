@@ -1555,22 +1555,24 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     # USE OPTIMIZED LOADER INSTEAD OF OLD ONE
     word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
+    total_rule_batches = len(rule_batch_starts)
     
-    print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{len(rule_batch_starts):,}')} {bold('batches')} "
+    print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{total_rule_batches:,}')} {bold('batches')} "
           f"{bold('(up to')} {cyan(f'{MAX_RULES_IN_BATCH:,}')} {bold('rules per batch)')}")
     
-    # Use numpy arrays for counters to avoid overflow
-    words_processed_total = np.uint64(0)
-    total_unique_found = np.uint64(0)
-    total_cracked_found = np.uint64(0)
+    # Use numpy arrays for counters to avoid overflow - CHANGE TO PYTHON INT
+    words_processed_total = 0  # Changed from np.uint64 to Python int
+    total_unique_found = 0     # Changed from np.uint64 to Python int
+    total_cracked_found = 0    # Changed from np.uint64 to Python int
     
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
     num_words_batch_exec = 0
     
-    word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist from disk [Unique: 0 | Cracked: 0]", unit=" word")
-    rule_batch_pbar = tqdm(total=len(rule_batch_starts), desc="Rule batches processed", unit=" batch")
+    # Update progress bar totals based on actual counts
+    word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist [Unique: 0 | Cracked: 0]", unit=" word")
+    rule_batch_pbar = tqdm(total=0, desc="Rule batches processed", unit=" batch", bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
 
     # A. Initial word batch load
     try:
@@ -1585,111 +1587,140 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # B. Main Pipelined Loop
     wordlist_processing_complete = False
-    remaining_rule_batches = rule_batch_starts.copy()
+    current_rule_batch_idx = 0  # Track current rule batch
     
-    while True:
+    # Initialize global hash map with first word batch
+    print(f"{blue('📊')} {bold('Initializing global hash map with first word batch...')}")
+    global_size_init_global = (int(math.ceil(num_words_batch_exec / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+    local_size_init_global = (LOCAL_WORK_SIZE,)
+    kernel_init(queue, global_size_init_global, local_size_init_global,
+                global_hash_map_g,
+                base_hashes_g[current_word_buffer_idx],
+                np.uint32(num_words_batch_exec),
+                np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
+    print(f"{green('✅')} {bold('Global hash map initialized with first batch.')}")
+    
+    # Track processed word batches
+    processed_word_batches = 0
+    
+    while current_rule_batch_idx < total_rule_batches:
         # Check for interrupt before processing
         if interrupted:
             break
-            
-        exec_idx = current_word_buffer_idx
-        next_idx = 1 - current_word_buffer_idx
         
-        # 7. ASYNC COPY: Start load of the *next* batch (only if wordlist processing not complete)
-        next_batch_data = None
-        if not wordlist_processing_complete:
+        # Get current word batch index
+        exec_idx = current_word_buffer_idx
+        
+        # 7. Process current rule batch with current word batch
+        rule_start_index = rule_batch_starts[current_rule_batch_idx]
+        rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
+        num_rules_in_batch = rule_end_index - rule_start_index
+
+        current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
+        current_rules_np = np.concatenate(current_rule_batch_list)
+        
+        cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
+        cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
+        cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
+        
+        global_size = (num_words_batch_exec * num_rules_in_batch, )
+        global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+
+        kernel_bfs.set_args(
+            base_words_in_g[exec_idx],
+            rules_in_g,
+            rule_uniqueness_counts_g,
+            rule_effectiveness_counts_g,
+            global_hash_map_g,
+            cracked_hash_map_g,
+            np.uint32(num_words_batch_exec),
+            np.uint32(num_rules_in_batch),
+            np.uint32(MAX_WORD_LEN),
+            np.uint32(MAX_OUTPUT_LEN),
+            np.uint32(GLOBAL_HASH_MAP_MASK),
+            np.uint32(CRACKED_HASH_MAP_MASK)
+        )
+
+        exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
+        exec_event.wait()
+
+        cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
+        cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
+
+        # Update counts for this rule batch
+        batch_unique_found = 0
+        batch_cracked_found = 0
+        
+        for i in range(num_rules_in_batch):
+            rule_index = rule_start_index + i
+            # Convert to Python int
+            uniqueness_val = int(mapped_uniqueness_np[i])
+            effectiveness_val = int(mapped_effectiveness_np[i])
+            
+            rules_list[rule_index]['uniqueness_score'] += uniqueness_val
+            rules_list[rule_index]['effectiveness_score'] += effectiveness_val
+            batch_unique_found += uniqueness_val
+            batch_cracked_found += effectiveness_val
+        
+        # Update global totals
+        total_unique_found += batch_unique_found
+        total_cracked_found += batch_cracked_found
+        
+        # Update progress bars
+        word_batch_pbar.set_description(
+            f"Processing wordlist [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,} | Word Batch: {processed_word_batches+1}]"
+        )
+        word_batch_pbar.refresh()
+        
+        rule_batch_pbar.update(1)
+        rule_batch_pbar.total = total_rule_batches
+        rule_batch_pbar.set_description(f"Rule batches: {current_rule_batch_idx+1}/{total_rule_batches}")
+        rule_batch_pbar.refresh()
+        
+        # Update interrupt handler stats
+        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
+        
+        # Move to next rule batch
+        current_rule_batch_idx += 1
+        
+        # If we've processed all rule batches for this word batch, load next word batch
+        if current_rule_batch_idx >= total_rule_batches and not wordlist_processing_complete:
+            # Load next word batch
             try:
                 next_batch_data = next(word_iterator)
                 base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
-                copy_events[next_idx] = cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
-                cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next, wait_for=[copy_events[next_idx]])
+                
+                # Switch buffers
+                next_idx = 1 - current_word_buffer_idx
+                cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
+                cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next).wait()
+                
+                # Update global hash map with new word batch
+                kernel_init(queue, global_size_init_global, local_size_init_global,
+                            global_hash_map_g,
+                            base_hashes_g[next_idx],
+                            np.uint32(num_words_batch_next),
+                            np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
+                
+                # Update counters
+                words_processed_total += num_words_batch_exec
+                word_batch_pbar.update(num_words_batch_exec)
+                
+                # Switch to new buffer and reset rule processing
+                current_word_buffer_idx = next_idx
+                num_words_batch_exec = num_words_batch_next
+                current_rule_batch_idx = 0  # Restart rule processing
+                processed_word_batches += 1
+                
             except StopIteration:
                 wordlist_processing_complete = True
-                print(f"{green('✅')} {bold('Wordlist fully loaded. Continuing with remaining rule batches...')}")
-                next_batch_data = None
-                copy_events[next_idx] = None
-        
-        # 8. PROCESS RULE BATCHES (process all remaining rule batches with current word batch)
-        for rule_batch_idx, rule_start_index in enumerate(remaining_rule_batches):
-            # Check for interrupt during rule batch processing
-            if interrupted:
-                break
-                
-            rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
-            num_rules_in_batch = rule_end_index - rule_start_index
-
-            current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
-            current_rules_np = np.concatenate(current_rule_batch_list)
-            
-            cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
-            cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
-            
-            global_size = (num_words_batch_exec * num_rules_in_batch, )
-            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-
-            kernel_bfs.set_args(
-                base_words_in_g[exec_idx],
-                rules_in_g,
-                rule_uniqueness_counts_g,
-                rule_effectiveness_counts_g,
-                global_hash_map_g,
-                cracked_hash_map_g,
-                np.uint32(num_words_batch_exec),
-                np.uint32(num_rules_in_batch),
-                np.uint32(MAX_WORD_LEN),
-                np.uint32(MAX_OUTPUT_LEN),
-                np.uint32(GLOBAL_HASH_MAP_MASK),
-                np.uint32(CRACKED_HASH_MAP_MASK)
-            )
-
-            exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
-            exec_event.wait()
-
-            cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
-            cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
-
-            for i in range(num_rules_in_batch):
-                rule_index = rule_start_index + i
-                # Convert to Python int to avoid overflow in rule scores
-                uniqueness_val = int(mapped_uniqueness_np[i])
-                effectiveness_val = int(mapped_effectiveness_np[i])
-                
-                rules_list[rule_index]['uniqueness_score'] += uniqueness_val
-                rules_list[rule_index]['effectiveness_score'] += effectiveness_val
-                total_unique_found += np.uint64(uniqueness_val)
-                total_cracked_found += np.uint64(effectiveness_val)
-
-            rule_batch_pbar.update(1)
-
-        # Remove processed rule batches from the list
-        remaining_rule_batches = []
-
-        # Update progress stats for interrupt handler
-        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
-            
-        # 9. UPDATE AND PREPARE NEXT ITERATION
-        words_processed_total += np.uint64(num_words_batch_exec)
-        word_batch_pbar.update(num_words_batch_exec)
-        word_batch_pbar.set_description(f"Processing wordlist from disk [Unique: {int(total_unique_found):,} | Cracked: {int(total_cracked_found):,}]")
-
-        # Check if we're done (both wordlist and all rule batches processed)
-        if wordlist_processing_complete and not remaining_rule_batches:
-            break
-            
-        # Move to next word batch if available
-        if next_batch_data is not None:
-            current_word_buffer_idx = next_idx
-            num_words_batch_exec = num_words_batch_next
-        elif wordlist_processing_complete:
-            # If wordlist is done but we still have rule batches, we need to reset to process remaining rules
-            # with the current word batch (this handles the case where we have more rule batches than word batches)
-            if remaining_rule_batches:
-                print(f"{blue('🔄')} {bold('Reusing current word batch for remaining rule processing...')}")
-                continue
-            else:
+                print(f"{green('✅')} {bold('Wordlist fully processed.')}")
                 break
 
+    # Final update for last word batch
+    words_processed_total += num_words_batch_exec
+    word_batch_pbar.update(num_words_batch_exec)
+    
     word_batch_pbar.close()
     rule_batch_pbar.close()
     
@@ -1704,10 +1735,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     print(f"\n{green('=' * 60)}")
     print(f"{bold('🎉 Final Results Summary')}")
     print(f"{green('=' * 60)}")
-    print(f"{blue('📊')} {bold('Total Words Processed:')} {cyan(f'{int(words_processed_total):,}')}")
+    print(f"{blue('📊')} {bold('Total Words Processed:')} {cyan(f'{words_processed_total:,}')}")
     print(f"{blue('📊')} {bold('Total Rules Processed:')} {cyan(f'{total_rules:,}')}")
-    print(f"{blue('🎯')} {bold('Total Unique Words Generated:')} {cyan(f'{int(total_unique_found):,}')}")
-    print(f"{blue('🔓')} {bold('Total True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
+    print(f"{blue('🎯')} {bold('Total Unique Words Generated:')} {cyan(f'{total_unique_found:,}')}")
+    print(f"{blue('🔓')} {bold('Total True Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
     print(f"{blue('⏱️')}  {bold('Total Execution Time:')} {cyan(f'{end_time - start_time:.2f} seconds')}")
     print(f"{green('=' * 60)}{Colors.END}\n")
 
@@ -1763,4 +1794,3 @@ if __name__ == '__main__':
         cracked_hash_map_bits=args.cracked_bits,
         preset=args.preset
     )
-
