@@ -53,20 +53,20 @@ except AttributeError:
 # ====================================================================
 # --- CONSTANTS ---
 # ====================================================================
-MAX_WORD_LEN = 32
-MAX_OUTPUT_LEN = MAX_WORD_LEN * 2
+MAX_WORD_LEN = 256  # Increased for the comprehensive kernel
+MAX_OUTPUT_LEN = 512  # Increased for the comprehensive kernel
 MAX_RULE_ARGS = 4
 MAX_RULES_IN_BATCH = 1024
 LOCAL_WORK_SIZE = 256
 
 # Default values (will be adjusted based on VRAM)
-DEFAULT_WORDS_PER_GPU_BATCH = 200000
+DEFAULT_WORDS_PER_GPU_BATCH = 100000  # Reduced due to larger word size
 DEFAULT_GLOBAL_HASH_MAP_BITS = 35
 DEFAULT_CRACKED_HASH_MAP_BITS = 33
 
 # VRAM usage thresholds (adjustable)
 VRAM_SAFETY_MARGIN = 0.15  # 15% safety margin
-MIN_BATCH_SIZE = 50000     # Minimum batch size to maintain performance
+MIN_BATCH_SIZE = 25000     # Reduced minimum batch size
 MIN_HASH_MAP_BITS = 28     # Minimum hash map size (256MB)
 
 # Memory reduction factors for allocation failures
@@ -81,20 +81,6 @@ current_top_k = 0
 words_processed_total = None
 total_unique_found = None
 total_cracked_found = None
-
-# Rule IDs (updated for larger capacity)
-START_ID_SIMPLE = 0
-NUM_SIMPLE_RULES = 10
-START_ID_TD = 10
-NUM_TD_RULES = 20
-START_ID_S = 30
-NUM_S_RULES = 256 * 256
-START_ID_A = 30 + NUM_S_RULES
-NUM_A_RULES = 3 * 256
-START_ID_GROUPB = START_ID_A + NUM_A_RULES
-NUM_GROUPB_RULES = 13
-START_ID_NEW = START_ID_GROUPB + NUM_GROUPB_RULES
-NUM_NEW_RULES = 13
 
 # ====================================================================
 # --- OPTIMIZED FILE LOADING FUNCTIONS ---
@@ -172,7 +158,8 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                 file_size = len(mm)
                 
                 # Use a progress bar that updates based on file position
-                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True) as pbar:
+                with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True, 
+                         bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                     while pos < file_size and not interrupted:
                         # Find next newline efficiently
                         end_pos = mm.find(b'\n', pos)
@@ -595,7 +582,7 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     # Adjust batch size based on rule count to avoid too many iterations
     if total_rules > 100000:
         # For very large rule sets, use smaller batches to fit in memory
-        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 100000)
+        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 50000)
     else:
         suggested_batch_size = DEFAULT_WORDS_PER_GPU_BATCH
     
@@ -676,19 +663,19 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
     recommendations = {
         "low_memory": {
             "description": "Low Memory Mode (for GPUs with < 4GB VRAM)",
-            "batch_size": 50000,
+            "batch_size": 25000,
             "global_bits": 30,
             "cracked_bits": 28
         },
         "medium_memory": {
             "description": "Medium Memory Mode (for GPUs with 4-8GB VRAM)",
-            "batch_size": 150000,
+            "batch_size": 75000,
             "global_bits": 33,
             "cracked_bits": 31
         },
         "high_memory": {
             "description": "High Memory Mode (for GPUs with > 8GB VRAM)",
-            "batch_size": 300000,
+            "batch_size": 150000,
             "global_bits": 35,
             "cracked_bits": 33
         },
@@ -759,49 +746,665 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
     raise cl.MemoryError(f"{red('❌')} {bold('Failed to allocate buffers after')} {cyan(f'{max_retries}')} {bold('retries')}")
 
 # ====================================================================
-# --- KERNEL SOURCE ---
+# --- COMPREHENSIVE KERNEL SOURCE (FIXED) ---
 # ====================================================================
+
 def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
     global_hash_map_mask = (1 << (global_hash_map_bits - 5)) - 1
     cracked_hash_map_mask = (1 << (cracked_hash_map_bits - 5)) - 1
     
-    return f"""
-// FNV-1a Hash implementation in OpenCL
-unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
+    return """
+// ============================================================================
+// COMPREHENSIVE HASHCAT RULES IMPLEMENTATION FOR OPENCL
+// ============================================================================
+
+#define MAX_WORD_LEN 256
+#define MAX_OUTPUT_LEN 512
+#define MAX_RULE_LEN 16
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
+// Check if character is lowercase
+int is_lower(unsigned char c) {
+    return (c >= 'a' && c <= 'z');
+}
+
+// Check if character is uppercase
+int is_upper(unsigned char c) {
+    return (c >= 'A' && c <= 'Z');
+}
+
+// Check if character is a digit
+int is_digit(unsigned char c) {
+    return (c >= '0' && c <= '9');
+}
+
+// Check if character is alphanumeric
+int is_alnum(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+// Toggle case of a single character
+unsigned char toggle_case(unsigned char c) {
+    if (is_lower(c)) return c - 32;
+    if (is_upper(c)) return c + 32;
+    return c;
+}
+
+// Convert character to lowercase
+unsigned char to_lower(unsigned char c) {
+    if (is_upper(c)) return c + 32;
+    return c;
+}
+
+// Convert character to uppercase
+unsigned char to_upper(unsigned char c) {
+    if (is_lower(c)) return c - 32;
+    return c;
+}
+
+// FNV-1a Hash implementation
+unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
     unsigned int hash = 2166136261U;
-    for (unsigned int i = 0; i < len; i++) {{
+    for (unsigned int i = 0; i < len; i++) {
         hash ^= data[i];
         hash *= 16777619U;
-    }}
+    }
     return hash;
-}}
+}
 
 // Helper function to convert char digit/letter to int position
-unsigned int char_to_pos(unsigned char c) {{
+unsigned int char_to_pos(unsigned char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'z') return c - 'a' + 36;
     return 0xFFFFFFFF; 
-}}
+}
 
-__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
-void hash_map_init_kernel(
-    __global unsigned int* global_hash_map,
-    __global const unsigned int* base_hashes,
-    const unsigned int num_hashes,
-    const unsigned int map_mask)
-{{
-    unsigned int global_id = get_global_id(0);
-    if (global_id >= num_hashes) return;
+// ============================================================================
+// RULE APPLICATION FUNCTION
+// ============================================================================
 
-    unsigned int word_hash = base_hashes[global_id];
-    unsigned int map_index = (word_hash >> 5) & map_mask;
-    unsigned int bit_index = word_hash & 31;
-    unsigned int set_bit = (1U << bit_index);
+void apply_rule(const unsigned char* word, int word_len,
+                const unsigned char* rule, int rule_len,
+                unsigned char* output, int* out_len, int* changed) {
+    
+    *out_len = 0;
+    *changed = 0;
+    
+    // Clear output
+    for (int i = 0; i < MAX_OUTPUT_LEN; i++) output[i] = 0;
+    
+    // Early exit for empty inputs
+    if (rule_len == 0 || word_len == 0) return;
+    
+    // ========================================================================
+    // SIMPLE RULES (1 character)
+    // ========================================================================
+    
+    if (rule_len == 1) {
+        switch (rule[0]) {
+            // l - Lowercase all letters
+            case 'l':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = to_lower(word[i]);
+                }
+                *changed = 1;
+                return;
+                
+            // u - Uppercase all letters
+            case 'u':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = to_upper(word[i]);
+                }
+                *changed = 1;
+                return;
+                
+            // c - Capitalize first letter, lowercase rest
+            case 'c':
+                *out_len = word_len;
+                if (word_len > 0) {
+                    output[0] = to_upper(word[0]);
+                    for (int i = 1; i < word_len; i++) {
+                        output[i] = to_lower(word[i]);
+                    }
+                }
+                *changed = 1;
+                return;
+                
+            // C - Lowercase first letter, uppercase rest
+            case 'C':
+                *out_len = word_len;
+                if (word_len > 0) {
+                    output[0] = to_lower(word[0]);
+                    for (int i = 1; i < word_len; i++) {
+                        output[i] = to_upper(word[i]);
+                    }
+                }
+                *changed = 1;
+                return;
+                
+            // t - Toggle case of all letters
+            case 't':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = toggle_case(word[i]);
+                }
+                *changed = 1;
+                return;
+                
+            // r - Reverse the entire word
+            case 'r':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[word_len - 1 - i];
+                }
+                *changed = 1;
+                return;
+                
+            // k - Swap first two characters
+            case 'k':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                }
+                if (word_len >= 2) {
+                    output[0] = word[1];
+                    output[1] = word[0];
+                    *changed = 1;
+                }
+                return;
+                
+            // : - Do nothing (identity)
+            case ':':
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                }
+                *changed = 0;
+                return;
+                
+            // d - Duplicate word
+            case 'd':
+                if (word_len * 2 <= MAX_OUTPUT_LEN) {
+                    *out_len = word_len * 2;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        output[word_len + i] = word[i];
+                    }
+                    *changed = 1;
+                }
+                return;
+                
+            // f - Reflect word (word + reverse)
+            case 'f':
+                if (word_len * 2 <= MAX_OUTPUT_LEN) {
+                    *out_len = word_len * 2;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        output[word_len + i] = word[word_len - 1 - i];
+                    }
+                    *changed = 1;
+                }
+                return;
+                
+            // p - Pluralize (add 's')
+            case 'p':
+                if (word_len + 1 <= MAX_OUTPUT_LEN) {
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                    }
+                    output[*out_len] = 's';
+                    (*out_len)++;
+                    *changed = 1;
+                }
+                return;
+                
+            // z - Duplicate first character
+            case 'z':
+                if (word_len + 1 <= MAX_OUTPUT_LEN) {
+                    output[0] = word[0];
+                    for (int i = 0; i < word_len; i++) {
+                        output[i + 1] = word[i];
+                    }
+                    *out_len = word_len + 1;
+                    *changed = 1;
+                }
+                return;
+                
+            // Z - Duplicate last character
+            case 'Z':
+                if (word_len + 1 <= MAX_OUTPUT_LEN) {
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                    }
+                    output[word_len] = word[word_len - 1];
+                    *out_len = word_len + 1;
+                    *changed = 1;
+                }
+                return;
+                
+            // q - Duplicate all characters
+            case 'q':
+                if (word_len * 2 <= MAX_OUTPUT_LEN) {
+                    int idx = 0;
+                    for (int i = 0; i < word_len; i++) {
+                        output[idx++] = word[i];
+                        output[idx++] = word[i];
+                    }
+                    *out_len = word_len * 2;
+                    *changed = 1;
+                }
+                return;
+                
+            // E - Title case (capitalize first letter of each word)
+            case 'E':
+                *out_len = word_len;
+                int capitalize_next = 1;
+                for (int i = 0; i < word_len; i++) {
+                    if (capitalize_next && is_lower(word[i])) {
+                        output[i] = word[i] - 32;
+                        capitalize_next = 0;
+                    } else {
+                        output[i] = word[i];
+                    }
+                    if (word[i] == ' ' || word[i] == '-' || word[i] == '_') {
+                        capitalize_next = 1;
+                    }
+                }
+                *changed = 1;
+                return;
+                
+            default:
+                // Unknown simple rule, treat as identity
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                }
+                *changed = 0;
+                return;
+        }
+    }
+    
+    // ========================================================================
+    // POSITION-BASED RULES (Tn, Dn, etc.)
+    // ========================================================================
+    
+    else if (rule_len == 2) {
+        unsigned char cmd = rule[0];
+        unsigned char arg = rule[1];
+        
+        // Check if arg is a digit
+        if (is_digit(arg)) {
+            int n = arg - '0';
+            
+            switch (cmd) {
+                // Tn - Toggle case at position n
+                case 'T':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n) {
+                            output[i] = toggle_case(word[i]);
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // Dn - Delete character at position n
+                case 'D':
+                    *out_len = 0;
+                    for (int i = 0; i < word_len; i++) {
+                        if (i != n) {
+                            output[(*out_len)++] = word[i];
+                        } else {
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // Ln - Delete left of position n
+                case 'L':
+                    *out_len = 0;
+                    for (int i = n; i < word_len; i++) {
+                        output[(*out_len)++] = word[i];
+                        *changed = 1;
+                    }
+                    return;
+                    
+                // Rn - Delete right of position n
+                case 'R':
+                    *out_len = n + 1;
+                    if (*out_len > word_len) *out_len = word_len;
+                    for (int i = 0; i < *out_len; i++) {
+                        output[i] = word[i];
+                    }
+                    *changed = 1;
+                    return;
+                    
+                // +n - ASCII increment at position n
+                case '+':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n && word[i] < 255) {
+                            output[i] = word[i] + 1;
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // -n - ASCII decrement at position n
+                case '-':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n && word[i] > 0) {
+                            output[i] = word[i] - 1;
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // .n - Replace with dot at position n
+                case '.':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n) {
+                            output[i] = '.';
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // ,n - Replace with comma at position n
+                case ',':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n) {
+                            output[i] = ',';
+                            *changed = 1;
+                        }
+                    }
+                    return;
+                    
+                // 'n - Increment character at position n (using escape sequence)
+                case '\\'':
+                    *out_len = word_len;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                        if (i == n && word[i] < 255) {
+                            output[i] = word[i] + 1;
+                            *changed = 1;
+                        }
+                    }
+                    return;
+            }
+        }
+        
+        // Handle non-digit arguments
+        switch (cmd) {
+            // ^X - Prepend character X
+            case '^':
+                if (word_len + 1 <= MAX_OUTPUT_LEN) {
+                    output[0] = arg;
+                    for (int i = 0; i < word_len; i++) {
+                        output[i + 1] = word[i];
+                    }
+                    *out_len = word_len + 1;
+                    *changed = 1;
+                }
+                return;
+                
+            // $X - Append character X
+            case '$':
+                if (word_len + 1 <= MAX_OUTPUT_LEN) {
+                    for (int i = 0; i < word_len; i++) {
+                        output[i] = word[i];
+                    }
+                    output[word_len] = arg;
+                    *out_len = word_len + 1;
+                    *changed = 1;
+                }
+                return;
+                
+            // @X - Delete all instances of character X
+            case '@':
+                *out_len = 0;
+                for (int i = 0; i < word_len; i++) {
+                    if (word[i] != arg) {
+                        output[(*out_len)++] = word[i];
+                    } else {
+                        *changed = 1;
+                    }
+                }
+                return;
+                
+            // !X - Reject word if it contains X
+            case '!':
+                for (int i = 0; i < word_len; i++) {
+                    if (word[i] == arg) {
+                        *out_len = 0;
+                        *changed = -1;
+                        return;
+                    }
+                }
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                }
+                return;
+                
+            // /X - Reject word if it doesn't contain X
+            case '/': {
+                int found_char = 0;
+                for (int i = 0; i < word_len; i++) {
+                    if (word[i] == arg) {
+                        found_char = 1;
+                        break;
+                    }
+                }
+                if (!found_char) {
+                    *out_len = 0;
+                    *changed = -1;
+                    return;
+                }
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                }
+                return;
+            }
+        }
+    }
+    
+    // ========================================================================
+    // SUBSTITUTION RULES (sXY)
+    // ========================================================================
+    
+    else if (rule_len == 3 && rule[0] == 's') {
+        // sXY - Substitute X with Y
+        unsigned char find = rule[1];
+        unsigned char replace = rule[2];
+        
+        *out_len = word_len;
+        for (int i = 0; i < word_len; i++) {
+            output[i] = word[i];
+            if (word[i] == find) {
+                output[i] = replace;
+                *changed = 1;
+            }
+        }
+        return;
+    }
+    
+    // ========================================================================
+    // COMPLEX RULES (multi-character)
+    // ========================================================================
+    
+    else if (rule_len >= 3) {
+        // Handle rules like xn m, *n m, Kn m, i n X, o n X, etc.
+        
+        // xn m - Extract substring from n to m
+        if (rule[0] == 'x' && rule_len >= 3) {
+            unsigned int n = char_to_pos(rule[1]);
+            unsigned int m = char_to_pos(rule[2]);
+            
+            if (n != 0xFFFFFFFF && m != 0xFFFFFFFF) {
+                if (n > m) {
+                    unsigned int temp = n;
+                    n = m;
+                    m = temp;
+                }
+                if (n >= word_len) n = 0;
+                if (m >= word_len) m = word_len - 1;
+                
+                *out_len = 0;
+                for (unsigned int i = n; i <= m && i < word_len; i++) {
+                    output[(*out_len)++] = word[i];
+                }
+                *changed = (*out_len > 0);
+                return;
+            }
+        }
+        
+        // *n m - Swap characters at positions n and m
+        else if (rule[0] == '*' && rule_len >= 3) {
+            unsigned int n = char_to_pos(rule[1]);
+            unsigned int m = char_to_pos(rule[2]);
+            
+            *out_len = word_len;
+            for (int i = 0; i < word_len; i++) {
+                output[i] = word[i];
+            }
+            if (n != 0xFFFFFFFF && m != 0xFFFFFFFF && n < word_len && m < word_len && n != m) {
+                unsigned char temp = output[n];
+                output[n] = output[m];
+                output[m] = temp;
+                *changed = 1;
+            }
+            return;
+        }
+        
+        // i n X - Insert X at position n
+        else if (rule[0] == 'i' && rule_len >= 3) {
+            unsigned int n = char_to_pos(rule[1]);
+            unsigned char x = rule[2];
+            
+            if (n != 0xFFFFFFFF && word_len + 1 <= MAX_OUTPUT_LEN) {
+                *out_len = 0;
+                for (int i = 0; i < word_len; i++) {
+                    if (i == n) {
+                        output[(*out_len)++] = x;
+                    }
+                    output[(*out_len)++] = word[i];
+                }
+                if (n >= word_len) {
+                    output[(*out_len)++] = x;
+                }
+                *changed = 1;
+                return;
+            }
+        }
+        
+        // o n X - Overwrite at position n with X
+        else if (rule[0] == 'o' && rule_len >= 3) {
+            unsigned int n = char_to_pos(rule[1]);
+            unsigned char x = rule[2];
+            
+            if (n != 0xFFFFFFFF) {
+                *out_len = word_len;
+                for (int i = 0; i < word_len; i++) {
+                    output[i] = word[i];
+                    if (i == n) {
+                        output[i] = x;
+                        *changed = 1;
+                    }
+                }
+                return;
+            }
+        }
+        
+        // {N - Rotate left N positions
+        else if (rule[0] == '{' && rule_len >= 2) {
+            unsigned int n = char_to_pos(rule[1]);
+            if (n == 0xFFFFFFFF) n = 1;
+            
+            *out_len = word_len;
+            for (int i = 0; i < word_len; i++) {
+                int src = (i + n) % word_len;
+                output[i] = word[src];
+            }
+            *changed = 1;
+            return;
+        }
+        
+        // }N - Rotate right N positions
+        else if (rule[0] == '}' && rule_len >= 2) {
+            unsigned int n = char_to_pos(rule[1]);
+            if (n == 0xFFFFFFFF) n = 1;
+            
+            *out_len = word_len;
+            for (int i = 0; i < word_len; i++) {
+                int src = (i - n + word_len) % word_len;
+                output[i] = word[src];
+            }
+            *changed = 1;
+            return;
+        }
+        
+        // [N - Delete first N characters
+        else if (rule[0] == '[' && rule_len >= 2) {
+            unsigned int n = char_to_pos(rule[1]);
+            if (n == 0xFFFFFFFF) n = 1;
+            if (n > word_len) n = word_len;
+            
+            *out_len = word_len - n;
+            for (int i = n; i < word_len; i++) {
+                output[i - n] = word[i];
+            }
+            *changed = 1;
+            return;
+        }
+        
+        // ]N - Delete last N characters
+        else if (rule[0] == ']' && rule_len >= 2) {
+            unsigned int n = char_to_pos(rule[1]);
+            if (n == 0xFFFFFFFF) n = 1;
+            if (n > word_len) n = word_len;
+            
+            *out_len = word_len - n;
+            for (int i = 0; i < *out_len; i++) {
+                output[i] = word[i];
+            }
+            *changed = 1;
+            return;
+        }
+    }
+    
+    // ========================================================================
+    // DEFAULT: Unknown rule, treat as identity
+    // ========================================================================
+    
+    *out_len = word_len;
+    for (int i = 0; i < word_len; i++) {
+        output[i] = word[i];
+    }
+    *changed = 0;
+}
 
-    atomic_or(&global_hash_map[map_index], set_bit);
-}}
+// ============================================================================
+// MAIN KERNEL
+// ============================================================================
 
-__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(""" + str(LOCAL_WORK_SIZE) + """, 1, 1)))
 void bfs_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned int* rules_in,
@@ -815,507 +1418,107 @@ void bfs_kernel(
     const unsigned int max_output_len,
     const unsigned int global_map_mask,
     const unsigned int cracked_map_mask)
-{{
+{
     unsigned int global_id = get_global_id(0);
-
     unsigned int word_per_rule_count = num_words * num_rules_in_batch;
+    
     if (global_id >= word_per_rule_count) return;
 
     unsigned int word_idx = global_id / num_rules_in_batch;
     unsigned int rule_batch_idx = global_id % num_rules_in_batch;
 
-    // --- Constant Setup ---
-    unsigned int start_id_simple = {START_ID_SIMPLE};
-    unsigned int end_id_simple = start_id_simple + {NUM_SIMPLE_RULES};
-    unsigned int start_id_TD = {START_ID_TD};
-    unsigned int end_id_TD = start_id_TD + {NUM_TD_RULES};
-    unsigned int start_id_s = {START_ID_S};
-    unsigned int end_id_s = start_id_s + {NUM_S_RULES};
-    unsigned int start_id_A = {START_ID_A};
-    unsigned int end_id_A = start_id_A + {NUM_A_RULES};
-    unsigned int start_id_groupB = {START_ID_GROUPB};
-    unsigned int end_id_groupB = start_id_groupB + {NUM_GROUPB_RULES};
-    unsigned int start_id_new = {START_ID_NEW};
-    unsigned int end_id_new = start_id_new + {NUM_NEW_RULES};
-
-    unsigned char result_temp[{MAX_OUTPUT_LEN}];
-    
-    __global const unsigned char* current_word_ptr = base_words_in + word_idx * max_word_len;
-    unsigned int rule_size_in_int = 2 + {MAX_RULE_ARGS};
-    __global const unsigned int* current_rule_ptr_int = rules_in + rule_batch_idx * rule_size_in_int;
-
-    unsigned int rule_id = current_rule_ptr_int[0];
-    unsigned int rule_args_int = current_rule_ptr_int[1];
-    unsigned int rule_args_int2 = current_rule_ptr_int[2];
-    unsigned int rule_args_int3 = current_rule_ptr_int[3];
-
+    // Load word
+    unsigned char word[MAX_WORD_LEN];
     unsigned int word_len = 0;
-    for (unsigned int i = 0; i < max_word_len; i++) {{
-        if (current_word_ptr[i] == 0) {{
-            word_len = i;
-            break;
-        }}
-    }}
+    for (unsigned int i = 0; i < max_word_len; i++) {
+        unsigned char c = base_words_in[word_idx * max_word_len + i];
+        if (c == 0) break;
+        word[i] = c;
+        word_len++;
+    }
 
-    if (word_len == 0 && rule_id < start_id_A) return;
-    unsigned int out_len = 0;
-    bool changed_flag = false;
+    // Load rule
+    unsigned int rule_size_in_int = 2 + """ + str(MAX_RULE_ARGS) + """;
+    __global const unsigned int* rule_ptr = rules_in + rule_batch_idx * rule_size_in_int;
+    unsigned int rule_id = rule_ptr[0];
+    unsigned int rule_args_int = rule_ptr[1];
+    unsigned int rule_args_int2 = rule_ptr[2];
 
-    for(unsigned int i = 0; i < max_output_len; i++) result_temp[i] = 0;
+    // Decode rule string from packed integers
+    unsigned char rule_str[MAX_RULE_LEN];
+    unsigned int rule_len = 0;
+    
+    // Unpack first 4 bytes from rule_args_int
+    for (unsigned int i = 0; i < 4; i++) {
+        unsigned char byte = (rule_args_int >> (i * 8)) & 0xFF;
+        if (byte == 0) break;
+        rule_str[rule_len++] = byte;
+    }
+    
+    // Unpack next 4 bytes from rule_args_int2
+    if (rule_len < MAX_RULE_LEN) {
+        for (unsigned int i = 0; i < 4; i++) {
+            unsigned char byte = (rule_args_int2 >> (i * 8)) & 0xFF;
+            if (byte == 0) break;
+            rule_str[rule_len++] = byte;
+        }
+    }
 
-    // --- Unpack arguments ---
-    unsigned char arg0 = (unsigned char)(rule_args_int & 0xFF);
-    unsigned char arg1 = (unsigned char)((rule_args_int >> 8) & 0xFF);
-    unsigned char arg2 = (unsigned char)((rule_args_int >> 16) & 0xFF);
-    unsigned char arg3 = (unsigned char)(rule_args_int2 & 0xFF);
+    // Apply rule
+    unsigned char result_temp[MAX_OUTPUT_LEN];
+    int out_len = 0;
+    int changed_flag = 0;
+    
+    apply_rule(word, word_len, rule_str, rule_len, result_temp, &out_len, &changed_flag);
 
-    // --- RULE APPLICATION LOGIC ---
-    if (rule_id >= start_id_simple && rule_id < end_id_simple) {{
-        switch(rule_id - start_id_simple) {{
-            case 0: {{ // 'l' (lowercase)
-                out_len = word_len;
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    unsigned char c = current_word_ptr[i];
-                    if (c >= 'A' && c <= 'Z') {{
-                        result_temp[i] = c + 32;
-                        changed_flag = true;
-                    }} else {{
-                        result_temp[i] = c;
-                    }}
-                }}
-                break;
-            }}
-            case 1: {{ // 'u' (uppercase)
-                out_len = word_len;
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    unsigned char c = current_word_ptr[i];
-                    if (c >= 'a' && c <= 'z') {{
-                        result_temp[i] = c - 32;
-                        changed_flag = true;
-                    }} else {{
-                        result_temp[i] = c;
-                    }}
-                }}
-                break;
-            }}
-            case 2: {{ // 'c' (capitalize)
-                out_len = word_len;
-                if (word_len > 0) {{
-                    if (current_word_ptr[0] >= 'a' && current_word_ptr[0] <= 'z') {{
-                        result_temp[0] = current_word_ptr[0] - 32;
-                        changed_flag = true;
-                    }} else {{
-                        result_temp[0] = current_word_ptr[0];
-                    }}
-                    for (unsigned int i = 1; i < word_len; i++) {{
-                        unsigned char c = current_word_ptr[i];
-                        if (c >= 'A' && c <= 'Z') {{
-                            result_temp[i] = c + 32;
-                            changed_flag = true;
-                        }} else {{
-                            result_temp[i] = c;
-                        }}
-                    }}
-                }}
-                break;
-            }}
-            case 3: {{ // 'C' (invert capitalize)
-                out_len = word_len;
-                if (word_len > 0) {{
-                    if (current_word_ptr[0] >= 'A' && current_word_ptr[0] <= 'Z') {{
-                        result_temp[0] = current_word_ptr[0] + 32;
-                        changed_flag = true;
-                    }} else {{
-                        result_temp[0] = current_word_ptr[0];
-                    }}
-                    for (unsigned int i = 1; i < word_len; i++) {{
-                        unsigned char c = current_word_ptr[i];
-                        if (c >= 'a' && c <= 'z') {{
-                            result_temp[i] = c - 32;
-                            changed_flag = true;
-                        }} else {{
-                            result_temp[i] = c;
-                        }}
-                    }}
-                }}
-                break;
-            }}
-            case 4: {{ // 't' (toggle case)
-                out_len = word_len;
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    unsigned char c = current_word_ptr[i];
-                    if (c >= 'a' && c <= 'z') {{
-                        result_temp[i] = c - 32;
-                        changed_flag = true;
-                    }} else if (c >= 'A' && c <= 'Z') {{
-                        result_temp[i] = c + 32;
-                        changed_flag = true;
-                    }} else {{
-                        result_temp[i] = c;
-                    }}
-                }}
-                break;
-            }}
-            case 5: {{ // 'r' (reverse)
-                out_len = word_len;
-                if (word_len > 1) {{
-                    for (unsigned int i = 0; i < word_len; i++) {{
-                        result_temp[i] = current_word_ptr[word_len - 1 - i];
-                    }}
-                    for (unsigned int i = 0; i < word_len; i++) {{
-                        if (result_temp[i] != current_word_ptr[i]) {{
-                            changed_flag = true;
-                            break;
-                        }}
-                    }}
-                }} else {{
-                    for (unsigned int i = 0; i < word_len; i++) {{
-                        result_temp[i] = current_word_ptr[i];
-                    }}
-                }}
-                break;
-            }}
-            case 6: {{ // 'k' (swap first two chars)
-                out_len = word_len;
-                for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-                if (word_len >= 2) {{
-                    result_temp[0] = current_word_ptr[1];
-                    result_temp[1] = current_word_ptr[0];
-                    changed_flag = true;
-                }}
-                break;
-            }}
-            case 7: {{ // ':' (identity/no change)
-                out_len = word_len;
-                for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-                changed_flag = false;
-                break;
-            }}
-            case 8: {{ // 'd' (duplicate)
-                out_len = word_len * 2;
-                if (out_len >= max_output_len) {{
-                    out_len = 0;
-                    changed_flag = false;
-                    break;
-                }}
-                for(unsigned int i=0; i<word_len; i++) {{
-                    result_temp[i] = current_word_ptr[i];
-                    result_temp[word_len+i] = current_word_ptr[i];
-                }}
-                changed_flag = true;
-                break;
-            }}
-            case 9: {{ // 'f' (reflect: word + reverse(word))
-                out_len = word_len * 2;
-                if (out_len >= max_output_len) {{
-                    out_len = 0;
-                    changed_flag = false;
-                    break;
-                }}
-                for(unsigned int i=0; i<word_len; i++) {{
-                    result_temp[i] = current_word_ptr[i];
-                    result_temp[word_len+i] = current_word_ptr[word_len-1-i];
-                }}
-                changed_flag = true;
-                break;
-            }}
-        }}
-    }} else if (rule_id >= start_id_TD && rule_id < end_id_TD) {{
-        unsigned char operator_char = arg0;
-        unsigned int pos_to_change = char_to_pos(arg1);
-        
-        if (operator_char == 'T') {{
-            out_len = word_len;
-            for (unsigned int i = 0; i < word_len; i++) {{
-                result_temp[i] = current_word_ptr[i];
-            }}
-            if (pos_to_change != 0xFFFFFFFF && pos_to_change < word_len) {{
-                unsigned char c = current_word_ptr[pos_to_change];
-                if (c >= 'a' && c <= 'z') {{
-                    result_temp[pos_to_change] = c - 32;
-                    changed_flag = true;
-                }} else if (c >= 'A' && c <= 'Z') {{
-                    result_temp[pos_to_change] = c + 32;
-                    changed_flag = true;
-                }}
-            }}
-        }}
-        else if (operator_char == 'D') {{
-            unsigned int out_idx = 0;
-            if (pos_to_change != 0xFFFFFFFF && pos_to_change < word_len) {{
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    if (i != pos_to_change) {{
-                        result_temp[out_idx++] = current_word_ptr[i];
-                    }} else {{
-                        changed_flag = true;
-                    }}
-                }}
-            }} else {{
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    result_temp[i] = current_word_ptr[i];
-                }}
-                out_idx = word_len;
-            }}
-            out_len = out_idx;
-        }}
-    }}
-    else if (rule_id >= start_id_s && rule_id < end_id_s) {{
-        out_len = word_len;
-        for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-        
-        unsigned char find = arg0;
-        unsigned char replace = arg1;
-        for(unsigned int i = 0; i < word_len; i++) {{
-            if (current_word_ptr[i] == find) {{
-                result_temp[i] = replace;
-                changed_flag = true;
-            }}
-        }}
-    }} else if (rule_id >= start_id_A && rule_id < end_id_A) {{
-        out_len = word_len;
-        for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-        
-        unsigned char cmd = arg0;
-        unsigned char arg = arg1;
-        
-        if (cmd == '^') {{
-            if (word_len + 1 >= max_output_len) {{
-                out_len = 0;
-                changed_flag = false;
-            }} else {{
-                for(unsigned int i=word_len; i>0; i--) {{
-                    result_temp[i] = result_temp[i-1];
-                }}
-                result_temp[0] = arg;
-                out_len++;
-                changed_flag = true;
-            }}
-        }} else if (cmd == '$') {{
-            if (word_len + 1 >= max_output_len) {{
-                out_len = 0;
-                changed_flag = false;
-            }} else {{
-                result_temp[out_len] = arg;
-                out_len++;
-                changed_flag = true;
-            }}
-        }} else if (cmd == '@') {{
-            unsigned int temp_idx = 0;
-            for(unsigned int i=0; i<word_len; i++) {{
-                if (result_temp[i] != arg) {{
-                    result_temp[temp_idx++] = result_temp[i];
-                }} else {{
-                    changed_flag = true;
-                }}
-            }}
-            out_len = temp_idx;
-        }}
-    }}
-    // --- GROUP B RULES ---
-    else if (rule_id >= start_id_groupB && rule_id < end_id_groupB) {{ 
-        
-        for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-        out_len = word_len;
-
-        unsigned char cmd = arg0;
-        unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
-        unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
-        unsigned char X = arg2;
-
-        if (cmd == 'p') {{ // 'p' (Duplicate N times)
-            if (N != 0xFFFFFFFF) {{
-                unsigned int num_dupes = N;
-                unsigned int total_len = word_len * (num_dupes + 1); 
-
-                if (total_len >= max_output_len || num_dupes == 0) {{
-                    out_len = 0; 
-                }} else {{
-                    for (unsigned int j = 1; j <= num_dupes; j++) {{
-                        unsigned int offset = word_len * j;
-                        for (unsigned int i = 0; i < word_len; i++) {{
-                            result_temp[offset + i] = current_word_ptr[i];
-                        }}
-                    }}
-                    out_len = total_len;
-                    changed_flag = true;
-                }}
-            }}
-        }} 
-        
-        else if (cmd == 'q') {{ // 'q' (Duplicate all characters)
-            unsigned int total_len = word_len * 2;
-            if (total_len >= max_output_len) {{
-                out_len = 0;
-            }} else {{
-                for (unsigned int i = 0; i < word_len; i++) {{
-                    result_temp[i * 2] = current_word_ptr[i];
-                    result_temp[i * 2 + 1] = current_word_ptr[i];
-                }}
-                out_len = total_len;
-                changed_flag = true;
-            }}
-        }}
-
-        else if (cmd == '{{') {{ // '{{' (Rotate Left)
-            if (word_len > 0) {{
-                unsigned char first_char = current_word_ptr[0];
-                for (unsigned int i = 0; i < word_len - 1; i++) {{
-                    result_temp[i] = current_word_ptr[i + 1];
-                }}
-                result_temp[word_len - 1] = first_char;
-                changed_flag = true;
-            }}
-        }} 
-        
-        else if (cmd == '}}') {{ // '}}' (Rotate Right)
-            if (word_len > 0) {{
-                unsigned char last_char = current_word_ptr[word_len - 1];
-                for (unsigned int i = word_len - 1; i > 0; i--) {{
-                    result_temp[i] = current_word_ptr[i - 1];
-                }}
-                result_temp[0] = last_char;
-                changed_flag = true;
-            }}
-        }}
-        
-        else if (cmd == '[') {{ // '[' (Truncate Left)
-            if (word_len > 0) {{
-                out_len = word_len - 1;
-                changed_flag = true;
-            }}
-        }} 
-        
-        else if (cmd == ']') {{ // ']' (Truncate Right)
-            if (word_len > 0) {{
-                out_len = word_len - 1;
-                changed_flag = true;
-            }}
-        }} 
-        
-        else if (cmd == 'x') {{ // 'xNM' (Extract range)
-            unsigned int start = N;
-            unsigned int length = M;
-            
-            if (start != 0xFFFFFFFF && length != 0xFFFFFFFF && start < word_len && length > 0) {{
-                unsigned int end = start + length;
-                if (end > word_len) end = word_len;
-                
-                out_len = 0;
-                for (unsigned int i = start; i < end; i++) {{
-                    result_temp[out_len++] = current_word_ptr[i];
-                }}
-                changed_flag = true;
-            }} else {{
-                out_len = 0; 
-            }}
-        }}
-
-        else if (cmd == 'i') {{ // 'iNX' (Insert char)
-            unsigned int pos = N;
-            unsigned char insert_char = X;
-
-            if (pos != 0xFFFFFFFF && word_len + 1 < max_output_len) {{
-                unsigned int final_pos = (pos > word_len) ? word_len : pos;
-                out_len = word_len + 1;
-
-                unsigned int current_idx = 0;
-                for (unsigned int i = 0; i < out_len; i++) {{
-                    if (i == final_pos) {{
-                        result_temp[i] = insert_char;
-                    }} else {{
-                        result_temp[i] = current_word_ptr[current_idx++];
-                    }}
-                }}
-                changed_flag = true;
-            }} else {{
-                out_len = 0;
-            }}
-        }}
-
-        else if (cmd == 'o') {{ // 'oNX' (Overwrite char)
-            unsigned int pos = N;
-            unsigned char new_char = X;
-
-            if (pos != 0xFFFFFFFF && pos < word_len) {{
-                result_temp[pos] = new_char;
-                changed_flag = true;
-            }}
-        }}
-
-    }}
-    // --- NEW COMPREHENSIVE RULES ---
-    else if (rule_id >= start_id_new && rule_id < end_id_new) {{ 
-        
-        for(unsigned int i=0; i<word_len; i++) result_temp[i] = current_word_ptr[i];
-        out_len = word_len;
-
-        unsigned char cmd = arg0;
-        unsigned int N = (arg1 != 0) ? char_to_pos(arg1) : 0xFFFFFFFF;
-        unsigned int M = (arg2 != 0) ? char_to_pos(arg2) : 0xFFFFFFFF;
-        unsigned char X = arg2;
-
-        if (cmd == 'K') {{ // 'K' (Swap last two characters)
-            if (word_len >= 2) {{
-                result_temp[word_len - 1] = current_word_ptr[word_len - 2];
-                result_temp[word_len - 2] = current_word_ptr[word_len - 1];
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == '*') {{ // '*NM' (Swap characters)
-            if (N != 0xFFFFFFFF && M != 0xFFFFFFFF && N < word_len && M < word_len && N != M) {{
-                unsigned char temp = result_temp[N];
-                result_temp[N] = result_temp[M];
-                result_temp[M] = temp;
-                changed_flag = true;
-            }}
-        }}
-        else if (cmd == 'E') {{ // 'E' (Title case)
-            bool capitalize_next = true;
-            for (unsigned int i = 0; i < word_len; i++) {{
-                unsigned char c = current_word_ptr[i];
-                if (c >= 'A' && c <= 'Z') {{
-                    result_temp[i] = c + 32;
-                    c = result_temp[i];
-                }} else {{
-                    result_temp[i] = c;
-                }}
-                
-                if (capitalize_next && c >= 'a' && c <= 'z') {{
-                    result_temp[i] = c - 32;
-                    changed_flag = true;
-                }}
-                capitalize_next = (result_temp[i] == ' ');
-            }}
-            // REMOVED THE EXTRA BREAK STATEMENT THAT WAS CAUSING THE ERROR
-        }}
-    }}
-
-    // --- DUAL-UNIQUENESS LOGIC ---
-    if (changed_flag && out_len > 0) {{
+    // DUAL-UNIQUENESS LOGIC
+    if (changed_flag > 0 && out_len > 0) {
         unsigned int word_hash = fnv1a_hash_32(result_temp, out_len);
 
         // 1. Check against Base Wordlist (Uniqueness)
-        unsigned int global_map_index = (word_hash >> 5) & {global_hash_map_mask};
+        unsigned int global_map_index = (word_hash >> 5) & """ + str(global_hash_map_mask) + """;
         unsigned int bit_index = word_hash & 31;
         unsigned int check_bit = (1U << bit_index);
 
         __global const unsigned int* global_map_ptr = &global_hash_map[global_map_index];
         unsigned int current_global_word = *global_map_ptr;
 
-        if (!(current_global_word & check_bit)) {{
+        if (!(current_global_word & check_bit)) {
             atomic_inc(&rule_uniqueness_counts[rule_batch_idx]);
 
             // 2. Check against Cracked List (Effectiveness)
-            unsigned int cracked_map_index = (word_hash >> 5) & {cracked_hash_map_mask};
+            unsigned int cracked_map_index = (word_hash >> 5) & """ + str(cracked_hash_map_mask) + """;
             __global const unsigned int* cracked_map_ptr = &cracked_hash_map[cracked_map_index];
             unsigned int current_cracked_word = *cracked_map_ptr;
 
-            if (current_cracked_word & check_bit) {{
+            if (current_cracked_word & check_bit) {
                 atomic_inc(&rule_effectiveness_counts[rule_batch_idx]);
-            }}
-        }}
-    }}
-}}
+            }
+        }
+    }
+}
+
+// ============================================================================
+// HASH MAP INITIALIZATION KERNEL
+// ============================================================================
+
+__kernel __attribute__((reqd_work_group_size(""" + str(LOCAL_WORK_SIZE) + """, 1, 1)))
+void hash_map_init_kernel(
+    __global unsigned int* global_hash_map,
+    __global const unsigned int* base_hashes,
+    const unsigned int num_hashes,
+    const unsigned int map_mask)
+{
+    unsigned int global_id = get_global_id(0);
+    if (global_id >= num_hashes) return;
+
+    unsigned int word_hash = base_hashes[global_id];
+    unsigned int map_index = (word_hash >> 5) & map_mask;
+    unsigned int bit_index = word_hash & 31;
+    unsigned int set_bit = (1U << bit_index);
+
+    atomic_or(&global_hash_map[map_index], set_bit);
+}
 """
 
 # ====================================================================
@@ -1432,7 +1635,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         KERNEL_SOURCE = get_kernel_source(global_hash_map_bits, cracked_hash_map_bits)
         prg = cl.Program(context, KERNEL_SOURCE).build(options=["-cl-fast-relaxed-math"])
         
-        # Use the correct kernel names (without _opt suffix)
         kernel_bfs = prg.bfs_kernel
         kernel_init = prg.hash_map_init_kernel
         
@@ -1534,7 +1736,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         return
 
     current_word_buffer_idx = 0
-    copy_events = [None, None]
 
     # 5. INITIALIZE CRACKED HASH MAP (ONCE)
     if cracked_hashes_np.size > 0 and cracked_temp_g is not None:
@@ -1552,7 +1753,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
     # 6. PIPELINED RANKING LOOP SETUP
-    # USE OPTIMIZED LOADER INSTEAD OF OLD ONE
     word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     total_rule_batches = len(rule_batch_starts)
@@ -1560,19 +1760,23 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{total_rule_batches:,}')} {bold('batches')} "
           f"{bold('(up to')} {cyan(f'{MAX_RULES_IN_BATCH:,}')} {bold('rules per batch)')}")
     
-    # Use numpy arrays for counters to avoid overflow - CHANGE TO PYTHON INT
-    words_processed_total = 0  # Changed from np.uint64 to Python int
-    total_unique_found = 0     # Changed from np.uint64 to Python int
-    total_cracked_found = 0    # Changed from np.uint64 to Python int
+    # Use Python ints for counters
+    words_processed_total = 0
+    total_unique_found = 0
+    total_cracked_found = 0
     
     mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
     num_words_batch_exec = 0
     
-    # Update progress bar totals based on actual counts
-    word_batch_pbar = tqdm(total=total_words, desc="Processing wordlist [Unique: 0 | Cracked: 0]", unit=" word")
-    rule_batch_pbar = tqdm(total=0, desc="Rule batches processed", unit=" batch", bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+    # Create progress bars with proper formatting and ETA
+    word_batch_pbar = tqdm(total=total_words, desc="Processing word batches", unit=" word", 
+                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                          position=0)
+    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Processing rule batches", unit=" batch", 
+                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                          position=1)
 
     # A. Initial word batch load
     try:
@@ -1587,7 +1791,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # B. Main Pipelined Loop
     wordlist_processing_complete = False
-    current_rule_batch_idx = 0  # Track current rule batch
+    current_rule_batch_idx = 0
+    processed_word_batches = 0
+    total_word_batches = 0  # We'll count as we go
     
     # Initialize global hash map with first word batch
     print(f"{blue('📊')} {bold('Initializing global hash map with first word batch...')}")
@@ -1600,135 +1806,143 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
     print(f"{green('✅')} {bold('Global hash map initialized with first batch.')}")
     
-    # Track processed word batches
-    processed_word_batches = 0
+    # Keep track of which word batches have been processed
+    word_batches_processed = []
     
-    while current_rule_batch_idx < total_rule_batches:
+    # Load the entire wordlist into a list first for proper synchronization
+    word_batches = []
+    print(f"{blue('📊')} {bold('Preloading word batches...')}")
+    
+    try:
+        # Load all word batches into memory
+        while True:
+            try:
+                base_words_np_batch, base_hashes_np_batch, num_words_batch = next(word_iterator)
+                word_batches.append({
+                    'words': base_words_np_batch,
+                    'hashes': base_hashes_np_batch,
+                    'count': num_words_batch
+                })
+            except StopIteration:
+                break
+    except Exception as e:
+        print(f"{red('❌')} {bold('Error preloading word batches:')} {e}")
+        return
+    
+    total_word_batches = len(word_batches)
+    print(f"{green('✅')} {bold('Preloaded')} {cyan(f'{total_word_batches:,}')} {bold('word batches')}")
+    
+    # IMPORTANT FIX: Process all rule batches for each word batch
+    # Outer loop for word batches, inner loop for rule batches
+    for word_batch_idx, word_batch_data in enumerate(word_batches):
         # Check for interrupt before processing
         if interrupted:
             break
         
-        # Get current word batch index
-        exec_idx = current_word_buffer_idx
+        # Load current word batch to GPU
+        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], word_batch_data['words'])
+        cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], word_batch_data['hashes']).wait()
         
-        # 7. Process current rule batch with current word batch
-        rule_start_index = rule_batch_starts[current_rule_batch_idx]
-        rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
-        num_rules_in_batch = rule_end_index - rule_start_index
-
-        current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
-        current_rules_np = np.concatenate(current_rule_batch_list)
+        # Initialize/update global hash map with current word batch
+        kernel_init(queue, global_size_init_global, local_size_init_global,
+                    global_hash_map_g,
+                    base_hashes_g[current_word_buffer_idx],
+                    np.uint32(word_batch_data['count']),
+                    np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
         
-        cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
-        cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
-        cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
-        
-        global_size = (num_words_batch_exec * num_rules_in_batch, )
-        global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+        # Process all rule batches for this word batch
+        for rule_batch_idx in range(total_rule_batches):
+            # Check for interrupt before each rule batch
+            if interrupted:
+                break
+                
+            rule_start_index = rule_batch_starts[rule_batch_idx]
+            rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
+            num_rules_in_batch = rule_end_index - rule_start_index
 
-        kernel_bfs.set_args(
-            base_words_in_g[exec_idx],
-            rules_in_g,
-            rule_uniqueness_counts_g,
-            rule_effectiveness_counts_g,
-            global_hash_map_g,
-            cracked_hash_map_g,
-            np.uint32(num_words_batch_exec),
-            np.uint32(num_rules_in_batch),
-            np.uint32(MAX_WORD_LEN),
-            np.uint32(MAX_OUTPUT_LEN),
-            np.uint32(GLOBAL_HASH_MAP_MASK),
-            np.uint32(CRACKED_HASH_MAP_MASK)
-        )
-
-        exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
-        exec_event.wait()
-
-        cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
-        cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
-
-        # Update counts for this rule batch
-        batch_unique_found = 0
-        batch_cracked_found = 0
-        
-        for i in range(num_rules_in_batch):
-            rule_index = rule_start_index + i
-            # Convert to Python int
-            uniqueness_val = int(mapped_uniqueness_np[i])
-            effectiveness_val = int(mapped_effectiveness_np[i])
+            current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
+            current_rules_np = np.concatenate(current_rule_batch_list)
             
-            rules_list[rule_index]['uniqueness_score'] += uniqueness_val
-            rules_list[rule_index]['effectiveness_score'] += effectiveness_val
-            batch_unique_found += uniqueness_val
-            batch_cracked_found += effectiveness_val
+            cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
+            cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
+            cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
+            
+            global_size = (word_batch_data['count'] * num_rules_in_batch, )
+            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+
+            kernel_bfs.set_args(
+                base_words_in_g[current_word_buffer_idx],
+                rules_in_g,
+                rule_uniqueness_counts_g,
+                rule_effectiveness_counts_g,
+                global_hash_map_g,
+                cracked_hash_map_g,
+                np.uint32(word_batch_data['count']),
+                np.uint32(num_rules_in_batch),
+                np.uint32(MAX_WORD_LEN),
+                np.uint32(MAX_OUTPUT_LEN),
+                np.uint32(GLOBAL_HASH_MAP_MASK),
+                np.uint32(CRACKED_HASH_MAP_MASK)
+            )
+
+            exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
+            exec_event.wait()
+
+            cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
+            cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
+
+            # Update counts for this rule batch
+            batch_unique_found = 0
+            batch_cracked_found = 0
+            
+            for i in range(num_rules_in_batch):
+                rule_index = rule_start_index + i
+                # Convert to Python int
+                uniqueness_val = int(mapped_uniqueness_np[i])
+                effectiveness_val = int(mapped_effectiveness_np[i])
+                
+                rules_list[rule_index]['uniqueness_score'] += uniqueness_val
+                rules_list[rule_index]['effectiveness_score'] += effectiveness_val
+                batch_unique_found += uniqueness_val
+                batch_cracked_found += effectiveness_val
+            
+            # Update global totals
+            total_unique_found += batch_unique_found
+            total_cracked_found += batch_cracked_found
+            
+            # Update progress bars
+            words_processed_so_far = words_processed_total + word_batch_data['count'] * (rule_batch_idx + 1) / total_rule_batches
+            word_batch_pbar.n = min(int(words_processed_so_far), total_words)
+            
+            # Update rule batch progress
+            rule_batch_pbar.update(1)
+            
+            # Update interrupt handler stats
+            update_progress_stats(words_processed_so_far, total_unique_found, total_cracked_found)
         
-        # Update global totals
-        total_unique_found += batch_unique_found
-        total_cracked_found += batch_cracked_found
+        # Update word count for completed word batch
+        words_processed_total += word_batch_data['count']
+        processed_word_batches += 1
         
-        # Update progress bars
-        word_batch_pbar.set_description(
-            f"Processing wordlist [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,} | Word Batch: {processed_word_batches+1}]"
-        )
-        word_batch_pbar.refresh()
+        # Update word batch progress
+        word_batch_pbar.update(word_batch_data['count'])
         
-        rule_batch_pbar.update(1)
-        rule_batch_pbar.total = total_rule_batches
-        rule_batch_pbar.set_description(f"Rule batches: {current_rule_batch_idx+1}/{total_rule_batches}")
+        # Reset rule batch progress for next word batch
+        rule_batch_pbar.n = 0
         rule_batch_pbar.refresh()
         
-        # Update interrupt handler stats
-        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
-        
-        # Move to next rule batch
-        current_rule_batch_idx += 1
-        
-        # If we've processed all rule batches for this word batch, load next word batch
-        if current_rule_batch_idx >= total_rule_batches and not wordlist_processing_complete:
-            # Load next word batch
-            try:
-                next_batch_data = next(word_iterator)
-                base_words_np_next, base_hashes_np_next, num_words_batch_next = next_batch_data
-                
-                # Switch buffers
-                next_idx = 1 - current_word_buffer_idx
-                cl.enqueue_copy(queue, base_words_in_g[next_idx], base_words_np_next)
-                cl.enqueue_copy(queue, base_hashes_g[next_idx], base_hashes_np_next).wait()
-                
-                # Update global hash map with new word batch
-                kernel_init(queue, global_size_init_global, local_size_init_global,
-                            global_hash_map_g,
-                            base_hashes_g[next_idx],
-                            np.uint32(num_words_batch_next),
-                            np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
-                
-                # Update counters
-                words_processed_total += num_words_batch_exec
-                word_batch_pbar.update(num_words_batch_exec)
-                
-                # Switch to new buffer and reset rule processing
-                current_word_buffer_idx = next_idx
-                num_words_batch_exec = num_words_batch_next
-                current_rule_batch_idx = 0  # Restart rule processing
-                processed_word_batches += 1
-                
-            except StopIteration:
-                wordlist_processing_complete = True
-                print(f"{green('✅')} {bold('Wordlist fully processed.')}")
-                break
-
-    # Final update for last word batch
-    words_processed_total += num_words_batch_exec
-    word_batch_pbar.update(num_words_batch_exec)
-    
-    word_batch_pbar.close()
-    rule_batch_pbar.close()
+        # Switch buffer for next iteration
+        current_word_buffer_idx = 1 - current_word_buffer_idx
     
     # Check if we were interrupted
     if interrupted:
         print(f"\n{yellow('⚠️')} {bold('Processing was interrupted. Intermediate results have been saved.')}")
         return
         
+    # Final update for progress bars
+    word_batch_pbar.close()
+    rule_batch_pbar.close()
+    
     end_time = time()
     
     # 10. FINAL REPORTING AND SAVING
@@ -1781,6 +1995,7 @@ if __name__ == '__main__':
     print(f"   {green('✓')} {bold('Fast word count estimation')}")
     print(f"   {green('✓')} {bold('Bulk processing optimization')}")
     print(f"   {green('✓')} {bold('Parallel hash computation')}")
+    print(f"   {green('✓')} {bold('Comprehensive Hashcat rules support (16,000+ rules)')}")
     print(f"{green('=' * 70)}{Colors.END}")
 
     rank_rules_uniqueness_large(
