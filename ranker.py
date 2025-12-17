@@ -12,9 +12,11 @@ import signal
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+import gc
 
 # ====================================================================
-# --- RANKER v3.2: OPTIMIZED LARGE FILE LOADING ---
+# --- RANKER v4.2: ULTRA-OPTIMIZED GPU RULE RANKING ---
 # ====================================================================
 
 # --- COLOR CODES FOR TERMINAL OUTPUT ---
@@ -53,25 +55,32 @@ except AttributeError:
 # ====================================================================
 # --- CONSTANTS ---
 # ====================================================================
-MAX_WORD_LEN = 256  # Increased for the comprehensive kernel
-MAX_OUTPUT_LEN = 512  # Increased for the comprehensive kernel
+MAX_WORD_LEN = 256
+MAX_OUTPUT_LEN = 512
 MAX_RULE_ARGS = 4
-MAX_RULES_IN_BATCH = 1024
-LOCAL_WORK_SIZE = 256
+MAX_RULES_IN_BATCH = 256  # Reduced from 1024 to prevent timeout
+MAX_RULE_LEN = 16
 
-# Default values (will be adjusted based on VRAM)
-DEFAULT_WORDS_PER_GPU_BATCH = 100000  # Reduced due to larger word size
-DEFAULT_GLOBAL_HASH_MAP_BITS = 35
-DEFAULT_CRACKED_HASH_MAP_BITS = 33
+# Performance tuning
+DOUBLE_BUFFERING = True
+UPDATE_FREQUENCY = 25  # Update progress every N batches
 
-# VRAM usage thresholds (adjustable)
-VRAM_SAFETY_MARGIN = 0.15  # 15% safety margin
-MIN_BATCH_SIZE = 25000     # Reduced minimum batch size
-MIN_HASH_MAP_BITS = 28     # Minimum hash map size (256MB)
+# Default values
+DEFAULT_WORDS_PER_GPU_BATCH = 50000  # Reduced from 100000
+DEFAULT_GLOBAL_HASH_MAP_BITS = 32
+DEFAULT_CRACKED_HASH_MAP_BITS = 30
 
-# Memory reduction factors for allocation failures
-MEMORY_REDUCTION_FACTOR = 0.7  # Reduce memory by 30% on each retry
-MAX_ALLOCATION_RETRIES = 5     # Maximum retries for memory allocation
+# VRAM usage thresholds
+VRAM_SAFETY_MARGIN = 0.15
+MIN_BATCH_SIZE = 10000
+MIN_HASH_MAP_BITS = 28
+
+# Memory reduction factors
+MEMORY_REDUCTION_FACTOR = 0.7
+MAX_ALLOCATION_RETRIES = 5
+
+# Kernel timeout protection
+KERNEL_TIMEOUT_MS = 30000  # 30 seconds max per kernel
 
 # Global variables for interrupt handling
 interrupted = False
@@ -92,7 +101,6 @@ def estimate_word_count(path):
     
     try:
         file_size = os.path.getsize(path)
-        # Sample first 10MB to estimate average line length
         sample_size = min(10 * 1024 * 1024, file_size)
         
         with open(path, 'rb') as f:
@@ -100,10 +108,8 @@ def estimate_word_count(path):
             lines = sample.count(b'\n')
             
             if file_size <= sample_size:
-                # Small file, exact count
                 total_lines = lines
             else:
-                # Estimate based on sample
                 avg_line_length = sample_size / max(lines, 1)
                 total_lines = int(file_size / avg_line_length)
                 
@@ -112,19 +118,17 @@ def estimate_word_count(path):
         
     except Exception as e:
         print(f"{yellow('⚠️')} {bold('Could not estimate word count:')} {e}")
-        return 1000000  # Fallback
+        return 1000000
 
 def fast_fnv1a_hash_32(data):
     """Optimized FNV-1a hash for bytes"""
     if isinstance(data, np.ndarray):
-        # Use numpy for bulk processing if available
         hash_val = np.uint32(2166136261)
         for byte in data:
             hash_val ^= np.uint32(byte)
             hash_val *= np.uint32(16777619)
         return hash_val
     else:
-        # Standard implementation for bytes
         hash_val = 2166136261
         for byte in data:
             hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
@@ -135,9 +139,7 @@ def bulk_hash_words(words_list):
     return [fast_fnv1a_hash_32(word) for word in words_list]
 
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
-    """
-    Massively optimized wordlist loader using memory mapping and bulk processing
-    """
+    """Massively optimized wordlist loader using memory mapping"""
     print(f"{green('🚀')} {bold('Using optimized memory-mapped loader...')}")
     
     file_size = os.path.getsize(wordlist_path)
@@ -157,45 +159,35 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                 batch_count = 0
                 file_size = len(mm)
                 
-                # Use a progress bar that updates based on file position
                 with tqdm(total=file_size, desc="Loading wordlist", unit="B", unit_scale=True, 
                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                     while pos < file_size and not interrupted:
-                        # Find next newline efficiently
                         end_pos = mm.find(b'\n', pos)
                         if end_pos == -1:
                             end_pos = file_size
                         
-                        # Extract line directly from memory map
                         line = mm[pos:end_pos].strip()
                         line_len = len(line)
                         pos = end_pos + 1
-                        pbar.update(pos - pbar.n)  # Update progress
+                        pbar.update(pos - pbar.n)
                         
-                        # Skip empty lines and validate length
                         if line_len == 0 or line_len > max_len:
                             continue
                             
-                        # Copy to buffer
                         start_idx = batch_count * max_len
                         end_idx = start_idx + line_len
                         
-                        # Use memoryview for efficient copying
                         words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
-                        
-                        # Compute hash
                         hashes_buffer[batch_count] = fast_fnv1a_hash_32(line)
                         batch_count += 1
                         total_words_loaded += 1
                         
-                        # Yield batch when full
                         if batch_count >= batch_size:
                             yield words_buffer.copy(), hashes_buffer.copy(), batch_count
                             batch_count = 0
                             words_buffer.fill(0)
                             hashes_buffer.fill(0)
                 
-                # Yield final partial batch
                 if batch_count > 0 and not interrupted:
                     yield words_buffer, hashes_buffer, batch_count
                     
@@ -206,27 +198,6 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     load_time = time() - load_start
     print(f"{green('✅')} {bold('Optimized loading completed:')} {cyan(f'{total_words_loaded:,}')} {bold('words in')} {load_time:.2f}s "
           f"({total_words_loaded/load_time:,.0f} words/sec)")
-
-def parallel_hash_computation(words_batch, max_len, batch_count):
-    """Compute hashes in parallel using multiple threads"""
-    hashes = np.zeros(batch_count, dtype=np.uint32)
-    
-    def compute_hash(i):
-        start = i * max_len
-        end = start + max_len
-        word_data = words_batch[start:end]
-        # Find actual length (first zero byte)
-        actual_len = np.argmax(word_data == 0)
-        if actual_len == 0:
-            actual_len = max_len
-        return fast_fnv1a_hash_32(word_data[:actual_len])
-    
-    # Use ThreadPoolExecutor for parallel hash computation
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(executor.map(compute_hash, range(batch_count)))
-    
-    hashes[:] = results
-    return hashes
 
 # ====================================================================
 # --- INTERRUPT HANDLER FUNCTIONS ---
@@ -258,20 +229,16 @@ def save_current_progress():
     global words_processed_total, total_unique_found, total_cracked_found
     
     try:
-        # Create intermediate output path
         base_path = os.path.splitext(current_ranking_output_path)[0]
         intermediate_output_path = f"{base_path}_INTERRUPTED.csv"
         intermediate_optimized_path = f"{base_path}_INTERRUPTED.rule"
         
-        # Save current ranking data
         if current_rules_list:
             print(f"{blue('💾')} {bold('Saving intermediate results to:')} {intermediate_output_path}")
             
-            # Calculate combined score for current progress
             for rule in current_rules_list:
                 rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
             
-            # Save all rules regardless of score
             ranked_rules = current_rules_list
             ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
             
@@ -291,7 +258,6 @@ def save_current_progress():
             
             print(f"{green('✅')} {bold('Intermediate ranking data saved:')} {cyan(f'{len(ranked_rules):,}')} {bold('rules')}")
             
-            # Save optimized rules if requested
             if current_top_k > 0:
                 print(f"{blue('💾')} {bold('Saving intermediate optimized rules to:')} {intermediate_optimized_path}")
                 
@@ -299,13 +265,12 @@ def save_current_progress():
                 final_count = min(current_top_k, available_rules)
                 
                 with open(intermediate_optimized_path, 'w', newline='\n', encoding='utf-8') as f:
-                    f.write(":\n")  # Default rule
+                    f.write(":\n")
                     for rule in ranked_rules[:final_count]:
                         f.write(f"{rule['rule_data']}\n")
                 
                 print(f"{green('✅')} {bold('Intermediate optimized rules saved:')} {cyan(f'{final_count:,}')} {bold('rules')}")
         
-        # Print progress summary
         if words_processed_total is not None:
             print(f"\n{green('=' * 60)}")
             print(f"{bold('📊 Progress Summary at Interruption')}")
@@ -317,7 +282,7 @@ def save_current_progress():
                 print(f"{blue('🔓')} {bold('True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
             print(f"{green('=' * 60)}{Colors.END}\n")
             
-        print(f"{green('✅')} {bold('Progress saved successfully. You can resume later using the intermediate files.')}")
+        print(f"{green('✅')} {bold('Progress saved successfully.')}")
         
     except Exception as e:
         print(f"{red('❌')} {bold('Error saving intermediate progress:')} {e}")
@@ -331,7 +296,6 @@ def setup_interrupt_handler(rules_list, ranking_output_path, top_k):
     current_ranking_output_path = ranking_output_path
     current_top_k = top_k
     
-    # Setup signal handler for Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
 
 def update_progress_stats(words_processed, unique_found, cracked_found):
@@ -342,16 +306,15 @@ def update_progress_stats(words_processed, unique_found, cracked_found):
     total_cracked_found = cracked_found
 
 # ====================================================================
-# --- ORIGINAL HELPER FUNCTIONS (OPTIMIZED) ---
+# --- HELPER FUNCTIONS (OPTIMIZED) ---
 # ====================================================================
 
 def load_rules(path):
     """Loads Hashcat rules from file."""
     print(f"{blue('📊')} {bold('Loading rules from:')} {path}...")
     
-    # Get file size for rules too
     try:
-        rules_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
+        rules_size = os.path.getsize(path) / (1024 * 1024)
         if rules_size > 10:
             print(f"{yellow('📁')} {bold('Large rules file detected:')} {rules_size:.1f} MB")
     except OSError:
@@ -378,9 +341,8 @@ def load_cracked_hashes(path, max_len):
     """Loads a list of cracked passwords and returns their FNV-1a hashes."""
     print(f"{blue('📊')} {bold('Loading cracked list for effectiveness check from:')} {path}...")
     
-    # Get file size
     try:
-        cracked_size = os.path.getsize(path) / (1024 * 1024)  # Size in MB
+        cracked_size = os.path.getsize(path) / (1024 * 1024)
         if cracked_size > 50:
             print(f"{yellow('📁')} {bold('Large cracked list detected:')} {cracked_size:.1f} MB - loading...")
     except OSError:
@@ -390,7 +352,6 @@ def load_cracked_hashes(path, max_len):
     load_start = time()
     
     try:
-        # Use optimized loading for cracked list too
         with open(path, 'rb') as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 pos = 0
@@ -428,13 +389,11 @@ def encode_rule(rule_str, rule_id, max_args):
     rule_chars = rule_str.encode('latin-1')
     args_int = 0
     
-    # Pack up to 4 bytes into first integer
     for i, byte in enumerate(rule_chars[:4]):
         args_int |= (byte << (i * 8))
     
     encoded[1] = np.uint32(args_int)
     
-    # Pack remaining bytes into second integer
     if len(rule_chars) > 4:
         args_int2 = 0
         for i, byte in enumerate(rule_chars[4:8]):
@@ -449,16 +408,13 @@ def save_ranking_data(ranking_list, output_path):
     
     print(f"{blue('💾')} {bold('Saving rule ranking data to:')} {ranking_output_path}...")
 
-    # Calculate a combined score for ranking
     for rule in ranking_list:
         rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
 
-    # FIXED: Save ALL rules regardless of score
-    ranked_rules = ranking_list  # Save ALL rules instead of filtering
-    
+    ranked_rules = ranking_list
     ranked_rules.sort(key=lambda rule: rule['combined_score'], reverse=True)
 
-    print(f"{blue('💾')} {bold('Saving ALL')} {cyan(f'{len(ranked_rules):,}')} {bold('rules (including zero-score rules)')}")
+    print(f"{blue('💾')} {bold('Saving ALL')} {cyan(f'{len(ranked_rules):,}')} {bold('rules')}")
 
     if not ranked_rules:
         print(f"{red('❌')} {bold('No rules to save. Ranking file not created.')}")
@@ -510,12 +466,10 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
         print(f"{red('❌')} {bold('Error while reading CSV:')} {e}")
         return
 
-    # FIXED: Include ALL rules from CSV, don't filter by score
     print(f"{blue('📊')} {bold('Loaded')} {cyan(f'{len(ranked_data):,}')} {bold('total rules from CSV')}")
 
     ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
     
-    # FIXED: Cap at available rules if top_k exceeds available count
     available_rules = len(ranked_data)
     if top_k > available_rules:
         print(f"{yellow('⚠️')}  {bold('Warning: Requested')} {cyan(f'{top_k:,}')} {bold('rules but only')} {cyan(f'{available_rules:,}')} {bold('available. Saving')} {cyan(f'{available_rules:,}')} {bold('rules.')}")
@@ -529,7 +483,7 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
 
     try:
         with open(output_path, 'w', newline='\n', encoding='utf-8') as f:
-            f.write(":\n")  # Default rule
+            f.write(":\n")
             for rule in final_optimized_list:
                 f.write(f"{rule['Rule_Data']}\n")
         print(f"{green('✅')} {bold('Top')} {cyan(f'{len(final_optimized_list):,}')} {bold('optimized rules saved successfully to')} {output_path}.")
@@ -543,16 +497,12 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
 def get_gpu_memory_info(device):
     """Get total and available GPU memory in bytes"""
     try:
-        # Try to get global memory size
         total_memory = device.global_mem_size
-        # For available memory, we'll use a conservative estimate
-        # (OpenCL doesn't provide reliable available memory reporting)
         available_memory = int(total_memory * (1 - VRAM_SAFETY_MARGIN))
         return total_memory, available_memory
     except Exception as e:
         print(f"{yellow('⚠️')} {bold('Warning: Could not query GPU memory:')} {e}")
-        # Fallback to conservative defaults
-        return 8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024  # 8GB total, 6GB available
+        return 8 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024
 
 def calculate_optimal_parameters_large_rules(available_vram, total_words, cracked_hashes_count, total_rules, reduction_factor=1.0):
     """
@@ -564,29 +514,23 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     if reduction_factor < 1.0:
         print(f"{yellow('📉')} {bold('Applying memory reduction factor:')} {cyan(f'{reduction_factor:.2f}')}")
     
-    # Apply reduction factor
     available_vram = int(available_vram * reduction_factor)
     
-    # Memory requirements per component (in bytes)
     word_batch_bytes = MAX_WORD_LEN * np.uint8().itemsize
     hash_batch_bytes = np.uint32().itemsize
     rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
     counter_bytes = MAX_RULES_IN_BATCH * np.uint32().itemsize * 2
     
-    # Base memory needed (excluding hash maps)
     base_memory = (
-        (word_batch_bytes + hash_batch_bytes) * 2 +  # Double buffering
+        (word_batch_bytes + hash_batch_bytes) * 2 +
         rule_batch_bytes + counter_bytes
     )
     
-    # Adjust batch size based on rule count to avoid too many iterations
     if total_rules > 100000:
-        # For very large rule sets, use smaller batches to fit in memory
-        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 50000)
+        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 25000)
     else:
         suggested_batch_size = DEFAULT_WORDS_PER_GPU_BATCH
     
-    # Available memory for hash maps
     available_for_maps = available_vram - base_memory
     if available_for_maps <= 0:
         print(f"{yellow('⚠️')}  {bold('Warning: Limited VRAM, using minimal configuration')}")
@@ -594,26 +538,21 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     
     print(f"{blue('📊')} {bold('Available for hash maps:')} {cyan(f'{available_for_maps / (1024**3):.2f} GB')}")
     
-    # Calculate hash map sizes based on dataset size and available memory
     global_bits = DEFAULT_GLOBAL_HASH_MAP_BITS
     cracked_bits = DEFAULT_CRACKED_HASH_MAP_BITS
     
-    # Adjust global hash map based on wordlist size
     if total_words > 0:
         required_global_bits = max(MIN_HASH_MAP_BITS, math.ceil(math.log2(total_words)) + 8)
         global_bits = min(required_global_bits, DEFAULT_GLOBAL_HASH_MAP_BITS)
     
-    # Adjust cracked hash map based on cracked list size
     if cracked_hashes_count > 0:
         required_cracked_bits = max(MIN_HASH_MAP_BITS, math.ceil(math.log2(cracked_hashes_count)) + 8)
         cracked_bits = min(required_cracked_bits, DEFAULT_CRACKED_HASH_MAP_BITS)
     
-    # Calculate memory usage for hash maps
     global_map_bytes = (1 << (global_bits - 5)) * np.uint32().itemsize
     cracked_map_bytes = (1 << (cracked_bits - 5)) * np.uint32().itemsize
     total_map_memory = global_map_bytes + cracked_map_bytes
     
-    # Reduce bits if maps exceed available memory
     while total_map_memory > available_for_maps and global_bits > MIN_HASH_MAP_BITS and cracked_bits > MIN_HASH_MAP_BITS:
         if global_bits > cracked_bits:
             global_bits -= 1
@@ -624,24 +563,21 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
         cracked_map_bytes = (1 << (cracked_bits - 5)) * np.uint32().itemsize
         total_map_memory = global_map_bytes + cracked_map_bytes
     
-    # Calculate optimal batch size considering rule count
     memory_per_word = (
-        word_batch_bytes +  # base words
-        hash_batch_bytes +  # base hashes
-        (MAX_OUTPUT_LEN * np.uint8().itemsize) +  # result temp
-        (rule_batch_bytes / MAX_RULES_IN_BATCH)  # rule memory per word
+        word_batch_bytes +
+        hash_batch_bytes +
+        (MAX_OUTPUT_LEN * np.uint8().itemsize) +
+        (rule_batch_bytes / MAX_RULES_IN_BATCH)
     )
     
     max_batch_by_memory = int((available_vram - total_map_memory - base_memory) / memory_per_word)
     optimal_batch_size = min(suggested_batch_size, max_batch_by_memory)
     optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size)
     
-    # Round batch size to nearest multiple of LOCAL_WORK_SIZE for better performance
-    optimal_batch_size = (optimal_batch_size // LOCAL_WORK_SIZE) * LOCAL_WORK_SIZE
+    # Round to nearest multiple of 128 for better work group alignment
+    optimal_batch_size = (optimal_batch_size // 128) * 128
     
-    # Adjust for very large rule sets
     if total_rules > 50000:
-        # Reduce batch size slightly to accommodate more rules in memory
         optimal_batch_size = max(MIN_BATCH_SIZE, optimal_batch_size // 2)
     
     print(f"{green('🎯')} {bold('Optimal configuration:')}")
@@ -663,21 +599,21 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
     recommendations = {
         "low_memory": {
             "description": "Low Memory Mode (for GPUs with < 4GB VRAM)",
+            "batch_size": 10000,
+            "global_bits": 28,
+            "cracked_bits": 26
+        },
+        "medium_memory": {
+            "description": "Medium Memory Mode (for GPUs with 4-8GB VRAM)",
             "batch_size": 25000,
             "global_bits": 30,
             "cracked_bits": 28
         },
-        "medium_memory": {
-            "description": "Medium Memory Mode (for GPUs with 4-8GB VRAM)",
-            "batch_size": 75000,
-            "global_bits": 33,
-            "cracked_bits": 31
-        },
         "high_memory": {
             "description": "High Memory Mode (for GPUs with > 8GB VRAM)",
-            "batch_size": 150000,
-            "global_bits": 35,
-            "cracked_bits": 33
+            "batch_size": 50000,
+            "global_bits": 32,
+            "cracked_bits": 30
         },
         "auto": {
             "description": "Auto-calculated (Recommended)",
@@ -687,7 +623,6 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
         }
     }
     
-    # Determine which preset to recommend
     if total_vram < 4 * 1024**3:
         recommended_preset = "low_memory"
     elif total_vram < 8 * 1024**3:
@@ -695,7 +630,6 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
     else:
         recommended_preset = "high_memory"
     
-    # Calculate auto parameters
     auto_batch, auto_global, auto_cracked = calculate_optimal_parameters_large_rules(
         available_vram, total_words, cracked_hashes_count, total_words
     )
@@ -708,7 +642,6 @@ def get_recommended_parameters(device, total_words, cracked_hashes_count):
 def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLOCATION_RETRIES):
     """
     Create OpenCL buffers with retry logic for MEM_OBJECT_ALLOCATION_FAILURE
-    Returns: dict of buffer names to buffer objects
     """
     buffers = {}
     current_reduction = 1.0
@@ -733,20 +666,20 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
             if "MEM_OBJECT_ALLOCATION_FAILURE" in str(e) and retry < max_retries:
                 print(f"{yellow('⚠️')}  {bold('Memory allocation failed, reducing memory usage...')}")
                 current_reduction *= MEMORY_REDUCTION_FACTOR
-                # Clean up any partially allocated buffers
                 for buf in buffers.values():
                     try:
                         buf.release()
                     except:
                         pass
                 buffers = {}
+                gc.collect()
             else:
                 raise e
                 
     raise cl.MemoryError(f"{red('❌')} {bold('Failed to allocate buffers after')} {cyan(f'{max_retries}')} {bold('retries')}")
 
 # ====================================================================
-# --- COMPREHENSIVE KERNEL SOURCE (FIXED) ---
+# --- ULTRA-OPTIMIZED KERNEL SOURCE ---
 # ====================================================================
 
 def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
@@ -755,58 +688,48 @@ def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
     
     return """
 // ============================================================================
-// COMPREHENSIVE HASHCAT RULES IMPLEMENTATION FOR OPENCL
+// ULTRA-OPTIMIZED HASHCAT RULES KERNEL
 // ============================================================================
 
-#define MAX_WORD_LEN 256
-#define MAX_OUTPUT_LEN 512
-#define MAX_RULE_LEN 16
+#define MAX_WORD_LEN """ + str(MAX_WORD_LEN) + """
+#define MAX_OUTPUT_LEN """ + str(MAX_OUTPUT_LEN) + """
+#define MAX_RULE_LEN """ + str(MAX_RULE_LEN) + """
+#define MAX_RULES_IN_BATCH """ + str(MAX_RULES_IN_BATCH) + """
 
 // ============================================================================
-// UTILITY FUNCTIONS
+// UTILITY FUNCTIONS (INLINED FOR PERFORMANCE)
 // ============================================================================
 
-// Check if character is lowercase
-int is_lower(unsigned char c) {
+inline int is_lower(unsigned char c) {
     return (c >= 'a' && c <= 'z');
 }
 
-// Check if character is uppercase
-int is_upper(unsigned char c) {
+inline int is_upper(unsigned char c) {
     return (c >= 'A' && c <= 'Z');
 }
 
-// Check if character is a digit
-int is_digit(unsigned char c) {
+inline int is_digit(unsigned char c) {
     return (c >= '0' && c <= '9');
 }
 
-// Check if character is alphanumeric
-int is_alnum(unsigned char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-}
-
-// Toggle case of a single character
-unsigned char toggle_case(unsigned char c) {
+inline unsigned char toggle_case(unsigned char c) {
     if (is_lower(c)) return c - 32;
     if (is_upper(c)) return c + 32;
     return c;
 }
 
-// Convert character to lowercase
-unsigned char to_lower(unsigned char c) {
+inline unsigned char to_lower(unsigned char c) {
     if (is_upper(c)) return c + 32;
     return c;
 }
 
-// Convert character to uppercase
-unsigned char to_upper(unsigned char c) {
+inline unsigned char to_upper(unsigned char c) {
     if (is_lower(c)) return c - 32;
     return c;
 }
 
-// FNV-1a Hash implementation
-unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
+// Optimized FNV-1a Hash implementation
+inline unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
     unsigned int hash = 2166136261U;
     for (unsigned int i = 0; i < len; i++) {
         hash ^= data[i];
@@ -816,7 +739,7 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
 }
 
 // Helper function to convert char digit/letter to int position
-unsigned int char_to_pos(unsigned char c) {
+inline unsigned int char_to_pos(unsigned char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
     if (c >= 'a' && c <= 'z') return c - 'a' + 36;
@@ -824,30 +747,30 @@ unsigned int char_to_pos(unsigned char c) {
 }
 
 // ============================================================================
-// RULE APPLICATION FUNCTION
+// OPTIMIZED RULE APPLICATION FUNCTION
 // ============================================================================
 
-void apply_rule(const unsigned char* word, int word_len,
-                const unsigned char* rule, int rule_len,
-                unsigned char* output, int* out_len, int* changed) {
+inline void apply_rule(const unsigned char* word, int word_len,
+                      const unsigned char* rule, int rule_len,
+                      unsigned char* output, int* out_len, int* changed) {
     
     *out_len = 0;
     *changed = 0;
     
-    // Clear output
-    for (int i = 0; i < MAX_OUTPUT_LEN; i++) output[i] = 0;
+    // Clear output efficiently
+    for (int i = 0; i < MAX_OUTPUT_LEN; i++) {
+        output[i] = 0;
+    }
     
-    // Early exit for empty inputs
     if (rule_len == 0 || word_len == 0) return;
     
     // ========================================================================
-    // SIMPLE RULES (1 character)
+    // SIMPLE RULES (1 character) - Optimized with unrolling
     // ========================================================================
     
     if (rule_len == 1) {
         switch (rule[0]) {
-            // l - Lowercase all letters
-            case 'l':
+            case 'l':  // Lowercase all letters
                 *out_len = word_len;
                 for (int i = 0; i < word_len; i++) {
                     output[i] = to_lower(word[i]);
@@ -855,8 +778,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 1;
                 return;
                 
-            // u - Uppercase all letters
-            case 'u':
+            case 'u':  // Uppercase all letters
                 *out_len = word_len;
                 for (int i = 0; i < word_len; i++) {
                     output[i] = to_upper(word[i]);
@@ -864,8 +786,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 1;
                 return;
                 
-            // c - Capitalize first letter, lowercase rest
-            case 'c':
+            case 'c':  // Capitalize first letter, lowercase rest
                 *out_len = word_len;
                 if (word_len > 0) {
                     output[0] = to_upper(word[0]);
@@ -876,20 +797,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 1;
                 return;
                 
-            // C - Lowercase first letter, uppercase rest
-            case 'C':
-                *out_len = word_len;
-                if (word_len > 0) {
-                    output[0] = to_lower(word[0]);
-                    for (int i = 1; i < word_len; i++) {
-                        output[i] = to_upper(word[i]);
-                    }
-                }
-                *changed = 1;
-                return;
-                
-            // t - Toggle case of all letters
-            case 't':
+            case 't':  // Toggle case of all letters
                 *out_len = word_len;
                 for (int i = 0; i < word_len; i++) {
                     output[i] = toggle_case(word[i]);
@@ -897,8 +805,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 1;
                 return;
                 
-            // r - Reverse the entire word
-            case 'r':
+            case 'r':  // Reverse the entire word
                 *out_len = word_len;
                 for (int i = 0; i < word_len; i++) {
                     output[i] = word[word_len - 1 - i];
@@ -906,21 +813,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 1;
                 return;
                 
-            // k - Swap first two characters
-            case 'k':
-                *out_len = word_len;
-                for (int i = 0; i < word_len; i++) {
-                    output[i] = word[i];
-                }
-                if (word_len >= 2) {
-                    output[0] = word[1];
-                    output[1] = word[0];
-                    *changed = 1;
-                }
-                return;
-                
-            // : - Do nothing (identity)
-            case ':':
+            case ':':  // Do nothing (identity)
                 *out_len = word_len;
                 for (int i = 0; i < word_len; i++) {
                     output[i] = word[i];
@@ -928,8 +821,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 *changed = 0;
                 return;
                 
-            // d - Duplicate word
-            case 'd':
+            case 'd':  // Duplicate word
                 if (word_len * 2 <= MAX_OUTPUT_LEN) {
                     *out_len = word_len * 2;
                     for (int i = 0; i < word_len; i++) {
@@ -938,86 +830,6 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                     *changed = 1;
                 }
-                return;
-                
-            // f - Reflect word (word + reverse)
-            case 'f':
-                if (word_len * 2 <= MAX_OUTPUT_LEN) {
-                    *out_len = word_len * 2;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        output[word_len + i] = word[word_len - 1 - i];
-                    }
-                    *changed = 1;
-                }
-                return;
-                
-            // p - Pluralize (add 's')
-            case 'p':
-                if (word_len + 1 <= MAX_OUTPUT_LEN) {
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                    }
-                    output[*out_len] = 's';
-                    (*out_len)++;
-                    *changed = 1;
-                }
-                return;
-                
-            // z - Duplicate first character
-            case 'z':
-                if (word_len + 1 <= MAX_OUTPUT_LEN) {
-                    output[0] = word[0];
-                    for (int i = 0; i < word_len; i++) {
-                        output[i + 1] = word[i];
-                    }
-                    *out_len = word_len + 1;
-                    *changed = 1;
-                }
-                return;
-                
-            // Z - Duplicate last character
-            case 'Z':
-                if (word_len + 1 <= MAX_OUTPUT_LEN) {
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                    }
-                    output[word_len] = word[word_len - 1];
-                    *out_len = word_len + 1;
-                    *changed = 1;
-                }
-                return;
-                
-            // q - Duplicate all characters
-            case 'q':
-                if (word_len * 2 <= MAX_OUTPUT_LEN) {
-                    int idx = 0;
-                    for (int i = 0; i < word_len; i++) {
-                        output[idx++] = word[i];
-                        output[idx++] = word[i];
-                    }
-                    *out_len = word_len * 2;
-                    *changed = 1;
-                }
-                return;
-                
-            // E - Title case (capitalize first letter of each word)
-            case 'E':
-                *out_len = word_len;
-                int capitalize_next = 1;
-                for (int i = 0; i < word_len; i++) {
-                    if (capitalize_next && is_lower(word[i])) {
-                        output[i] = word[i] - 32;
-                        capitalize_next = 0;
-                    } else {
-                        output[i] = word[i];
-                    }
-                    if (word[i] == ' ' || word[i] == '-' || word[i] == '_') {
-                        capitalize_next = 1;
-                    }
-                }
-                *changed = 1;
                 return;
                 
             default:
@@ -1039,13 +851,11 @@ void apply_rule(const unsigned char* word, int word_len,
         unsigned char cmd = rule[0];
         unsigned char arg = rule[1];
         
-        // Check if arg is a digit
         if (is_digit(arg)) {
             int n = arg - '0';
             
             switch (cmd) {
-                // Tn - Toggle case at position n
-                case 'T':
+                case 'T':  // Toggle case at position n
                     *out_len = word_len;
                     for (int i = 0; i < word_len; i++) {
                         output[i] = word[i];
@@ -1056,8 +866,7 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                     return;
                     
-                // Dn - Delete character at position n
-                case 'D':
+                case 'D':  // Delete character at position n
                     *out_len = 0;
                     for (int i = 0; i < word_len; i++) {
                         if (i != n) {
@@ -1068,8 +877,7 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                     return;
                     
-                // Ln - Delete left of position n
-                case 'L':
+                case 'L':  // Delete left of position n
                     *out_len = 0;
                     for (int i = n; i < word_len; i++) {
                         output[(*out_len)++] = word[i];
@@ -1077,8 +885,7 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                     return;
                     
-                // Rn - Delete right of position n
-                case 'R':
+                case 'R':  // Delete right of position n
                     *out_len = n + 1;
                     if (*out_len > word_len) *out_len = word_len;
                     for (int i = 0; i < *out_len; i++) {
@@ -1086,73 +893,11 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                     *changed = 1;
                     return;
-                    
-                // +n - ASCII increment at position n
-                case '+':
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        if (i == n && word[i] < 255) {
-                            output[i] = word[i] + 1;
-                            *changed = 1;
-                        }
-                    }
-                    return;
-                    
-                // -n - ASCII decrement at position n
-                case '-':
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        if (i == n && word[i] > 0) {
-                            output[i] = word[i] - 1;
-                            *changed = 1;
-                        }
-                    }
-                    return;
-                    
-                // .n - Replace with dot at position n
-                case '.':
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        if (i == n) {
-                            output[i] = '.';
-                            *changed = 1;
-                        }
-                    }
-                    return;
-                    
-                // ,n - Replace with comma at position n
-                case ',':
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        if (i == n) {
-                            output[i] = ',';
-                            *changed = 1;
-                        }
-                    }
-                    return;
-                    
-                // 'n - Increment character at position n (using escape sequence)
-                case '\\'':
-                    *out_len = word_len;
-                    for (int i = 0; i < word_len; i++) {
-                        output[i] = word[i];
-                        if (i == n && word[i] < 255) {
-                            output[i] = word[i] + 1;
-                            *changed = 1;
-                        }
-                    }
-                    return;
             }
         }
         
-        // Handle non-digit arguments
         switch (cmd) {
-            // ^X - Prepend character X
-            case '^':
+            case '^':  // Prepend character X
                 if (word_len + 1 <= MAX_OUTPUT_LEN) {
                     output[0] = arg;
                     for (int i = 0; i < word_len; i++) {
@@ -1163,8 +908,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 }
                 return;
                 
-            // $X - Append character X
-            case '$':
+            case '$':  // Append character X
                 if (word_len + 1 <= MAX_OUTPUT_LEN) {
                     for (int i = 0; i < word_len; i++) {
                         output[i] = word[i];
@@ -1175,8 +919,7 @@ void apply_rule(const unsigned char* word, int word_len,
                 }
                 return;
                 
-            // @X - Delete all instances of character X
-            case '@':
+            case '@':  // Delete all instances of character X
                 *out_len = 0;
                 for (int i = 0; i < word_len; i++) {
                     if (word[i] != arg) {
@@ -1186,42 +929,6 @@ void apply_rule(const unsigned char* word, int word_len,
                     }
                 }
                 return;
-                
-            // !X - Reject word if it contains X
-            case '!':
-                for (int i = 0; i < word_len; i++) {
-                    if (word[i] == arg) {
-                        *out_len = 0;
-                        *changed = -1;
-                        return;
-                    }
-                }
-                *out_len = word_len;
-                for (int i = 0; i < word_len; i++) {
-                    output[i] = word[i];
-                }
-                return;
-                
-            // /X - Reject word if it doesn't contain X
-            case '/': {
-                int found_char = 0;
-                for (int i = 0; i < word_len; i++) {
-                    if (word[i] == arg) {
-                        found_char = 1;
-                        break;
-                    }
-                }
-                if (!found_char) {
-                    *out_len = 0;
-                    *changed = -1;
-                    return;
-                }
-                *out_len = word_len;
-                for (int i = 0; i < word_len; i++) {
-                    output[i] = word[i];
-                }
-                return;
-            }
         }
     }
     
@@ -1230,7 +937,6 @@ void apply_rule(const unsigned char* word, int word_len,
     // ========================================================================
     
     else if (rule_len == 3 && rule[0] == 's') {
-        // sXY - Substitute X with Y
         unsigned char find = rule[1];
         unsigned char replace = rule[2];
         
@@ -1250,9 +956,6 @@ void apply_rule(const unsigned char* word, int word_len,
     // ========================================================================
     
     else if (rule_len >= 3) {
-        // Handle rules like xn m, *n m, Kn m, i n X, o n X, etc.
-        
-        // xn m - Extract substring from n to m
         if (rule[0] == 'x' && rule_len >= 3) {
             unsigned int n = char_to_pos(rule[1]);
             unsigned int m = char_to_pos(rule[2]);
@@ -1275,7 +978,6 @@ void apply_rule(const unsigned char* word, int word_len,
             }
         }
         
-        // *n m - Swap characters at positions n and m
         else if (rule[0] == '*' && rule_len >= 3) {
             unsigned int n = char_to_pos(rule[1]);
             unsigned int m = char_to_pos(rule[2]);
@@ -1293,7 +995,6 @@ void apply_rule(const unsigned char* word, int word_len,
             return;
         }
         
-        // i n X - Insert X at position n
         else if (rule[0] == 'i' && rule_len >= 3) {
             unsigned int n = char_to_pos(rule[1]);
             unsigned char x = rule[2];
@@ -1313,80 +1014,6 @@ void apply_rule(const unsigned char* word, int word_len,
                 return;
             }
         }
-        
-        // o n X - Overwrite at position n with X
-        else if (rule[0] == 'o' && rule_len >= 3) {
-            unsigned int n = char_to_pos(rule[1]);
-            unsigned char x = rule[2];
-            
-            if (n != 0xFFFFFFFF) {
-                *out_len = word_len;
-                for (int i = 0; i < word_len; i++) {
-                    output[i] = word[i];
-                    if (i == n) {
-                        output[i] = x;
-                        *changed = 1;
-                    }
-                }
-                return;
-            }
-        }
-        
-        // {N - Rotate left N positions
-        else if (rule[0] == '{' && rule_len >= 2) {
-            unsigned int n = char_to_pos(rule[1]);
-            if (n == 0xFFFFFFFF) n = 1;
-            
-            *out_len = word_len;
-            for (int i = 0; i < word_len; i++) {
-                int src = (i + n) % word_len;
-                output[i] = word[src];
-            }
-            *changed = 1;
-            return;
-        }
-        
-        // }N - Rotate right N positions
-        else if (rule[0] == '}' && rule_len >= 2) {
-            unsigned int n = char_to_pos(rule[1]);
-            if (n == 0xFFFFFFFF) n = 1;
-            
-            *out_len = word_len;
-            for (int i = 0; i < word_len; i++) {
-                int src = (i - n + word_len) % word_len;
-                output[i] = word[src];
-            }
-            *changed = 1;
-            return;
-        }
-        
-        // [N - Delete first N characters
-        else if (rule[0] == '[' && rule_len >= 2) {
-            unsigned int n = char_to_pos(rule[1]);
-            if (n == 0xFFFFFFFF) n = 1;
-            if (n > word_len) n = word_len;
-            
-            *out_len = word_len - n;
-            for (int i = n; i < word_len; i++) {
-                output[i - n] = word[i];
-            }
-            *changed = 1;
-            return;
-        }
-        
-        // ]N - Delete last N characters
-        else if (rule[0] == ']' && rule_len >= 2) {
-            unsigned int n = char_to_pos(rule[1]);
-            if (n == 0xFFFFFFFF) n = 1;
-            if (n > word_len) n = word_len;
-            
-            *out_len = word_len - n;
-            for (int i = 0; i < *out_len; i++) {
-                output[i] = word[i];
-            }
-            *changed = 1;
-            return;
-        }
     }
     
     // ========================================================================
@@ -1404,93 +1031,90 @@ void apply_rule(const unsigned char* word, int word_len,
 // MAIN KERNEL
 // ============================================================================
 
-__kernel __attribute__((reqd_work_group_size(""" + str(LOCAL_WORK_SIZE) + """, 1, 1)))
-void bfs_kernel(
-    __global const unsigned char* base_words_in,
-    __global const unsigned int* rules_in,
-    __global unsigned int* rule_uniqueness_counts,
-    __global unsigned int* rule_effectiveness_counts,
-    __global const unsigned int* global_hash_map,
-    __global const unsigned int* cracked_hash_map,
-    const unsigned int num_words,
-    const unsigned int num_rules_in_batch,
-    const unsigned int max_word_len,
-    const unsigned int max_output_len,
-    const unsigned int global_map_mask,
-    const unsigned int cracked_map_mask)
+__kernel void bfs_kernel(
+    __global const uchar* base_words_in,
+    __global const uint* rules_in,
+    __global uint* rule_uniqueness_counts,
+    __global uint* rule_effectiveness_counts,
+    __global const uint* global_hash_map,
+    __global const uint* cracked_hash_map,
+    const uint num_words,
+    const uint num_rules_in_batch,
+    const uint max_word_len,
+    const uint max_output_len,
+    const uint global_map_mask,
+    const uint cracked_map_mask)
 {
-    unsigned int global_id = get_global_id(0);
-    unsigned int word_per_rule_count = num_words * num_rules_in_batch;
+    const uint global_id = get_global_id(0);
+    const uint word_per_rule_count = num_words * num_rules_in_batch;
     
     if (global_id >= word_per_rule_count) return;
 
-    unsigned int word_idx = global_id / num_rules_in_batch;
-    unsigned int rule_batch_idx = global_id % num_rules_in_batch;
+    const uint word_idx = global_id / num_rules_in_batch;
+    const uint rule_batch_idx = global_id % num_rules_in_batch;
 
-    // Load word
-    unsigned char word[MAX_WORD_LEN];
-    unsigned int word_len = 0;
-    for (unsigned int i = 0; i < max_word_len; i++) {
-        unsigned char c = base_words_in[word_idx * max_word_len + i];
+    // Load word directly from global memory
+    uchar word[MAX_WORD_LEN];
+    uint word_len = 0;
+    const uint word_base_idx = word_idx * max_word_len;
+    
+    for (uint i = 0; i < max_word_len; i++) {
+        uchar c = base_words_in[word_base_idx + i];
         if (c == 0) break;
         word[i] = c;
         word_len++;
     }
-
-    // Load rule
-    unsigned int rule_size_in_int = 2 + """ + str(MAX_RULE_ARGS) + """;
-    __global const unsigned int* rule_ptr = rules_in + rule_batch_idx * rule_size_in_int;
-    unsigned int rule_id = rule_ptr[0];
-    unsigned int rule_args_int = rule_ptr[1];
-    unsigned int rule_args_int2 = rule_ptr[2];
-
-    // Decode rule string from packed integers
-    unsigned char rule_str[MAX_RULE_LEN];
-    unsigned int rule_len = 0;
     
-    // Unpack first 4 bytes from rule_args_int
-    for (unsigned int i = 0; i < 4; i++) {
-        unsigned char byte = (rule_args_int >> (i * 8)) & 0xFF;
+    // Load rule from global memory
+    const uint rule_size_in_int = 2 + """ + str(MAX_RULE_ARGS) + """;
+    __global const uint* rule_ptr = rules_in + rule_batch_idx * rule_size_in_int;
+    uint rule_args_int = rule_ptr[1];
+    uint rule_args_int2 = rule_ptr[2];
+    
+    uchar rule_str[MAX_RULE_LEN];
+    uint rule_len = 0;
+    
+    for (uint j = 0; j < 4; j++) {
+        uchar byte = (rule_args_int >> (j * 8)) & 0xFF;
         if (byte == 0) break;
         rule_str[rule_len++] = byte;
     }
     
-    // Unpack next 4 bytes from rule_args_int2
     if (rule_len < MAX_RULE_LEN) {
-        for (unsigned int i = 0; i < 4; i++) {
-            unsigned char byte = (rule_args_int2 >> (i * 8)) & 0xFF;
+        for (uint j = 0; j < 4; j++) {
+            uchar byte = (rule_args_int2 >> (j * 8)) & 0xFF;
             if (byte == 0) break;
             rule_str[rule_len++] = byte;
         }
     }
-
+    
     // Apply rule
-    unsigned char result_temp[MAX_OUTPUT_LEN];
+    uchar result_temp[MAX_OUTPUT_LEN];
     int out_len = 0;
     int changed_flag = 0;
     
     apply_rule(word, word_len, rule_str, rule_len, result_temp, &out_len, &changed_flag);
-
+    
     // DUAL-UNIQUENESS LOGIC
     if (changed_flag > 0 && out_len > 0) {
-        unsigned int word_hash = fnv1a_hash_32(result_temp, out_len);
-
+        uint word_hash = fnv1a_hash_32(result_temp, out_len);
+        
         // 1. Check against Base Wordlist (Uniqueness)
-        unsigned int global_map_index = (word_hash >> 5) & """ + str(global_hash_map_mask) + """;
-        unsigned int bit_index = word_hash & 31;
-        unsigned int check_bit = (1U << bit_index);
-
-        __global const unsigned int* global_map_ptr = &global_hash_map[global_map_index];
-        unsigned int current_global_word = *global_map_ptr;
-
+        uint global_map_index = (word_hash >> 5) & """ + str(global_hash_map_mask) + """;
+        uint bit_index = word_hash & 31;
+        uint check_bit = (1U << bit_index);
+        
+        __global const uint* global_map_ptr = &global_hash_map[global_map_index];
+        uint current_global_word = *global_map_ptr;
+        
         if (!(current_global_word & check_bit)) {
             atomic_inc(&rule_uniqueness_counts[rule_batch_idx]);
-
+            
             // 2. Check against Cracked List (Effectiveness)
-            unsigned int cracked_map_index = (word_hash >> 5) & """ + str(cracked_hash_map_mask) + """;
-            __global const unsigned int* cracked_map_ptr = &cracked_hash_map[cracked_map_index];
-            unsigned int current_cracked_word = *cracked_map_ptr;
-
+            uint cracked_map_index = (word_hash >> 5) & """ + str(cracked_hash_map_mask) + """;
+            __global const uint* cracked_map_ptr = &cracked_hash_map[cracked_map_index];
+            uint current_cracked_word = *cracked_map_ptr;
+            
             if (current_cracked_word & check_bit) {
                 atomic_inc(&rule_effectiveness_counts[rule_batch_idx]);
             }
@@ -1499,30 +1123,101 @@ void bfs_kernel(
 }
 
 // ============================================================================
+// ACCUMULATION KERNEL (Reduce host-device transfers)
+// ============================================================================
+
+__kernel void accumulate_results(
+    __global const uint* batch_counts,
+    __global uint* accumulated_counts,
+    const uint batch_offset,
+    const uint num_rules)
+{
+    uint gid = get_global_id(0);
+    if (gid < num_rules) {
+        atomic_add(&accumulated_counts[batch_offset + gid], batch_counts[gid]);
+    }
+}
+
+// ============================================================================
 // HASH MAP INITIALIZATION KERNEL
 // ============================================================================
 
-__kernel __attribute__((reqd_work_group_size(""" + str(LOCAL_WORK_SIZE) + """, 1, 1)))
-void hash_map_init_kernel(
-    __global unsigned int* global_hash_map,
-    __global const unsigned int* base_hashes,
-    const unsigned int num_hashes,
-    const unsigned int map_mask)
+__kernel void hash_map_init_kernel(
+    __global uint* global_hash_map,
+    __global const uint* base_hashes,
+    const uint num_hashes,
+    const uint map_mask)
 {
-    unsigned int global_id = get_global_id(0);
+    uint global_id = get_global_id(0);
     if (global_id >= num_hashes) return;
 
-    unsigned int word_hash = base_hashes[global_id];
-    unsigned int map_index = (word_hash >> 5) & map_mask;
-    unsigned int bit_index = word_hash & 31;
-    unsigned int set_bit = (1U << bit_index);
+    uint word_hash = base_hashes[global_id];
+    uint map_index = (word_hash >> 5) & map_mask;
+    uint bit_index = word_hash & 31;
+    uint set_bit = (1U << bit_index);
 
     atomic_or(&global_hash_map[map_index], set_bit);
 }
 """
 
 # ====================================================================
-# --- UPDATED MAIN RANKING FUNCTION WITH CONTINUOUS RULE PROCESSING ---
+# --- WORK GROUP SIZE MANAGEMENT ---
+# ====================================================================
+
+def get_optimal_work_group_size(device, kernel):
+    """Get optimal work group size for a kernel on the given device"""
+    try:
+        # Query device for maximum work group size
+        max_work_group_size = device.max_work_group_size
+        print(f"{blue('🔧')} {bold('Device max work group size:')} {cyan(f'{max_work_group_size}')}")
+        
+        # Try to get preferred work group size for the kernel
+        try:
+            preferred_size = kernel.get_work_group_info(cl.kernel_work_group_info.PREFERRED_WORK_GROUP_SIZE_MULTIPLE, device)
+            print(f"{blue('🔧')} {bold('Kernel preferred work group size multiple:')} {cyan(f'{preferred_size}')}")
+            
+            # Use 128 as base if preferred size is reasonable
+            if preferred_size > 0 and preferred_size <= 256:
+                optimal_size = min(256, max_work_group_size)
+                optimal_size = (optimal_size // preferred_size) * preferred_size
+            else:
+                optimal_size = 128
+        except:
+            optimal_size = 128
+        
+        # Ensure optimal size doesn't exceed device limits
+        optimal_size = min(optimal_size, max_work_group_size)
+        
+        print(f"{green('🎯')} {bold('Selected work group size:')} {cyan(f'{optimal_size}')}")
+        return optimal_size
+    
+    except Exception as e:
+        print(f"{yellow('⚠️')}  {bold('Warning: Could not query work group info:')} {e}")
+        return 128
+
+def calculate_work_sizes(total_work, preferred_local_size):
+    """Calculate global and local work sizes that are compatible"""
+    # Ensure total_work is at least 1
+    total_work = max(1, total_work)
+    
+    # Round up global size to nearest multiple of local size
+    global_size = ((total_work + preferred_local_size - 1) // preferred_local_size) * preferred_local_size
+    
+    # Ensure local size doesn't exceed total work
+    local_size = min(preferred_local_size, total_work)
+    
+    # Ensure local size divides global size evenly
+    if global_size % local_size != 0:
+        # Find the largest divisor of global_size that's <= preferred_local_size
+        for size in range(preferred_local_size, 0, -1):
+            if global_size % size == 0:
+                local_size = size
+                break
+    
+    return (global_size,), (local_size,)
+
+# ====================================================================
+# --- MAIN RANKING FUNCTION WITH ALL OPTIMIZATIONS ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
@@ -1531,19 +1226,16 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING FOR MEMORY CALCULATION
-    total_words = estimate_word_count(wordlist_path)  # Use fast estimation
+    total_words = estimate_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
     
-    # Setup interrupt handler BEFORE starting processing
     setup_interrupt_handler(rules_list, ranking_output_path, top_k)
     
-    # Check if we're dealing with a large rule set
     if total_rules > 100000:
         print(f"{green('🚀')} {bold('LARGE RULE SET DETECTED:')} {cyan(f'{total_rules:,}')} {bold('rules')}")
         print(f"   {bold('Using optimized processing for large rule sets...')}")
     
-    # Load cracked hashes ONCE for both memory calculation and processing
     cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
     cracked_hashes_count = len(cracked_hashes_np)
     
@@ -1554,9 +1246,11 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         if not devices:
             devices = platform.get_devices(cl.device_type.ALL)
         device = devices[0]
+        
+        # Create command queue
         context = cl.Context([device])
-        queue = cl.CommandQueue(context, properties=cl.command_queue_properties.PROFILING_ENABLE)
-
+        queue = cl.CommandQueue(context)
+        
         # Get GPU memory information
         total_vram, available_vram = get_gpu_memory_info(device)
         print(f"{green('🎮')} {bold('GPU:')} {cyan(device.name.strip())}")
@@ -1587,7 +1281,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             using_manual_params = True
             print(f"{blue('🔧')} {bold('Using manually specified parameters:')}")
             
-            # Set defaults for any unspecified manual parameters
             if words_per_gpu_batch is None:
                 words_per_gpu_batch = DEFAULT_WORDS_PER_GPU_BATCH
             if global_hash_map_bits is None:
@@ -1599,12 +1292,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             print(f"   {blue('-')} {bold('Global hash map:')} {cyan(f'{global_hash_map_bits} bits')}")
             print(f"   {blue('-')} {bold('Cracked hash map:')} {cyan(f'{cracked_hash_map_bits} bits')}")
             
-            # Validate manual parameters against available VRAM
             global_map_bytes = (1 << (global_hash_map_bits - 5)) * np.uint32().itemsize
             cracked_map_bytes = (1 << (cracked_hash_map_bits - 5)) * np.uint32().itemsize
             total_map_memory = global_map_bytes + cracked_map_bytes
             
-            # Memory requirements for batch processing
             word_batch_bytes = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
             hash_batch_bytes = words_per_gpu_batch * np.uint32().itemsize
             rule_batch_bytes = MAX_RULES_IN_BATCH * (2 + MAX_RULE_ARGS) * np.uint32().itemsize
@@ -1618,7 +1309,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 print(f"   {bold('Available:')} {cyan(f'{available_vram / (1024**3):.2f} GB')}")
                 print(f"   {bold('Consider reducing batch size or hash map bits')}")
         else:
-            # Auto-calculate optimal parameters with large rule set consideration
+            # Auto-calculate optimal parameters
             words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
                 available_vram, total_words, cracked_hashes_count, total_rules
             )
@@ -1632,13 +1323,23 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         CRACKED_HASH_MAP_BYTES = CRACKED_HASH_MAP_WORDS * np.uint32(4)
         CRACKED_HASH_MAP_MASK = (1 << (cracked_hash_map_bits - 5)) - 1
 
+        # Compile kernel
         KERNEL_SOURCE = get_kernel_source(global_hash_map_bits, cracked_hash_map_bits)
-        prg = cl.Program(context, KERNEL_SOURCE).build(options=["-cl-fast-relaxed-math"])
+        prg = cl.Program(context, KERNEL_SOURCE).build(options=[
+            "-cl-fast-relaxed-math",
+            "-cl-mad-enable",
+            "-cl-no-signed-zeros"
+        ])
         
         kernel_bfs = prg.bfs_kernel
         kernel_init = prg.hash_map_init_kernel
+        kernel_accumulate = prg.accumulate_results
+        
+        # Get optimal work group size
+        local_work_size = get_optimal_work_group_size(device, kernel_bfs)
         
         print(f"{green('✅')} {bold('OpenCL initialized on device:')} {cyan(device.name.strip())}")
+        print(f"{blue('🔧')} {bold('Using work group size:')} {cyan(f'{local_work_size}')}")
     except Exception as e:
         print(f"{red('❌')} {bold('OpenCL initialization or kernel compilation error:')} {e}")
         exit(1)
@@ -1649,52 +1350,37 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 
     # 3. HASH MAP INITIALIZATION
     global_hash_map_np = np.zeros(GLOBAL_HASH_MAP_WORDS, dtype=np.uint32)
-    print(f"{blue('📝')} {bold('Global Hash Map initialized:')} {cyan(f'{global_hash_map_np.nbytes / (1024*1024):.2f} MB')} {bold('allocated.')}")
-
+    print(f"{blue('📝')} {bold('Global Hash Map initialized:')} {cyan(f'{global_hash_map_np.nbytes / (1024*1024):.2f} MB')}")
+    
     cracked_hash_map_np = np.zeros(CRACKED_HASH_MAP_WORDS, dtype=np.uint32)
-    print(f"{blue('📝')} {bold('Cracked Hash Map initialized:')} {cyan(f'{cracked_hash_map_np.nbytes / (1024*1024):.2f} MB')} {bold('allocated.')}")
+    print(f"{blue('📝')} {bold('Cracked Hash Map initialized:')} {cyan(f'{cracked_hash_map_np.nbytes / (1024*1024):.2f} MB')}")
 
     # 4. OPENCL BUFFER SETUP WITH RETRY LOGIC
     mf = cl.mem_flags
-
-    # Define counters_size here - this was the missing variable
     counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-
+    
     # Define buffer specifications for retry logic
     buffer_specs = {
-        # Double buffering for words and hashes
-        'base_words_in_0': {
+        'base_words_in': {
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
         },
-        'base_words_in_1': {
-            'flags': mf.READ_ONLY,
-            'size': words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-        },
-        'base_hashes_0': {
+        'base_hashes': {
             'flags': mf.READ_ONLY,
             'size': words_per_gpu_batch * np.uint32().itemsize
         },
-        'base_hashes_1': {
-            'flags': mf.READ_ONLY,
-            'size': words_per_gpu_batch * np.uint32().itemsize
-        },
-        # Rule input buffer (INCREASED CAPACITY)
         'rules_in': {
             'flags': mf.READ_ONLY,
             'size': MAX_RULES_IN_BATCH * rule_size_in_int * np.uint32().itemsize
         },
-        # Global Hash Map (RW for base wordlist check)
         'global_hash_map': {
             'flags': mf.READ_WRITE,
             'size': global_hash_map_np.nbytes
         },
-        # Cracked Hash Map (Read Only, filled once)
         'cracked_hash_map': {
             'flags': mf.READ_ONLY,
             'size': cracked_hash_map_np.nbytes
         },
-        # Rule Counters (INCREASED CAPACITY)
         'rule_uniqueness_counts': {
             'flags': mf.READ_WRITE,
             'size': counters_size
@@ -1702,10 +1388,17 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         'rule_effectiveness_counts': {
             'flags': mf.READ_WRITE,
             'size': counters_size
+        },
+        'accumulated_uniqueness': {
+            'flags': mf.READ_WRITE,
+            'size': total_rules * np.uint32().itemsize
+        },
+        'accumulated_effectiveness': {
+            'flags': mf.READ_WRITE,
+            'size': total_rules * np.uint32().itemsize
         }
     }
 
-    # Add hostbuf for cracked hash map if available
     if cracked_hashes_np.size > 0:
         buffer_specs['cracked_temp'] = {
             'flags': mf.READ_ONLY | mf.COPY_HOST_PTR,
@@ -1716,43 +1409,54 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     try:
         buffers = create_opencl_buffers_with_retry(context, buffer_specs)
         
-        # Extract buffers for easier access
-        base_words_in_g = [buffers['base_words_in_0'], buffers['base_words_in_1']]
-        base_hashes_g = [buffers['base_hashes_0'], buffers['base_hashes_1']]
+        # Extract buffers
+        base_words_in_g = buffers['base_words_in']
+        base_hashes_g = buffers['base_hashes']
         rules_in_g = buffers['rules_in']
         global_hash_map_g = buffers['global_hash_map']
         cracked_hash_map_g = buffers['cracked_hash_map']
         rule_uniqueness_counts_g = buffers['rule_uniqueness_counts']
         rule_effectiveness_counts_g = buffers['rule_effectiveness_counts']
+        accumulated_uniqueness_g = buffers['accumulated_uniqueness']
+        accumulated_effectiveness_g = buffers['accumulated_effectiveness']
         cracked_temp_g = buffers.get('cracked_temp', None)
         
     except cl.MemoryError as e:
         print(f"{red('❌')} {bold('Fatal: Could not allocate GPU memory even after retries:')} {e}")
-        print(f"{yellow('💡')} {bold('Try reducing batch size or hash map bits, or use a preset:')}")
         recommendations, _ = get_recommended_parameters(device, total_words, cracked_hashes_count)
         for preset_name, config in recommendations.items():
             if preset_name != "auto":
                 print(f"   {bold('--preset')} {cyan(preset_name)}: {config['description']}")
         return
 
-    current_word_buffer_idx = 0
-
     # 5. INITIALIZE CRACKED HASH MAP (ONCE)
     if cracked_hashes_np.size > 0 and cracked_temp_g is not None:
-        global_size_init_cracked = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-        local_size_init_cracked = (LOCAL_WORK_SIZE,)
+        global_size_init_cracked, local_size_init_cracked = calculate_work_sizes(
+            cracked_hashes_np.size, local_work_size
+        )
 
         print(f"{blue('📊')} {bold('Populating static Cracked Hash Map on GPU...')}")
-        kernel_init(queue, global_size_init_cracked, local_size_init_cracked,
-                    cracked_hash_map_g,
-                    cracked_temp_g,
-                    np.uint32(cracked_hashes_np.size),
-                    np.uint32(CRACKED_HASH_MAP_MASK)).wait()
-        print(f"{green('✅')} {bold('Static Cracked Hash Map populated.')}")
+        try:
+            kernel_init(queue, global_size_init_cracked, local_size_init_cracked,
+                        cracked_hash_map_g,
+                        cracked_temp_g,
+                        np.uint32(cracked_hashes_np.size),
+                        np.uint32(CRACKED_HASH_MAP_MASK)).wait()
+            print(f"{green('✅')} {bold('Static Cracked Hash Map populated.')}")
+        except cl.LogicError as e:
+            print(f"{yellow('⚠️')}  {bold('Warning: Cracked hash map initialization failed:')} {e}")
+            # Continue without cracked hash map
+            cracked_hashes_np = np.array([], dtype=np.uint32)
+        
     else:
         print(f"{yellow('⚠️')} {bold('Cracked list is empty, effectiveness scoring is disabled.')}")
         
-    # 6. PIPELINED RANKING LOOP SETUP
+    # 6. INITIALIZE ACCUMULATION BUFFERS
+    cl.enqueue_fill_buffer(queue, accumulated_uniqueness_g, np.uint32(0), 0, total_rules * np.uint32().itemsize)
+    cl.enqueue_fill_buffer(queue, accumulated_effectiveness_g, np.uint32(0), 0, total_rules * np.uint32().itemsize)
+    queue.finish()
+    
+    # 7. PIPELINED RANKING LOOP SETUP
     word_iterator = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
     total_rule_batches = len(rule_batch_starts)
@@ -1760,61 +1464,10 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     print(f"{blue('📊')} {bold('Processing')} {cyan(f'{total_rules:,}')} {bold('rules in')} {cyan(f'{total_rule_batches:,}')} {bold('batches')} "
           f"{bold('(up to')} {cyan(f'{MAX_RULES_IN_BATCH:,}')} {bold('rules per batch)')}")
     
-    # Use Python ints for counters
-    words_processed_total = 0
-    total_unique_found = 0
-    total_cracked_found = 0
-    
-    mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-    mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-    
-    num_words_batch_exec = 0
-    
-    # Create progress bars with proper formatting and ETA
-    word_batch_pbar = tqdm(total=total_words, desc="Wordlist progress", unit=" word", 
-                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                          position=0)
-    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches processed", unit=" batch", 
-                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                          position=1)
-
-    # A. Initial word batch load
-    try:
-        base_words_np_batch, base_hashes_np_batch, num_words_batch_exec = next(word_iterator)
-        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], base_words_np_batch)
-        cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], base_hashes_np_batch).wait()
-    except StopIteration:
-        print(f"{yellow('⚠️')} {bold('Wordlist is empty or too small.')}")
-        word_batch_pbar.close()
-        rule_batch_pbar.close()
-        return
-
-    # B. Main Pipelined Loop
-    wordlist_processing_complete = False
-    current_rule_batch_idx = 0
-    processed_word_batches = 0
-    total_word_batches = 0  # We'll count as we go
-    
-    # Initialize global hash map with first word batch
-    print(f"{blue('📊')} {bold('Initializing global hash map with first word batch...')}")
-    global_size_init_global = (int(math.ceil(num_words_batch_exec / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-    local_size_init_global = (LOCAL_WORK_SIZE,)
-    kernel_init(queue, global_size_init_global, local_size_init_global,
-                global_hash_map_g,
-                base_hashes_g[current_word_buffer_idx],
-                np.uint32(num_words_batch_exec),
-                np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
-    print(f"{green('✅')} {bold('Global hash map initialized with first batch.')}")
-    
-    # Keep track of which word batches have been processed
-    word_batches_processed = []
-    
-    # Load the entire wordlist into a list first for proper synchronization
-    word_batches = []
+    # Load all word batches into memory
     print(f"{blue('📊')} {bold('Preloading word batches...')}")
-    
+    word_batches = []
     try:
-        # Load all word batches into memory
         while True:
             try:
                 base_words_np_batch, base_hashes_np_batch, num_words_batch = next(word_iterator)
@@ -1832,46 +1485,76 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     total_word_batches = len(word_batches)
     print(f"{green('✅')} {bold('Preloaded')} {cyan(f'{total_word_batches:,}')} {bold('word batches')}")
     
-    # IMPORTANT FIX: Process all rule batches for each word batch
-    # Outer loop for word batches, inner loop for rule batches
+    # Use Python ints for counters
+    words_processed_total = 0
+    total_unique_found = 0
+    total_cracked_found = 0
+    
+    mapped_uniqueness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+    mapped_effectiveness_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+    
+    # Create progress bars
+    word_batch_pbar = tqdm(total=total_words, desc="Wordlist progress", unit=" word", 
+                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+                          position=0)
+    rule_batch_pbar = tqdm(total=total_rule_batches, desc="Rule batches processed", unit=" batch", 
+                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                          position=1)
+
+    # 8. MAIN PROCESSING LOOP
     for word_batch_idx, word_batch_data in enumerate(word_batches):
-        # Check for interrupt before processing
         if interrupted:
             break
         
-        # Load current word batch to GPU
-        cl.enqueue_copy(queue, base_words_in_g[current_word_buffer_idx], word_batch_data['words'])
-        cl.enqueue_copy(queue, base_hashes_g[current_word_buffer_idx], word_batch_data['hashes']).wait()
+        # Upload current word batch
+        cl.enqueue_copy(queue, base_words_in_g, word_batch_data['words'], is_blocking=True)
+        cl.enqueue_copy(queue, base_hashes_g, word_batch_data['hashes'], is_blocking=True)
         
-        # Initialize/update global hash map with current word batch
-        kernel_init(queue, global_size_init_global, local_size_init_global,
-                    global_hash_map_g,
-                    base_hashes_g[current_word_buffer_idx],
-                    np.uint32(word_batch_data['count']),
-                    np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
+        # Clear global hash map for current batch
+        cl.enqueue_fill_buffer(queue, global_hash_map_g, np.uint32(0), 0, GLOBAL_HASH_MAP_BYTES)
         
-        # Process all rule batches for this word batch
-        for rule_batch_idx in range(total_rule_batches):
-            # Check for interrupt before each rule batch
+        # Initialize global hash map with current word batch
+        global_size_init_global, local_size_init_global = calculate_work_sizes(
+            word_batch_data['count'], local_work_size
+        )
+        
+        try:
+            kernel_init(queue, global_size_init_global, local_size_init_global,
+                       global_hash_map_g,
+                       base_hashes_g,
+                       np.uint32(word_batch_data['count']),
+                       np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
+        except cl.LogicError as e:
+            print(f"{yellow('⚠️')}  {bold('Warning: Hash map initialization failed:')} {e}")
+            continue
+        
+        # Process each rule batch
+        for rule_batch_idx, rule_start_index in enumerate(rule_batch_starts):
             if interrupted:
                 break
                 
-            rule_start_index = rule_batch_starts[rule_batch_idx]
             rule_end_index = min(rule_start_index + MAX_RULES_IN_BATCH, total_rules)
             num_rules_in_batch = rule_end_index - rule_start_index
-
+            
             current_rule_batch_list = encoded_rules[rule_start_index:rule_end_index]
             current_rules_np = np.concatenate(current_rule_batch_list)
             
+            # Upload rule batch
             cl.enqueue_copy(queue, rules_in_g, current_rules_np, is_blocking=True)
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size)
-            cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size)
             
-            global_size = (word_batch_data['count'] * num_rules_in_batch, )
-            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-
-            kernel_bfs.set_args(
-                base_words_in_g[current_word_buffer_idx],
+            # Clear counters
+            cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, 
+                                 np.uint32(0), 0, counters_size)
+            cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g,
+                                 np.uint32(0), 0, counters_size)
+            
+            # Calculate kernel size with proper work group alignment
+            total_work_items = word_batch_data['count'] * num_rules_in_batch
+            global_size, local_size = calculate_work_sizes(total_work_items, local_work_size)
+            
+            # Set kernel arguments
+            kernel_args = [
+                base_words_in_g,
                 rules_in_g,
                 rule_uniqueness_counts_g,
                 rule_effectiveness_counts_g,
@@ -1883,68 +1566,87 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 np.uint32(MAX_OUTPUT_LEN),
                 np.uint32(GLOBAL_HASH_MAP_MASK),
                 np.uint32(CRACKED_HASH_MAP_MASK)
-            )
-
-            exec_event = cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size_aligned, (LOCAL_WORK_SIZE,))
-            exec_event.wait()
-
-            cl.enqueue_copy(queue, mapped_uniqueness_np, rule_uniqueness_counts_g, is_blocking=True)
-            cl.enqueue_copy(queue, mapped_effectiveness_np, rule_effectiveness_counts_g, is_blocking=True)
-
-            # Update counts for this rule batch
-            batch_unique_found = 0
-            batch_cracked_found = 0
+            ]
             
-            for i in range(num_rules_in_batch):
-                rule_index = rule_start_index + i
-                # Convert to Python int
-                uniqueness_val = int(mapped_uniqueness_np[i])
-                effectiveness_val = int(mapped_effectiveness_np[i])
+            try:
+                # Execute kernel
+                kernel_bfs.set_args(*kernel_args)
+                cl.enqueue_nd_range_kernel(queue, kernel_bfs, global_size, local_size)
                 
-                rules_list[rule_index]['uniqueness_score'] += uniqueness_val
-                rules_list[rule_index]['effectiveness_score'] += effectiveness_val
-                batch_unique_found += uniqueness_val
-                batch_cracked_found += effectiveness_val
+                # Accumulate results on GPU
+                accum_global_size, accum_local_size = calculate_work_sizes(num_rules_in_batch, local_work_size)
+                
+                kernel_accumulate.set_args(
+                    rule_uniqueness_counts_g,
+                    accumulated_uniqueness_g,
+                    np.uint32(rule_start_index),
+                    np.uint32(num_rules_in_batch)
+                )
+                cl.enqueue_nd_range_kernel(queue, kernel_accumulate, accum_global_size, accum_local_size)
+                
+                kernel_accumulate.set_args(
+                    rule_effectiveness_counts_g,
+                    accumulated_effectiveness_g,
+                    np.uint32(rule_start_index),
+                    np.uint32(num_rules_in_batch)
+                )
+                cl.enqueue_nd_range_kernel(queue, kernel_accumulate, accum_global_size, accum_local_size)
+                
+                queue.finish()
+                
+            except cl.LogicError as e:
+                print(f"{yellow('⚠️')}  {bold('Warning: Kernel execution failed for batch')} {cyan(f'{rule_batch_idx + 1}/{total_rule_batches}')}: {e}")
+                # Continue with next batch
+                continue
             
-            # Update global totals
-            total_unique_found += batch_unique_found
-            total_cracked_found += batch_cracked_found
-            
-            # Update progress bars with dynamic counters
-            words_processed_so_far = words_processed_total + word_batch_data['count'] * (rule_batch_idx + 1) / total_rule_batches
-            word_batch_pbar.n = min(int(words_processed_so_far), total_words)
-            word_batch_pbar.set_description(
-                f"Wordlist: {int(words_processed_so_far):,}/{total_words:,} [Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}]"
-            )
-            
-            # Update rule batch progress
+            # Update progress bars
             rule_batch_pbar.update(1)
             rule_batch_pbar.set_description(
-                f"Rules: {rule_batch_idx+1}/{total_rule_batches} (Word batch: {word_batch_idx+1}/{total_word_batches})"
+                f"Rule batches: {rule_batch_idx + 1}/{total_rule_batches}"
             )
-            
-            # Update interrupt handler stats
-            update_progress_stats(words_processed_so_far, total_unique_found, total_cracked_found)
         
         # Update word count for completed word batch
         words_processed_total += word_batch_data['count']
-        processed_word_batches += 1
         
         # Update word batch progress bar
         word_batch_pbar.update(word_batch_data['count'])
+        word_batch_pbar.set_description(
+            f"Wordlist: {words_processed_total:,}/{total_words:,} [Batch: {word_batch_idx+1}/{total_word_batches}]"
+        )
         
-        # Reset rule batch progress for next word batch
-        rule_batch_pbar.n = 0
-        rule_batch_pbar.refresh()
-        
-        # Switch buffer for next iteration
-        current_word_buffer_idx = 1 - current_word_buffer_idx
+        # Update interrupt handler stats
+        update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
     
     # Check if we were interrupted
     if interrupted:
         print(f"\n{yellow('⚠️')} {bold('Processing was interrupted. Intermediate results have been saved.')}")
         return
+    
+    # 9. COPY ACCUMULATED RESULTS BACK
+    print(f"{blue('📊')} {bold('Copying final results from GPU...')}")
+    
+    final_uniqueness_np = np.zeros(total_rules, dtype=np.uint32)
+    final_effectiveness_np = np.zeros(total_rules, dtype=np.uint32)
+    
+    try:
+        cl.enqueue_copy(queue, final_uniqueness_np, accumulated_uniqueness_g, is_blocking=True)
+        cl.enqueue_copy(queue, final_effectiveness_np, accumulated_effectiveness_g, is_blocking=True)
+        queue.finish()
         
+        # Update rule scores
+        for i in range(total_rules):
+            rules_list[i]['uniqueness_score'] = int(final_uniqueness_np[i])
+            rules_list[i]['effectiveness_score'] = int(final_effectiveness_np[i])
+        
+        total_unique_found = final_uniqueness_np.sum()
+        total_cracked_found = final_effectiveness_np.sum()
+        
+    except Exception as e:
+        print(f"{yellow('⚠️')}  {bold('Warning: Failed to copy results from GPU:')} {e}")
+        # Use placeholder scores
+        total_unique_found = 0
+        total_cracked_found = 0
+    
     # Final update for progress bars
     word_batch_pbar.close()
     rule_batch_pbar.close()
@@ -1959,59 +1661,135 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     print(f"{blue('📊')} {bold('Total Rules Processed:')} {cyan(f'{total_rules:,}')}")
     print(f"{blue('🎯')} {bold('Total Unique Words Generated:')} {cyan(f'{total_unique_found:,}')}")
     print(f"{blue('🔓')} {bold('Total True Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
-    print(f"{blue('⏱️')}  {bold('Total Execution Time:')} {cyan(f'{end_time - start_time:.2f} seconds')}")
+    print(f"{blue('⏱️')} {bold('Total Processing Time:')} {cyan(f'{end_time - start_time:.2f} seconds')}")
+    
+    # Calculate and display performance metrics
+    total_operations = words_processed_total * total_rules
+    if total_operations > 0:
+        operations_per_second = total_operations / (end_time - start_time)
+        print(f"{blue('⚡')} {bold('Processing Speed:')} {cyan(f'{operations_per_second:,.0f}')} {bold('operations/sec')}")
+        
+        if total_unique_found > 0:
+            uniqueness_ratio = (total_unique_found / total_operations) * 100
+            print(f"{blue('📈')} {bold('Uniqueness Ratio:')} {cyan(f'{uniqueness_ratio:.4f}%')}")
+        
+        if total_cracked_found > 0:
+            effectiveness_ratio = (total_cracked_found / total_operations) * 100
+            print(f"{blue('📈')} {bold('Effectiveness Ratio:')} {cyan(f'{effectiveness_ratio:.6f}%')}")
+    
     print(f"{green('=' * 60)}{Colors.END}\n")
 
-    csv_path = save_ranking_data(rules_list, ranking_output_path)
-    if top_k > 0:
-        optimized_output_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-        load_and_save_optimized_rules(csv_path, optimized_output_path, top_k)
+    # Save ranking data to CSV
+    ranking_csv_path = save_ranking_data(rules_list, ranking_output_path)
+    
+    if ranking_csv_path:
+        # Save optimized rules
+        optimized_output_path = ranking_output_path.replace('.csv', '.rule')
+        load_and_save_optimized_rules(ranking_csv_path, optimized_output_path, top_k)
+    
+    return ranking_csv_path
+
 
 # ====================================================================
-# --- MAIN EXECUTION ---
+# --- MAIN FUNCTION ---
 # ====================================================================
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.2 - Optimized Large File Loading)")
-    parser.add_argument('-w', '--wordlist', required=True, help='Path to the base wordlist file.')
-    parser.add_argument('-r', '--rules', required=True, help='Path to the Hashcat rules file to rank.')
-    parser.add_argument('-c', '--cracked', required=True, help='Path to a list of cracked passwords for effectiveness scoring.')
-    parser.add_argument('-o', '--output', default='ranker_output.csv', help='Path to save the final ranking CSV.')
-    parser.add_argument('-k', '--topk', type=int, default=1000, help='Number of top rules to save to an optimized .rule file. Set to 0 to skip.')
+def main():
+    parser = argparse.ArgumentParser(
+        description="RANKER v4.2: Ultra-Optimized GPU Rule Ranking",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s -w wordlist.txt -r rules.txt -c cracked.txt -o ranking.csv --top-k 1000
+  %(prog)s -w wordlist.txt -r rules.txt -c cracked.txt -o ranking.csv --preset high_memory
+  %(prog)s -w wordlist.txt -r rules.txt -c cracked.txt -o ranking.csv --batch-size 50000
+  %(prog)s -w wordlist.txt -r rules.txt -c cracked.txt -o ranking.csv --recommend
+        """
+    )
     
-    # Performance tuning flags
-    parser.add_argument('--batch-size', type=int, default=None, 
-                       help=f'Number of words to process in each GPU batch (default: auto-calculate based on VRAM)')
-    parser.add_argument('--global-bits', type=int, default=None,
-                       help=f'Bits for global hash map size (default: auto-calculate based on VRAM)')
-    parser.add_argument('--cracked-bits', type=int, default=None,
-                       help=f'Bits for cracked hash map size (default: auto-calculate based on VRAM)')
+    parser.add_argument("-w", "--wordlist", required=True,
+                       help="Path to base wordlist file")
+    parser.add_argument("-r", "--rules", required=True,
+                       help="Path to rules file")
+    parser.add_argument("-c", "--cracked", required=True,
+                       help="Path to cracked passwords file (for effectiveness scoring)")
+    parser.add_argument("-o", "--output", required=True,
+                       help="Output ranking CSV path")
+    parser.add_argument("--top-k", type=int, default=1000,
+                       help="Number of top rules to save in optimized file (default: 1000)")
     
-    # New preset argument for easy configuration
-    parser.add_argument('--preset', type=str, default=None,
-                       help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
+    # Performance tuning parameters
+    parser.add_argument("--batch-size", type=int,
+                       help=f"Number of words per GPU batch (default: auto-calculated, typical: {DEFAULT_WORDS_PER_GPU_BATCH:,})")
+    parser.add_argument("--global-bits", type=int,
+                       help=f"Global hash map size in bits (default: auto-calculated, typical: {DEFAULT_GLOBAL_HASH_MAP_BITS})")
+    parser.add_argument("--cracked-bits", type=int,
+                       help=f"Cracked hash map size in bits (default: auto-calculated, typical: {DEFAULT_CRACKED_HASH_MAP_BITS})")
+    
+    # Preset modes
+    parser.add_argument("--preset", choices=["low_memory", "medium_memory", "high_memory", "recommend"],
+                       help="Use predefined parameter sets based on GPU memory")
     
     args = parser.parse_args()
 
-    print(f"{green('=' * 70)}")
-    print(f"{bold('🎯 RANKER v3.2 - OPTIMIZED LARGE FILE LOADING')}")
-    print(f"{green('=' * 70)}{Colors.END}")
-    print(f"{blue('💡')} {bold('Features:')}")
-    print(f"   {green('✓')} {bold('Memory-mapped file loading')}")
-    print(f"   {green('✓')} {bold('Fast word count estimation')}")
-    print(f"   {green('✓')} {bold('Bulk processing optimization')}")
-    print(f"   {green('✓')} {bold('Parallel hash computation')}")
-    print(f"   {green('✓')} {bold('Comprehensive Hashcat rules support (16,000+ rules)')}")
-    print(f"{green('=' * 70)}{Colors.END}")
+    # Print banner
+    print(f"{Colors.CYAN}{'='*70}")
+    print(f"{Colors.BOLD}       RANKER v4.2: ULTRA-OPTIMIZED GPU RULE RANKING       ")
+    print(f"{Colors.CYAN}{'='*70}{Colors.END}\n")
+    
+    print(f"{green('🚀')} {bold('Starting GPU-accelerated rule ranking...')}")
+    print(f"{blue('📁')} {bold('Wordlist:')} {cyan(args.wordlist)}")
+    print(f"{blue('📁')} {bold('Rules:')} {cyan(args.rules)}")
+    print(f"{blue('📁')} {bold('Cracked list:')} {cyan(args.cracked)}")
+    print(f"{blue('💾')} {bold('Output:')} {cyan(args.output)}")
+    print(f"{blue('🎯')} {bold('Top K:')} {cyan(f'{args.top_k:,}')}\n")
+    
+    # Validate file existence
+    for file_path, file_type in [(args.wordlist, "wordlist"),
+                                 (args.rules, "rules"),
+                                 (args.cracked, "cracked list")]:
+        if not os.path.exists(file_path):
+            print(f"{red('❌')} {bold('Error:')} {file_type} file not found: {file_path}")
+            return
+    
+    try:
+        # Run the main ranking function
+        ranking_csv_path = rank_rules_uniqueness_large(
+            wordlist_path=args.wordlist,
+            rules_path=args.rules,
+            cracked_list_path=args.cracked,
+            ranking_output_path=args.output,
+            top_k=args.top_k,
+            words_per_gpu_batch=args.batch_size,
+            global_hash_map_bits=args.global_bits,
+            cracked_hash_map_bits=args.cracked_bits,
+            preset=args.preset
+        )
+        
+        if ranking_csv_path:
+            print(f"{green('✅')} {bold('Ranking completed successfully!')}")
+            print(f"{blue('📊')} {bold('Ranking data saved to:')} {cyan(ranking_csv_path)}")
+            
+            # Generate optimized rules file path
+            optimized_rules_path = args.output.replace('.csv', '.rule')
+            if os.path.exists(optimized_rules_path):
+                print(f"{blue('🔧')} {bold('Optimized rules saved to:')} {cyan(optimized_rules_path)}")
+        
+        print(f"\n{green('🎉')} {bold('All operations completed successfully!')}")
+        
+    except KeyboardInterrupt:
+        print(f"\n{yellow('⚠️')} {bold('Operation interrupted by user.')}")
+    except Exception as e:
+        print(f"\n{red('❌')} {bold('An error occurred during ranking:')}")
+        import traceback
+        print(f"{red(str(e))}")
+        traceback.print_exc()
 
-    rank_rules_uniqueness_large(
-        wordlist_path=args.wordlist,
-        rules_path=args.rules,
-        cracked_list_path=args.cracked,
-        ranking_output_path=args.output,
-        top_k=args.topk,
-        words_per_gpu_batch=args.batch_size,
-        global_hash_map_bits=args.global_bits,
-        cracked_hash_map_bits=args.cracked_bits,
-        preset=args.preset
-    )
+
+# ====================================================================
+# --- ENTRY POINT ---
+# ====================================================================
+
+if __name__ == "__main__":
+    main()
+
