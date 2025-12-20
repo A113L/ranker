@@ -673,7 +673,6 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     Calculate optimal parameters with consideration for large rule sets
     """
     print(f"{blue('Calculating optimal parameters for')} {cyan(f'{available_vram / (1024**3):.1f} GB')} {bold('available VRAM')}")
-    print(f"{blue('Dataset:')} {cyan(f'{total_words:,}')} {bold('words,')} {cyan(f'{total_rules:,}')} {bold('rules,')} {cyan(f'{cracked_hashes_count:,}')} {bold('cracked hashes')}")
     
     if reduction_factor < 1.0:
         print(f"{yellow('Applying memory reduction factor:')} {cyan(f'{reduction_factor:.2f}')}")
