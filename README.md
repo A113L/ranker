@@ -18,7 +18,7 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 
 **Combine Score = Effectiveness*10+Uniqueness**
 
-## 📋 Requirements
+## 📋 Requirements and Usage
 
 ```bash
 pip install pyopencl numpy tqdm
