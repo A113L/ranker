@@ -14,7 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # ====================================================================
-# --- RANKER v3.3: COMPLETE HASHCAT RULES IMPLEMENTATION ---
+# --- RANKER v4.0: HASHCAT RULES RANKING WITH MULTI-ARMED BANDITS ---
 # ====================================================================
 
 # --- COLOR CODES FOR TERMINAL OUTPUT ---
@@ -38,6 +38,165 @@ def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
 def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 
 # ====================================================================
+# --- MULTI-ARMED BANDIT (MAB) MODULE FOR RULE SELECTION ---
+# ====================================================================
+
+class RuleBandit:
+    """Multi-Armed Bandit with Thompson Sampling for rule selection"""
+    
+    def __init__(self, rules_list, exploration_factor=1.0, min_trials=100):
+        """
+        Initialize the bandit with all rules.
+        
+        Args:
+            rules_list: List of all rules with their metadata
+            exploration_factor: Controls exploration vs exploitation (higher = more exploration)
+            min_trials: Minimum number of trials before considering a rule for pruning
+        """
+        self.all_rules = rules_list
+        self.num_rules = len(rules_list)
+        
+        # Thompson Sampling parameters: Beta(alpha, beta) distribution
+        # alpha = successes (cracks found) + 1 (prior)
+        # beta = failures (no cracks) + 1 (prior)
+        self.alphas = np.ones(self.num_rules, dtype=np.float32)  # Prior: 1 success
+        self.betas = np.ones(self.num_rules, dtype=np.float32)   # Prior: 1 failure
+        
+        # Exploration tracking
+        self.rule_trials = np.zeros(self.num_rules, dtype=np.uint32)  # How many times each rule was tested
+        self.rule_performance = np.zeros(self.num_rules, dtype=np.float32)  # Success rate
+        
+        # Configuration
+        self.exploration_factor = exploration_factor
+        self.min_trials = min_trials
+        self.exploration_rate = 0.3  # Initial exploration rate
+        self.exploration_decay = 0.995  # Decay factor per batch
+        
+        # Performance statistics
+        self.total_selections = 0
+        self.successful_selections = 0
+        self.pruned_rules = set()
+        self.active_rules_mask = np.ones(self.num_rules, dtype=bool)  # All rules initially active
+        
+        print(f"{green('MAB INIT')}: Thompson Sampling Bandit with {cyan(f'{self.num_rules:,}')} rules")
+        print(f"{blue('MAB CONFIG')}: Exploration factor: {cyan(f'{exploration_factor}')}, Min trials: {cyan(f'{min_trials}')}")
+    
+    def select_best_rules(self, batch_size, force_exploration=False):
+        """
+        Select the best rules using Thompson Sampling.
+        
+        Args:
+            batch_size: Number of rules to select
+            force_exploration: Force exploration of new rules
+        
+        Returns:
+            Indices of selected rules
+        """
+        # Filter out pruned rules
+        active_indices = np.where(self.active_rules_mask)[0]
+        
+        if len(active_indices) <= batch_size:
+            # Not enough active rules, return all
+            return active_indices
+        
+        # Calculate performance scores using Thompson Sampling
+        # Sample from Beta distribution for each active rule
+        samples = np.random.beta(
+            self.alphas[active_indices] * self.exploration_factor,
+            self.betas[active_indices]
+        )
+        
+        # Apply exploration bonus for under-explored rules
+        if force_exploration or np.random.random() < self.exploration_rate:
+            # Exploration phase: favor rules with few trials
+            exploration_bonus = np.sqrt(2 * np.log(self.total_selections + 1) / (self.rule_trials[active_indices] + 1e-8))
+            scores = samples + exploration_bonus
+        else:
+            # Exploitation phase: use Thompson samples directly
+            scores = samples
+        
+        # Select top rules
+        top_indices = np.argsort(scores)[-batch_size:]
+        selected_indices = active_indices[top_indices]
+        
+        # Update statistics
+        self.total_selections += 1
+        for idx in selected_indices:
+            self.rule_trials[idx] += 1
+        
+        # Decay exploration rate
+        self.exploration_rate *= self.exploration_decay
+        
+        return selected_indices
+    
+    def update(self, selected_indices, effectiveness_counts, words_tested):
+        """
+        Update bandit parameters based on rule performance.
+        
+        Args:
+            selected_indices: Indices of rules that were tested
+            effectiveness_counts: Number of cracks found by each rule
+            words_tested: Number of words tested with each rule
+        """
+        for idx, cracked_count in zip(selected_indices, effectiveness_counts):
+            # Update Beta distribution parameters
+            self.alphas[idx] += cracked_count
+            self.betas[idx] += (words_tested - cracked_count)
+            
+            # Update performance tracking
+            if words_tested > 0:
+                success_rate = cracked_count / words_tested
+                self.rule_performance[idx] = (
+                    0.9 * self.rule_performance[idx] + 0.1 * success_rate
+                ) if self.rule_trials[idx] > 0 else success_rate
+            
+            # Check if rule should be pruned (consistently poor performance)
+            if (self.rule_trials[idx] >= self.min_trials and 
+                self.rule_performance[idx] < 0.0001 and  # Less than 0.01% success rate
+                np.random.random() < 0.1):  # 10% chance to prune
+                
+                self.pruned_rules.add(idx)
+                self.active_rules_mask[idx] = False
+                self.successful_selections += 1
+    
+    def get_statistics(self):
+        """Get current bandit statistics"""
+        active_count = np.sum(self.active_rules_mask)
+        avg_trials = np.mean(self.rule_trials[self.active_rules_mask]) if active_count > 0 else 0
+        avg_success_rate = np.mean(self.rule_performance[self.active_rules_mask]) if active_count > 0 else 0
+        
+        return {
+            'total_rules': self.num_rules,
+            'active_rules': int(active_count),
+            'pruned_rules': len(self.pruned_rules),
+            'avg_trials_per_rule': float(avg_trials),
+            'avg_success_rate': float(avg_success_rate),
+            'exploration_rate': float(self.exploration_rate),
+            'selection_efficiency': self.successful_selections / max(self.total_selections, 1)
+        }
+    
+    def get_top_rules(self, n=100):
+        """Get top n rules based on estimated success probability"""
+        # Calculate success probability for each rule
+        success_probs = self.alphas / (self.alphas + self.betas)
+        
+        # Get indices of top rules
+        top_indices = np.argsort(success_probs)[-n:]
+        
+        # Return rules with their probabilities
+        return [
+            {
+                'rule_id': idx,
+                'rule_data': self.all_rules[idx]['rule_data'],
+                'success_probability': float(success_probs[idx]),
+                'trials': int(self.rule_trials[idx]),
+                'successes': int(self.alphas[idx] - 1),  # Subtract prior
+                'failures': int(self.betas[idx] - 1)     # Subtract prior
+            }
+            for idx in top_indices[::-1]  # Reverse to get highest first
+        ]
+
+# ====================================================================
 # --- CONSTANTS ---
 # ====================================================================
 MAX_WORD_LEN = 256
@@ -50,6 +209,11 @@ LOCAL_WORK_SIZE = 256
 DEFAULT_WORDS_PER_GPU_BATCH = 100000
 DEFAULT_GLOBAL_HASH_MAP_BITS = 35
 DEFAULT_CRACKED_HASH_MAP_BITS = 33
+
+# MAB Configuration
+DEFAULT_MAB_EXPLORATION_FACTOR = 1.0
+DEFAULT_MAB_MIN_TRIALS = 100
+DEFAULT_MAB_PRUNING_THRESHOLD = 0.0001  # 0.01% success rate
 
 # Memory settings
 VRAM_SAFETY_MARGIN = 0.15
@@ -1524,17 +1688,20 @@ def encode_rule_full(rule_str, rule_id):
     
     return encoded
 
-def prepare_rules_buffer(rules_list):
-    """Prepare all rules in a batch for GPU processing"""
-    num_rules = len(rules_list)
-    rules_buffer = np.zeros((num_rules, MAX_RULE_LEN), dtype=np.uint8)
-    rule_ids = np.zeros(num_rules, dtype=np.uint32)
+def prepare_rules_buffer(rules_list, selected_indices):
+    """Prepare selected rules in a batch for GPU processing"""
+    num_rules = len(selected_indices)
+    rules_buffer = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
+    rule_ids = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     
-    for i, rule in enumerate(rules_list):
+    for i, rule_idx in enumerate(selected_indices):
+        if i >= MAX_RULES_IN_BATCH:
+            break
+        rule = rules_list[rule_idx]
         rules_buffer[i] = encode_rule_full(rule['rule_data'], rule['rule_id'])
         rule_ids[i] = rule['rule_id']
     
-    return rules_buffer, rule_ids
+    return rules_buffer, rule_ids, num_rules
 
 # ====================================================================
 # --- INTERRUPT HANDLER FUNCTIONS ---
@@ -1650,16 +1817,16 @@ def update_progress_stats(words_processed, unique_found, cracked_found):
     total_cracked_found = cracked_found
 
 # ====================================================================
-# --- UPDATED RANKER MAIN FUNCTION ---
+# --- UPDATED RANKER MAIN FUNCTION WITH MAB ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
                                words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
-                               preset=None, device_id=None):
+                               preset=None, device_id=None, mab_exploration_factor=None, mab_min_trials=None):
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING
-    print(f"{blue('INITIALIZING')}: RANKER with Complete Hashcat Rules Implementation...")
+    print(f"{blue('INITIALIZING')}: RANKER v4.0 with Multi-Armed Bandits...")
     
     # Estimate word count
     total_words = estimate_word_count(wordlist_path)
@@ -1711,7 +1878,18 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     cracked_hashes_count = len(cracked_hashes_np)
     print(f"{green('LOADED')}: {cyan(f'{cracked_hashes_count:,}')} unique cracked password hashes")
     
-    # 1. OPENCL INITIALIZATION
+    # 1. INITIALIZE MULTI-ARMED BANDIT
+    exploration_factor = mab_exploration_factor if mab_exploration_factor else DEFAULT_MAB_EXPLORATION_FACTOR
+    min_trials = mab_min_trials if mab_min_trials else DEFAULT_MAB_MIN_TRIALS
+    
+    print(f"{green('MAB')}: Initializing Thompson Sampling Bandit...")
+    rule_bandit = RuleBandit(
+        rules_list, 
+        exploration_factor=exploration_factor,
+        min_trials=min_trials
+    )
+    
+    # 2. OPENCL INITIALIZATION
     try:
         # Device selection
         if device_id is not None:
@@ -1813,18 +1991,14 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{red('ERROR')}: OpenCL initialization failed: {e}")
         return
     
-    # 2. DATA PREPARATION
+    # 3. DATA PREPARATION
     print(f"{blue('PREPARING')}: Data for GPU processing...")
     
     # Initialize hash maps
     global_hash_map_np = np.zeros(GLOBAL_HASH_MAP_WORDS, dtype=np.uint32)
     cracked_hash_map_np = np.zeros(CRACKED_HASH_MAP_WORDS, dtype=np.uint32)
     
-    # Prepare rules in batches
-    rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
-    total_rule_batches = len(rule_batch_starts)
-    
-    # 3. OPENCL BUFFER ALLOCATION
+    # 4. OPENCL BUFFER ALLOCATION
     mf = cl.mem_flags
     
     # Calculate buffer sizes
@@ -1850,7 +2024,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{red('ERROR')}: GPU memory allocation failed!")
         return
     
-    # 4. INITIALIZE CRACKED HASH MAP
+    # 5. INITIALIZE CRACKED HASH MAP
     if cracked_hashes_np.size > 0:
         print(f"{blue('INITIALIZING')}: Cracked hash map on GPU...")
         global_size_init = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
@@ -1861,8 +2035,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     np.uint32(CRACKED_HASH_MAP_MASK)).wait()
         print(f"{green('INITIALIZED')}: Cracked hash map")
     
-    # 5. PROCESSING LOOP
-    print(f"{blue('STARTING')}: Rule ranking with {cyan(f'{total_rules:,}')} rules in {cyan(f'{total_rule_batches:,}')} batches...")
+    # 6. PROCESSING LOOP WITH MAB
+    print(f"{blue('STARTING')}: Rule ranking with MAB optimization...")
     
     # Initialize counters
     words_processed_total = 0
@@ -1871,15 +2045,18 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     
     # Calculate total work for progress bars
     total_word_batches = math.ceil(total_words / words_per_gpu_batch)
-    total_work_units = total_word_batches * total_rule_batches
+    total_work_units = total_word_batches
     current_work_unit = 0
     
     # Create single progress bar for all work
-    pbar = tqdm(total=total_work_units, desc="Overall Progress", unit=" unit",
-                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
+    pbar = tqdm(total=total_work_units, desc="Overall Progress", unit=" batch",
+                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]',
                 position=0)
     
-    # Main processing loop
+    # Statistics tracking
+    mab_stats_history = []
+    
+    # Main processing loop with MAB
     try:
         word_iter = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
         
@@ -1902,88 +2079,113 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                         np.uint32(num_words_batch),
                         np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
             
-            # Process all rule batches for this word batch
-            for rule_batch_idx in range(total_rule_batches):
-                if interrupted:
+            # MAB: Select rules for this batch
+            force_exploration = (word_batch_idx % 10 == 0)  # Force exploration every 10 batches
+            selected_indices = rule_bandit.select_best_rules(
+                batch_size=MAX_RULES_IN_BATCH,
+                force_exploration=force_exploration
+            )
+            
+            num_rules_in_batch = len(selected_indices)
+            
+            if num_rules_in_batch == 0:
+                print(f"{yellow('WARNING')}: No rules selected by MAB, using all rules")
+                selected_indices = np.arange(min(MAX_RULES_IN_BATCH, len(rules_list)))
+                num_rules_in_batch = len(selected_indices)
+            
+            # Prepare rules buffer
+            rules_buffer_np, rule_ids_np, actual_num_rules = prepare_rules_buffer(rules_list, selected_indices)
+            
+            # Upload rules to GPU
+            cl.enqueue_copy(queue, rules_g, rules_buffer_np).wait()
+            
+            # Clear counters
+            cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size).wait()
+            cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size).wait()
+            
+            # Execute ranking kernel
+            global_size = (num_words_batch * num_rules_in_batch,)
+            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            
+            kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
+                        base_words_g,
+                        rules_g,
+                        cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rule_ids_np),
+                        global_hash_map_g,
+                        cracked_hash_map_g,
+                        rule_uniqueness_counts_g,
+                        rule_effectiveness_counts_g,
+                        np.uint32(num_words_batch),
+                        np.uint32(num_rules_in_batch),
+                        np.uint32(MAX_WORD_LEN),
+                        np.uint32(MAX_OUTPUT_LEN)).wait()
+            
+            # Read back results
+            uniqueness_counts_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+            effectiveness_counts_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+            
+            cl.enqueue_copy(queue, uniqueness_counts_np, rule_uniqueness_counts_g).wait()
+            cl.enqueue_copy(queue, effectiveness_counts_np, rule_effectiveness_counts_g).wait()
+            
+            # MAB: Update bandit parameters
+            effectiveness_counts_selected = effectiveness_counts_np[:num_rules_in_batch]
+            rule_bandit.update(selected_indices, effectiveness_counts_selected, num_words_batch)
+            
+            # Update rule scores
+            batch_unique = 0
+            batch_cracked = 0
+            
+            for i, rule_idx in enumerate(selected_indices):
+                if i >= num_rules_in_batch:
                     break
                 
-                # Prepare rule batch
-                start_idx = rule_batch_starts[rule_batch_idx]
-                end_idx = min(start_idx + MAX_RULES_IN_BATCH, total_rules)
-                current_rules = rules_list[start_idx:end_idx]
-                num_rules_in_batch = len(current_rules)
+                rule = rules_list[rule_idx]
+                uniqueness_val = int(uniqueness_counts_np[i])
+                effectiveness_val = int(effectiveness_counts_np[i])
                 
-                # Prepare rules buffer
-                rules_buffer_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-                rule_ids_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+                rule['uniqueness_score'] += uniqueness_val
+                rule['effectiveness_score'] += effectiveness_val
                 
-                for i, rule in enumerate(current_rules):
-                    rules_buffer_np[i] = encode_rule_full(rule['rule_data'], rule['rule_id'])
-                    rule_ids_np[i] = rule['rule_id']
+                batch_unique += uniqueness_val
+                batch_cracked += effectiveness_val
+            
+            # Update global totals
+            total_unique_found += batch_unique
+            total_cracked_found += batch_cracked
+            
+            # Update progress
+            current_work_unit += 1
+            pbar.update(1)
+            
+            # Get MAB statistics
+            mab_stats = rule_bandit.get_statistics()
+            mab_stats_history.append(mab_stats)
+            
+            # Update progress postfix with current stats
+            active_rules = mab_stats['active_rules']
+            pruned_rules = mab_stats['pruned_rules']
+            postfix_str = f"Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,} | Active: {active_rules:,} | Pruned: {pruned_rules:,}"
+            pbar.set_postfix_str(postfix_str)
+            
+            # Print MAB statistics every 10 batches
+            if word_batch_idx % 10 == 0:
+                active_display = f"{active_rules:,}/{mab_stats['total_rules']:,}"
+                avg_trials = mab_stats['avg_trials_per_rule']
+                success_rate = mab_stats['avg_success_rate'] * 100
+                exploration = mab_stats['exploration_rate']
                 
-                # Upload rules to GPU
-                cl.enqueue_copy(queue, rules_g, rules_buffer_np).wait()
-                
-                # Clear counters
-                cl.enqueue_fill_buffer(queue, rule_uniqueness_counts_g, np.uint32(0), 0, counters_size).wait()
-                cl.enqueue_fill_buffer(queue, rule_effectiveness_counts_g, np.uint32(0), 0, counters_size).wait()
-                
-                # Execute ranking kernel
-                global_size = (num_words_batch * num_rules_in_batch,)
-                global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-                
-                kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
-                            base_words_g,
-                            rules_g,
-                            cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=rule_ids_np),
-                            global_hash_map_g,
-                            cracked_hash_map_g,
-                            rule_uniqueness_counts_g,
-                            rule_effectiveness_counts_g,
-                            np.uint32(num_words_batch),
-                            np.uint32(num_rules_in_batch),
-                            np.uint32(MAX_WORD_LEN),
-                            np.uint32(MAX_OUTPUT_LEN)).wait()
-                
-                # Read back results
-                uniqueness_counts_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-                effectiveness_counts_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-                
-                cl.enqueue_copy(queue, uniqueness_counts_np, rule_uniqueness_counts_g).wait()
-                cl.enqueue_copy(queue, effectiveness_counts_np, rule_effectiveness_counts_g).wait()
-                
-                # Update rule scores
-                batch_unique = 0
-                batch_cracked = 0
-                
-                for i, rule in enumerate(current_rules):
-                    uniqueness_val = int(uniqueness_counts_np[i])
-                    effectiveness_val = int(effectiveness_counts_np[i])
-                    
-                    rule['uniqueness_score'] += uniqueness_val
-                    rule['effectiveness_score'] += effectiveness_val
-                    
-                    batch_unique += uniqueness_val
-                    batch_cracked += effectiveness_val
-                
-                # Update global totals
-                total_unique_found += batch_unique
-                total_cracked_found += batch_cracked
-                
-                # Update progress
-                current_work_unit += 1
-                pbar.update(1)
-                
-                # Update progress description with current stats
-                pbar.set_description(
-                    f"Progress: Word {word_batch_idx+1}, "
-                    f"Rule {rule_batch_idx+1}/{total_rule_batches} | "
-                    f"Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}"
+                mab_stats_msg = (
+                    f"\n{green('MAB STATS')}: "
+                    f"Active rules: {cyan(active_display)} | "
+                    f"Avg trials: {cyan(f'{avg_trials:.1f}')} | "
+                    f"Success rate: {cyan(f'{success_rate:.3f}%')} | "
+                    f"Exploration: {cyan(f'{exploration:.3f}')}"
                 )
-                
-                # Update interrupt stats
-                update_progress_stats(words_processed_total + num_words_batch, 
-                                    total_unique_found, total_cracked_found)
+                print(mab_stats_msg)
+            
+            # Update interrupt stats
+            update_progress_stats(words_processed_total + num_words_batch, 
+                                total_unique_found, total_cracked_found)
             
             # Update word count
             words_processed_total += num_words_batch
@@ -1999,28 +2201,68 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"\n{yellow('INTERRUPTED')}: Processing stopped. Results saved.")
         return
     
-    # 6. FINAL RESULTS
+    # 7. FINAL RESULTS WITH MAB STATISTICS
     end_time = time()
     total_time = end_time - start_time
     
-    print(f"\n{green('=' * 60)}")
-    print(f"{bold('RANKING COMPLETE')}")
-    print(f"{green('=' * 60)}")
+    # Get final MAB statistics
+    final_mab_stats = rule_bandit.get_statistics()
+    top_mab_rules = rule_bandit.get_top_rules(20)
+    
+    print(f"\n{green('=' * 70)}")
+    print(f"{bold('MAB RANKING COMPLETE')}")
+    print(f"{green('=' * 70)}")
     print(f"{blue('PROCESSED')}: {cyan(f'{words_processed_total:,}')} words")
     print(f"{blue('PROCESSED')}: {cyan(f'{total_rules:,}')} Hashcat rules")
     print(f"{blue('UNIQUE')}: Generated {cyan(f'{total_unique_found:,}')} unique words")
     print(f"{blue('CRACKED')}: Found {cyan(f'{total_cracked_found:,}')} true cracks")
     print(f"{blue('TIME')}: {cyan(f'{total_time:.2f}')} seconds total")
     if total_time > 0:
-        print(f"{blue('SPEED')}: {cyan(f'{words_processed_total/total_time:.0f}')} words/sec")
-    print(f"{green('=' * 60)}")
+        speed = words_processed_total / total_time
+        print(f"{blue('SPEED')}: {cyan(f'{speed:.0f}')} words/sec")
+    
+    print(f"\n{green('MAB FINAL STATISTICS')}:")
+    active_rules = final_mab_stats['active_rules']
+    total_rules_count = final_mab_stats['total_rules']
+    pruned_rules = final_mab_stats['pruned_rules']
+    pruned_percentage = pruned_rules / total_rules_count * 100
+    avg_trials = final_mab_stats['avg_trials_per_rule']
+    success_rate = final_mab_stats['avg_success_rate'] * 100
+    efficiency = final_mab_stats['selection_efficiency'] * 100
+    
+    print(f"  {blue('ACTIVE RULES')}: {cyan(f'{active_rules:,}/{total_rules_count:,}')}")
+    print(f"  {blue('PRUNED RULES')}: {cyan(f'{pruned_rules:,}')} ({pruned_percentage:.1f}%)")
+    print(f"  {blue('AVG TRIALS PER RULE')}: {cyan(f'{avg_trials:.1f}')}")
+    print(f"  {blue('AVG SUCCESS RATE')}: {cyan(f'{success_rate:.3f}%')}")
+    print(f"  {blue('SELECTION EFFICIENCY')}: {cyan(f'{efficiency:.1f}%')}")
+    
+    print(f"\n{green('TOP 10 RULES BY MAB SUCCESS PROBABILITY')}:")
+    for i, rule in enumerate(top_mab_rules[:10], 1):
+        rule_data = rule['rule_data']
+        success_prob = rule['success_probability']
+        trials = rule['trials']
+        successes = rule['successes']
+        
+        print(f"  {blue(f'{i:2}.')} {cyan(rule_data):30} "
+              f"Success: {success_prob:.4f} "
+              f"Trials: {trials:,} "
+              f"Successes: {successes:,}")
+    
+    print(f"{green('=' * 70)}")
     
     # Save ranking data
     print(f"\n{blue('SAVING')}: Ranking results to {ranking_output_path}...")
     
-    # Calculate combined scores
+    # Calculate combined scores (incorporating MAB success probability)
     for rule in rules_list:
-        rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0)
+        rule_idx = rule['rule_id']
+        mab_success_prob = rule_bandit.alphas[rule_idx] / (rule_bandit.alphas[rule_idx] + rule_bandit.betas[rule_idx])
+        rule['mab_success_prob'] = mab_success_prob
+        rule['combined_score'] = (
+            rule.get('effectiveness_score', 0) * 10 + 
+            rule.get('uniqueness_score', 0) +
+            mab_success_prob * 1000  # Weight MAB success probability
+        )
     
     # Sort rules
     ranked_rules = sorted(rules_list, key=lambda x: x['combined_score'], reverse=True)
@@ -2029,14 +2271,15 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     try:
         with open(ranking_output_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data'])
+            writer.writerow(['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'MAB_Success_Prob', 'Rule_Data'])
             
             for rank, rule in enumerate(ranked_rules, 1):
                 writer.writerow([
                     rank,
-                    rule['combined_score'],
+                    f"{rule['combined_score']:.2f}",
                     rule.get('effectiveness_score', 0),
                     rule.get('uniqueness_score', 0),
+                    f"{rule.get('mab_success_prob', 0):.4f}",
                     rule['rule_data']
                 ])
         
@@ -2053,6 +2296,24 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     f.write(f"{rule['rule_data']}\n")
             
             print(f"{green('SAVED')}: Top {cyan(f'{min(top_k, len(ranked_rules)):,}')} rules saved")
+        
+        # Save MAB statistics
+        mab_stats_path = os.path.splitext(ranking_output_path)[0] + "_mab_stats.csv"
+        with open(mab_stats_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Batch', 'Active_Rules', 'Pruned_Rules', 'Avg_Trials', 'Avg_Success_Rate', 'Exploration_Rate'])
+            
+            for i, stats in enumerate(mab_stats_history):
+                writer.writerow([
+                    i,
+                    stats['active_rules'],
+                    stats['pruned_rules'],
+                    f"{stats['avg_trials_per_rule']:.2f}",
+                    f"{stats['avg_success_rate']:.6f}",
+                    f"{stats['exploration_rate']:.3f}"
+                ])
+        
+        print(f"{green('SAVED')}: MAB statistics to {cyan(mab_stats_path)}")
     
     except Exception as e:
         print(f"{red('ERROR')}: Failed to save results: {e}")
@@ -2062,7 +2323,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 # ====================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool with Complete Rules Support")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Armed Bandits")
     
     # Required arguments
     parser.add_argument('-w', '--wordlist', help='Path to the base wordlist file')
@@ -2076,7 +2337,13 @@ if __name__ == '__main__':
     parser.add_argument('--global-bits', type=int, help='Bits for global hash map (auto-calculated)')
     parser.add_argument('--cracked-bits', type=int, help='Bits for cracked hash map (auto-calculated)')
     
-    # Preset configuration flag (restored from v3.2)
+    # MAB configuration flags
+    parser.add_argument('--mab-exploration', type=float, default=DEFAULT_MAB_EXPLORATION_FACTOR,
+                       help=f'Multi-Armed Bandit exploration factor (default: {DEFAULT_MAB_EXPLORATION_FACTOR})')
+    parser.add_argument('--mab-min-trials', type=int, default=DEFAULT_MAB_MIN_TRIALS,
+                       help=f'MAB minimum trials before pruning (default: {DEFAULT_MAB_MIN_TRIALS})')
+    
+    # Preset configuration flag
     parser.add_argument('--preset', type=str, default=None,
                        help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
     
@@ -2100,7 +2367,7 @@ if __name__ == '__main__':
         sys.exit(1)
     
     print(f"{green('=' * 70)}")
-    print(f"{bold('HASHCAT RULE RANKER - COMPLETE IMPLEMENTATION')}")
+    print(f"{bold('HASHCAT RULE RANKER v4.0 - WITH MULTI-ARMED BANDITS')}")
     print(f"{green('=' * 70)}")
     print(f"{blue('IMPLEMENTED RULES')}:")
     print(f"  {green('✓')} Simple rules (l, u, c, C, t, r, k, :, d, f, p, z, Z, q, E)")
@@ -2124,5 +2391,8 @@ if __name__ == '__main__':
         global_hash_map_bits=args.global_bits,
         cracked_hash_map_bits=args.cracked_bits,
         preset=args.preset,
-        device_id=args.device
+        device_id=args.device,
+        mab_exploration_factor=args.mab_exploration,
+        mab_min_trials=args.mab_min_trials
     )
+
