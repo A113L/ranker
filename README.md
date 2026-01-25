@@ -1,4 +1,4 @@
-**RANKER v3.2**
+**RANKER v4.0**
 
 # GPU-Accelerated Hashcat Rule Ranker
 
