@@ -14,9 +14,7 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 - **📊 Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
 - **🎯 Smart Presets**: Auto-configures based on GPU memory and dataset size
 
-[![mermaid-20251213-642c5b.png](https://i.postimg.cc/qBssNdW3/mermaid-20251213-642c5b.png)](https://postimg.cc/w3Byrnqq)
-
-**Combine Score = Effectiveness*10+Uniqueness**
+[![mab.jpg](https://i.postimg.cc/TwWGZ2ZR/mab.jpg)](https://postimg.cc/BLsdF3Sy)
 
 ## 📋 Requirements and Usage
 
@@ -27,34 +25,52 @@ pip install pyopencl numpy tqdm
 bash
 python3 ranker.py --help
 usage: ranker.py [-h] [-w WORDLIST] [-r RULES] [-c CRACKED] [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
-                   [--cracked-bits CRACKED_BITS] [--preset PRESET] [--device DEVICE] [--list-devices]
+                     [--cracked-bits CRACKED_BITS] [--mab-exploration MAB_EXPLORATION] [--mab-min-trials MAB_MIN_TRIALS] [--preset PRESET]
+                     [--device DEVICE] [--list-devices]
 
-GPU-Accelerated Hashcat Rule Ranking Tool (Ranker v3.2 - Optimized Large File Loading)
+GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Armed Bandits
 
 optional arguments:
   -h, --help            show this help message and exit
   -w WORDLIST, --wordlist WORDLIST
-                        Path to the base wordlist file.
+                        Path to the base wordlist file
   -r RULES, --rules RULES
-                        Path to the Hashcat rules file to rank.
+                        Path to the Hashcat rules file to rank
   -c CRACKED, --cracked CRACKED
-                        Path to a list of cracked passwords for effectiveness scoring.
+                        Path to a list of cracked passwords for effectiveness scoring
   -o OUTPUT, --output OUTPUT
-                        Path to save the final ranking CSV.
-  -k TOPK, --topk TOPK  Number of top rules to save to an optimized .rule file. Set to 0 to skip.
+                        Path to save the ranking CSV
+  -k TOPK, --topk TOPK  Number of top rules to save (0 to skip)
   --batch-size BATCH_SIZE
-                        Number of words to process in each GPU batch (default: auto-calculate based on VRAM)
+                        Words per GPU batch (auto-calculated if not specified)
   --global-bits GLOBAL_BITS
-                        Bits for global hash map size (default: auto-calculate based on VRAM)
+                        Bits for global hash map (auto-calculated)
   --cracked-bits CRACKED_BITS
-                        Bits for cracked hash map size (default: auto-calculate based on VRAM)
+                        Bits for cracked hash map (auto-calculated)
+  --mab-exploration MAB_EXPLORATION
+                        Multi-Armed Bandit exploration factor (default: 1.0)
+  --mab-min-trials MAB_MIN_TRIALS
+                        MAB minimum trials before pruning (default: 100)
   --preset PRESET       Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)
-  --device DEVICE       Select OpenCL device by ID (use --list-devices to see available devices)
+  --device DEVICE       OpenCL device ID
   --list-devices        List all available OpenCL devices and exit
-```
-🎯 **How It Works**
 
-- Processing: GPU processes each rule against each word
+```
+The Combined Score is a weighted heuristic used to rank the strategic value of Hashcat rules.
+
+*Effectiveness:* The total number of passwords a rule successfully cracks.
+
+*Uniqueness:* The number of passwords cracked only by that specific rule.
+
+By applying a 10x multiplier to Effectiveness, the formula prioritizes "high-yield" rules that deliver bulk results. The addition of Uniqueness ensures that "specialist" rules, which uncover rare patterns others miss, still gain a competitive rank. This balance creates an optimized rule set that maximizes total cracks while retaining the ability to hit complex, non-standard passwords.
+
+**Key Mechanisms**
+
+*Statistical Selection:* Each rule is modeled using a Beta Distribution ($\alpha$ for hits, $\beta$ for misses). Before each GPU batch, the script draws a random sample for every rule. High-performing rules yield higher samples, naturally prioritizing them for the next processing cycle.
+
+*Hybrid Exploration:* To prevent "cold start" neglect, a UCB-inspired exploration bonus is applied to less-tested rules. This ensures every transformation is evaluated fairly. An Exploration Decay mechanism gradually reduces this bonus, shifting the strategy from discovery to pure exploitation of known "winners."
+
+*Probabilistic Pruning:* The script implements "survival of the fittest" through automated pruning. Rules consistently performing below a 0.01% effectiveness threshold face a 10% chance of removal per batch. This purges "junk" rules, maximizing VRAM and GPU throughput for high-yield candidates.
 
 Scoring:
 
