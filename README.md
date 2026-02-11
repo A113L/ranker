@@ -48,9 +48,9 @@ optional arguments:
   --cracked-bits CRACKED_BITS
                         Bits for cracked hash map (auto-calculated)
   --mab-exploration MAB_EXPLORATION
-                        Multi-Armed Bandit exploration factor (default: 1.0)
+                        Multi-Armed Bandit exploration factor (default: 2.0)
   --mab-min-trials MAB_MIN_TRIALS
-                        MAB minimum trials before pruning (default: 100)
+                        MAB minimum trials before pruning (default: 50)
   --preset PRESET       Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)
   --device DEVICE       OpenCL device ID
   --list-devices        List all available OpenCL devices and exit
