@@ -23,21 +23,25 @@ pip install pyopencl numpy tqdm
 
 📝 Usage
 bash
-python3 ranker.py --help
-usage: ranker.py [-h] [-w WORDLIST] [-r RULES] [-c CRACKED] [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
-                     [--cracked-bits CRACKED_BITS] [--mab-exploration MAB_EXPLORATION] [--mab-min-trials MAB_MIN_TRIALS] [--preset PRESET]
-                     [--device DEVICE] [--list-devices]
+python3 ranker.py -h
+usage: rmab.py [-h] [-w WORDLIST] [-r RULES] [-c CRACKED] [-o OUTPUT]
+               [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
+               [--cracked-bits CRACKED_BITS]
+               [--mab-exploration MAB_EXPLORATION]
+               [--mab-min-trials MAB_MIN_TRIALS] [--preset PRESET]
+               [--device DEVICE] [--list-devices] [--max-passes MAX_PASSES]
 
-GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Armed Bandits
+GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Pass Multi-Armed Bandits
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   -w WORDLIST, --wordlist WORDLIST
                         Path to the base wordlist file
   -r RULES, --rules RULES
                         Path to the Hashcat rules file to rank
   -c CRACKED, --cracked CRACKED
-                        Path to a list of cracked passwords for effectiveness scoring
+                        Path to a list of cracked passwords for effectiveness
+                        scoring
   -o OUTPUT, --output OUTPUT
                         Path to save the ranking CSV
   -k TOPK, --topk TOPK  Number of top rules to save (0 to skip)
@@ -50,10 +54,17 @@ optional arguments:
   --mab-exploration MAB_EXPLORATION
                         Multi-Armed Bandit exploration factor (default: 2.0)
   --mab-min-trials MAB_MIN_TRIALS
-                        MAB minimum trials before pruning (default: 50)
-  --preset PRESET       Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)
+                        MAB minimum number of TIMES each rule must be selected
+                        (default: 50)
+  --preset PRESET       Use preset configuration: "low_memory",
+                        "medium_memory", "high_memory", "recommend" (auto-
+                        selects best)
   --device DEVICE       OpenCL device ID
   --list-devices        List all available OpenCL devices and exit
+  --max-passes MAX_PASSES
+                        Maximum number of passes through wordlist (0 =
+                        unlimited until all rules tested)
+
 
 ```
 The Combined Score is a weighted heuristic used to rank the strategic value of Hashcat rules.
@@ -95,7 +106,3 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - PyOpenCL developers for GPU bindings
 - Cybersecurity researchers worldwide
 - 0xVavaldi for inspiration - https://github.com/0xVavaldi
-
-**Website**
-
-https://hcrt.pages.dev/ranker.static_workflow
