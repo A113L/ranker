@@ -76,7 +76,7 @@ A GPU-accelerated Multi-Armed Bandit (MAB) system that intelligently ranks Hashc
 
 - OpenCL kernel executes 150,000 words/sec per rule batch (tested on RTX 3060Ti GB)
 - FNV-1a hash tables for global uniqueness & cracked hash detection
-- Memory-mapped I/O for multi-GB wordlists
+- Memory-mapped I/O for multi-MB wordlists
 - Real-time progress tracking with interrupt
 - Comprehensive CSV output with ranking, success probabilities, and elimination reasons
 
