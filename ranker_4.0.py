@@ -14,7 +14,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # ====================================================================
-# --- RANKER v4.0: MULTI-PASS MAB                                  ---
+# --- RANKER v4.0: MULTI-PASS MAB WITH EARLY RULES ELIMINATION ---
 # ====================================================================
 
 # --- COLOR CODES FOR TERMINAL OUTPUT ---
@@ -38,37 +38,52 @@ def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
 def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 
 # ====================================================================
-# --- FIXED MULTI-ARMED BANDIT (MAB) MODULE WITH PROPER UPDATES ---
+# --- MULTI-PASS MAB WITH EARLY ELIMINATION MODULE ---
 # ====================================================================
 
-class RuleBandit:
-    """Fixed Multi-Armed Bandit with Thompson Sampling for rule selection"""
+class MultiPassMAB:
+    """Multi-Armed Bandit with early elimination for large rule sets"""
     
-    def __init__(self, rules_list, exploration_factor=2.0, min_trials=50):
+    def __init__(self, rules_list, exploration_factor=2.0, final_trials=50, 
+                 screening_trials=5, zero_success_elimination=True,
+                 batch_size_words=150000):
         """
-        Initialize the bandit with all rules.
+        Initialize the Multi-Pass MAB with early elimination.
         
         Args:
             rules_list: List of all rules with their metadata
-            exploration_factor: Controls exploration vs exploitation (higher = more exploration)
-            min_trials: Minimum number of trials before considering a rule for pruning
+            exploration_factor: Controls exploration vs exploitation
+            final_trials: Target number of trials for final ranking
+            screening_trials: Eliminate low-performing rules after this many trials
+            zero_success_elimination: Eliminate rules with zero successes immediately
+            batch_size_words: Size of word batch for calculating evidence
         """
         self.all_rules = rules_list
         self.num_rules = len(rules_list)
         
-        # Thompson Sampling parameters: Beta(alpha, beta) distribution
+        # Thompson Sampling parameters
         self.successes = np.ones(self.num_rules, dtype=np.float32)
         self.failures = np.ones(self.num_rules, dtype=np.float32)
         
         # Performance tracking
-        self.trials = np.zeros(self.num_rules, dtype=np.uint32)  # Number of TIMES selected, not words processed
-        self.words_processed = np.zeros(self.num_rules, dtype=np.uint64)  # Total words processed with this rule
-        self.performance_history = np.zeros((self.num_rules, 20), dtype=np.float32)
-        self.performance_index = np.zeros(self.num_rules, dtype=np.uint32)
+        self.trials = np.zeros(self.num_rules, dtype=np.uint32)  # Number of TIMES selected
+        self.words_processed = np.zeros(self.num_rules, dtype=np.uint64)
+        self.zero_success_count = np.zeros(self.num_rules, dtype=np.uint32)
         
         # Configuration
         self.exploration_factor = exploration_factor
-        self.min_trials = min_trials
+        self.final_trials = final_trials
+        self.screening_trials = screening_trials
+        self.zero_success_elimination = zero_success_elimination
+        self.batch_size_words = batch_size_words
+        
+        # Elimination thresholds by phase
+        self.elimination_thresholds = {
+            'phase1': {'min_trials': 5, 'min_success_rate': 0.0000001, 'eliminate_zero': True},   # Phase 1: eliminate zero-success
+            'phase2': {'min_trials': 20, 'min_success_rate': 0.000001, 'eliminate_zero': True},   # Phase 2: < 0.0001%
+            'phase3': {'min_trials': 50, 'min_success_rate': 0.00001, 'eliminate_zero': True},    # Phase 3: < 0.001%
+            'phase4': {'min_trials': 100, 'min_success_rate': 0.0001, 'eliminate_zero': True},    # Phase 4: < 0.01%
+        }
         
         # Selection tracking
         self.selection_count = np.zeros(self.num_rules, dtype=np.uint32)
@@ -78,212 +93,306 @@ class RuleBandit:
         # Statistics
         self.total_selections = 0
         self.total_updates = 0
-        self.pruned_rules = set()
+        self.eliminated_rules = set()
         self.active_rules = set(range(self.num_rules))
         self.last_selected_batch = []
         
-        # Track which rules have been tested at least once
+        # Track elimination statistics
+        self.elimination_stats = {
+            'zero_success': 0,
+            'low_success_rate': 0,
+            'worse_than_threshold': 0,
+            'total_eliminated': 0,
+            'elimination_events': []
+        }
+        
+        # Track which rules have been tested
         self.tested_rules = set()
         self.tested_rules_count = 0
         
-        # Track pruning statistics
-        self.pruning_threshold = 0
-        self.last_pruning_check = 0
+        # Track batch zero-success streaks
+        self.batch_zero_streaks = np.zeros(self.num_rules, dtype=np.uint32)
         
-        print(f"{green('MAB INIT')}: Thompson Sampling Bandit with {cyan(f'{self.num_rules:,}')} rules")
-        print(f"{blue('MAB CONFIG')}: Exploration factor: {cyan(f'{exploration_factor}')}, Min trials: {cyan(f'{min_trials}')}")
+        print(f"{green('MAB INIT')}: Multi-Pass MAB with Early Elimination - {cyan(f'{self.num_rules:,}')} rules")
+        print(f"{blue('MAB CONFIG')}:")
+        print(f"  {blue('Screening trials')}: {cyan(f'{screening_trials}')} batches")
+        print(f"  {blue('Final trials')}: {cyan(f'{final_trials}')} batches")
+        print(f"  {blue('Zero success elimination')}: {cyan('Yes' if zero_success_elimination else 'No')}")
+        print(f"  {blue('Batch size')}: {cyan(f'{batch_size_words:,}')} words")
+        print(f"  {blue('Evidence before elimination')}: {cyan(f'{screening_trials * batch_size_words:,}')} words")
+        print(f"{blue('ELIMINATION PHASES')}:")
+        for phase, config in self.elimination_thresholds.items():
+            max_trials_val = config['min_trials']
+            min_rate_val = config['min_success_rate']
+            print(f"  {blue(f'{phase}:')} After {cyan(max_trials_val)} trials: "
+                  f"min rate {cyan(f'{min_rate_val:.2e}')}")
     
     def select_rules(self, batch_size, iteration=0):
         """
-        Select rules using Thompson Sampling with proper exploration.
-        Ensures all rules get tested multiple times.
+        Select rules with strong bias toward untested and low-trial rules.
         """
         self.current_iteration = iteration
         
-        # CRITICAL: First, identify all rules that still need more trials
+        # First, identify all rules that need more screening trials
         rules_needing_trials = []
         for idx in self.active_rules:
-            if self.trials[idx] < self.min_trials:
+            if self.trials[idx] < self.screening_trials:
                 rules_needing_trials.append(idx)
         
         # Sort by trials (ascending) to prioritize least-tested rules
-        rules_needing_trials.sort(key=lambda x: self.trials[x])
+        rules_needing_trials.sort(key=lambda x: (self.trials[x], -self.selection_count[x]))
         
-        # Always select rules that need more trials first - this is crucial
         selected = []
         
-        # Take as many rules needing trials as possible, up to batch_size
+        # ALWAYS select rules that haven't reached screening_trials first
         if rules_needing_trials:
             num_to_take = min(batch_size, len(rules_needing_trials))
             selected = rules_needing_trials[:num_to_take]
+            if num_to_take > 0:
+                avg_trials_val = np.mean([self.trials[i] for i in selected[:num_to_take]])
+                self.elimination_stats['elimination_events'].append({
+                    'iteration': iteration,
+                    'type': 'screening',
+                    'count': num_to_take,
+                    'avg_trials': float(avg_trials_val)
+                })
         
-        # If we still have slots, fill with Thompson Sampling
         remaining_slots = batch_size - len(selected)
         
+        # If we still have slots, prioritize:
+        # 1. Rules that haven't reached final_trials
+        # 2. Rules with highest potential (Thompson Sampling)
         if remaining_slots > 0 and len(self.active_rules) > 0:
-            # Get active rules not already selected
             available = list(self.active_rules - set(selected))
             
             if available:
-                # Prioritize rules that are closer to reaching min_trials
-                available.sort(key=lambda x: (
-                    self.trials[x] < self.min_trials,  # Rules needing trials first
-                    self.trials[x],  # Then by fewest trials
-                    -self.selection_count[x]  # Then by least selected
-                ))
+                # Score each available rule
+                rule_scores = []
+                for idx in available:
+                    # Base score: how far from final_trials
+                    trials_needed = max(0, self.final_trials - self.trials[idx])
+                    trials_score = trials_needed / self.final_trials
+                    
+                    # Thompson Sampling score for exploitation
+                    alpha = self.successes[idx]
+                    beta = self.failures[idx]
+                    thompson_score = np.random.beta(alpha, beta)
+                    
+                    # Zero success penalty
+                    zero_penalty = 0.0
+                    if self.trials[idx] >= self.screening_trials and self.successes[idx] <= 1:
+                        zero_penalty = -0.5
+                    
+                    # Combined score
+                    combined_score = (
+                        trials_score * 10.0 +  # Strong priority for untested rules
+                        thompson_score * self.exploration_factor +
+                        zero_penalty
+                    )
+                    
+                    rule_scores.append((idx, combined_score))
                 
-                # Take some from available
-                additional = min(remaining_slots, len(available))
-                selected.extend(available[:additional])
+                # Select top scoring rules
+                rule_scores.sort(key=lambda x: x[1], reverse=True)
+                additional = min(remaining_slots, len(rule_scores))
+                selected.extend([idx for idx, _ in rule_scores[:additional]])
         
         # Update statistics
         self.total_selections += 1
-        for idx in selected:
-            self.trials[idx] += 1  # Increment trial count (number of times selected)
+        for idx in selected[:batch_size]:
+            self.trials[idx] += 1
             self.selection_count[idx] += 1
             self.last_selected_iteration[idx] = self.current_iteration
             
-            # Mark as tested
             if idx not in self.tested_rules:
                 self.tested_rules.add(idx)
                 self.tested_rules_count = len(self.tested_rules)
         
-        self.last_selected_batch = selected
-        return selected
+        self.last_selected_batch = selected[:batch_size]
+        return selected[:batch_size]
     
     def update(self, selected_indices, successes_array, words_tested):
         """
-        Update bandit parameters based on rule performance.
+        Update bandit parameters and eliminate low-performing rules.
         """
         self.total_updates += 1
         
+        # First, update parameters for selected rules
         for idx, success_count in zip(selected_indices, successes_array):
-            if idx >= len(self.successes):
+            if idx >= len(self.successes) or idx not in self.active_rules:
                 continue
             
-            # Ensure success_count is not negative
             success_count = max(0, success_count)
-            
-            # Calculate failures (words where rule didn't find a crack)
             failure_count = max(0, words_tested - success_count)
             
-            # Track total words processed with this rule
+            # Track zero-success streaks
+            if success_count == 0:
+                self.batch_zero_streaks[idx] += 1
+            else:
+                self.batch_zero_streaks[idx] = 0
+            
+            # Track total words processed
             self.words_processed[idx] += words_tested
             
-            # Scale down counts for very large numbers to prevent numerical overflow
-            # This only affects the Beta distribution, not the actual counts
+            # Scale down for very large numbers
             scaled_success = success_count
             scaled_failure = failure_count
-            
             if words_tested > 1000000:
                 scale = 1000000.0 / words_tested
                 scaled_success = int(success_count * scale)
                 scaled_failure = int(failure_count * scale)
             
-            # Update Beta distribution parameters
+            # Update Beta distribution
             self.successes[idx] += scaled_success
             self.failures[idx] += scaled_failure
             
-            # Update performance history (success rate per batch)
-            if words_tested > 0:
-                success_rate = success_count / words_tested
-                hist_idx = int(self.performance_index[idx])
-                self.performance_history[idx, hist_idx] = success_rate
-                self.performance_index[idx] = (hist_idx + 1) % 20
+            # Track zero success count for elimination
+            if self.successes[idx] <= 1.0:  # Still effectively zero successes
+                self.zero_success_count[idx] += 1
         
-        # Periodically check for pruning (every 50 iterations)
-        if self.total_updates % 50 == 0 and self.total_updates > self.last_pruning_check:
-            self._prune_worst_rules()
-            self.last_pruning_check = self.total_updates
+        # EARLY ELIMINATION - Check after every update
+        self._eliminate_low_performers()
         
         # Decay exploration factor slowly
         self.exploration_factor *= 0.9999
     
-    def _prune_worst_rules(self):
+    def _eliminate_low_performers(self):
         """
-        Prune rules that are 1000x worse than the average of the top 100 rules.
-        Only considers rules that have been selected at least min_trials times.
+        Eliminate low-performing rules using multiple strategies.
+        Called frequently to remove bad rules early.
         """
-        if len(self.active_rules) < 200:  # Need enough rules to make pruning meaningful
+        if len(self.active_rules) < 100:
             return
         
         active_indices = np.array(list(self.active_rules))
+        to_eliminate = set()
         
-        # Only consider rules with sufficient trials
-        sufficient_trials_mask = self.trials[active_indices] >= self.min_trials
+        # -----------------------------------------------------------------
+        # STRATEGY 1: Eliminate rules with zero successes after screening_trials
+        # -----------------------------------------------------------------
+        if self.zero_success_elimination:
+            for idx in active_indices:
+                if self.trials[idx] >= self.screening_trials:
+                    total_successes = self.successes[idx] - 1  # Subtract initial 1
+                    if total_successes <= 0:
+                        to_eliminate.add(idx)
+                        self.elimination_stats['zero_success'] += 1
         
-        if not np.any(sufficient_trials_mask):
-            return
+        # -----------------------------------------------------------------
+        # STRATEGY 2: Phase-based elimination using success rate thresholds
+        # -----------------------------------------------------------------
+        for idx in active_indices:
+            if idx in to_eliminate:
+                continue
+                
+            trials_completed = self.trials[idx]
+            total_successes = self.successes[idx] - 1
+            total_failures = self.failures[idx] - 1
+            total_tested = total_successes + total_failures
+            
+            if total_tested > 0:
+                success_rate = total_successes / total_tested
+                
+                # Apply appropriate phase threshold
+                for phase, config in self.elimination_thresholds.items():
+                    if trials_completed >= config['min_trials']:
+                        if success_rate < config['min_success_rate']:
+                            to_eliminate.add(idx)
+                            self.elimination_stats['low_success_rate'] += 1
+                            break
         
-        # Calculate success rates for rules with sufficient trials
-        valid_indices = active_indices[sufficient_trials_mask]
+        # -----------------------------------------------------------------
+        # STRATEGY 3: Eliminate rules significantly worse than top performers
+        # -----------------------------------------------------------------
+        if len(self.active_rules) > 500 and self.total_updates % 25 == 0:
+            # Get success rates for rules with sufficient trials
+            valid_rules = []
+            for idx in self.active_rules:
+                if idx not in to_eliminate and self.trials[idx] >= self.screening_trials:
+                    total_successes = self.successes[idx] - 1
+                    total_failures = self.failures[idx] - 1
+                    total_tested = total_successes + total_failures
+                    if total_tested > 0:
+                        success_rate = total_successes / total_tested
+                        valid_rules.append((idx, success_rate))
+            
+            if len(valid_rules) >= 100:
+                # Sort by success rate
+                valid_rules.sort(key=lambda x: x[1], reverse=True)
+                
+                # Calculate top 100 average
+                top_100_avg = np.mean([rate for _, rate in valid_rules[:100]])
+                
+                # Eliminate rules that are 1000x worse than top 100 average
+                threshold = top_100_avg / 1000
+                
+                for idx, rate in valid_rules:
+                    if rate < threshold and idx not in to_eliminate:
+                        to_eliminate.add(idx)
+                        self.elimination_stats['worse_than_threshold'] += 1
         
-        success_rates = []
-        success_rates_dict = {}
-        for idx in valid_indices:
-            total_s = self.successes[idx] - 1
-            total_f = self.failures[idx] - 1
-            total_t = total_s + total_f
-            if total_t > 0:
-                rate = total_s / total_t
-                success_rates.append((idx, rate))
-                success_rates_dict[idx] = rate
+        # -----------------------------------------------------------------
+        # STRATEGY 4: Eliminate rules with multiple consecutive zero-success batches
+        # -----------------------------------------------------------------
+        if self.zero_success_elimination:
+            for idx in active_indices:
+                if idx not in to_eliminate and self.trials[idx] >= self.screening_trials:
+                    if self.batch_zero_streaks[idx] >= 3:  # 3 consecutive zero-success batches
+                        to_eliminate.add(idx)
+                        self.elimination_stats['zero_success'] += 1
         
-        if len(success_rates) < 100:
-            return
-        
-        # Sort by success rate (descending)
-        success_rates.sort(key=lambda x: x[1], reverse=True)
-        
-        # Calculate average of top 100
-        top_100_avg = np.mean([rate for _, rate in success_rates[:100]])
-        
-        # Set pruning threshold to 1000x worse than top 100 average
-        self.pruning_threshold = top_100_avg / 1000
-        
-        # Find rules to prune
-        to_prune = []
-        for idx, rate in success_rates:
-            if rate < self.pruning_threshold and idx in self.active_rules:
-                to_prune.append(idx)
-        
-        # Prune the worst rules (limit per check to avoid massive changes)
-        max_prune_per_check = min(100, len(to_prune) // 10)
-        if max_prune_per_check > 0:
-            # Take the worst ones first
-            to_prune.sort(key=lambda x: success_rates_dict.get(x, 0))
-            for idx in to_prune[:max_prune_per_check]:
+        # Execute elimination
+        if to_eliminate:
+            # Limit elimination per check to avoid massive changes
+            max_eliminate = min(5000, len(to_eliminate))
+            eliminate_list = list(to_eliminate)[:max_eliminate]
+            
+            for idx in eliminate_list:
                 if idx in self.active_rules:
-                    self.pruned_rules.add(idx)
+                    self.eliminated_rules.add(idx)
                     self.active_rules.remove(idx)
                     if idx in self.tested_rules:
                         self.tested_rules.remove(idx)
                         self.tested_rules_count = len(self.tested_rules)
             
-            if max_prune_per_check > 0:
-                print(f"{yellow('PRUNE')}: Removed {cyan(max_prune_per_check)} rules "
-                      f"(threshold: {self.pruning_threshold:.8f}, top 100 avg: {top_100_avg:.8f})")
+            self.elimination_stats['total_eliminated'] += len(eliminate_list)
+            
+            # Log elimination event for large batches
+            if len(eliminate_list) >= 1000:
+                active_count = len(self.active_rules)
+                zero_success_val = self.elimination_stats['zero_success']
+                low_rate_val = self.elimination_stats['low_success_rate']
+                threshold_val = self.elimination_stats['worse_than_threshold']
+                
+                print(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{len(eliminate_list):,}')} low-performing rules")
+                print(f"  {blue('Active remaining')}: {cyan(f'{active_count:,}')}")
+                print(f"  {blue('Zero success')}: {cyan(zero_success_val)}")
+                print(f"  {blue('Low success rate')}: {cyan(low_rate_val)}")
+                print(f"  {blue('Below threshold')}: {cyan(threshold_val)}")
     
     def get_statistics(self):
-        """Get current bandit statistics"""
+        """Get current MAB statistics"""
         active_count = len(self.active_rules)
         tested_count = len(self.tested_rules)
         
         if active_count > 0:
             active_indices = np.array(list(self.active_rules))
-            avg_trials = np.mean(self.trials[active_indices])  # Average number of TIMES selected
-            avg_selections = np.mean(self.selection_count[active_indices])
-            avg_words_processed = np.mean(self.words_processed[active_indices]) if active_count > 0 else 0
-            min_trials_active = np.min(self.trials[active_indices]) if len(active_indices) > 0 else 0
-            max_trials_active = np.max(self.trials[active_indices]) if len(active_indices) > 0 else 0
+            avg_trials = np.mean(self.trials[active_indices])
+            avg_words_processed = np.mean(self.words_processed[active_indices])
             
-            # FIXED: Count rules that still need more trials (trials < min_trials)
-            rules_needing_trials = 0
+            # Count rules needing screening trials
+            rules_needing_screening = 0
             for idx in active_indices:
-                if self.trials[idx] < self.min_trials:
-                    rules_needing_trials += 1
+                if self.trials[idx] < self.screening_trials:
+                    rules_needing_screening += 1
             
-            # Calculate success rates for active rules
+            # Count rules needing final trials
+            rules_needing_final = 0
+            for idx in active_indices:
+                if self.trials[idx] < self.final_trials:
+                    rules_needing_final += 1
+            
+            # Calculate success rates
             total_successes = self.successes[active_indices] - 1
             total_failures = self.failures[active_indices] - 1
             total_trials_words = total_successes + total_failures
@@ -296,30 +405,32 @@ class RuleBandit:
                 avg_success_rate = 0
         else:
             avg_trials = 0
-            avg_selections = 0
             avg_words_processed = 0
             avg_success_rate = 0
-            min_trials_active = 0
-            max_trials_active = 0
-            rules_needing_trials = 0
+            rules_needing_screening = 0
+            rules_needing_final = 0
+        
+        # Calculate elimination effectiveness
+        if self.num_rules > 0:
+            eliminated_percentage = (len(self.eliminated_rules) / self.num_rules) * 100
+        else:
+            eliminated_percentage = 0
         
         return {
             'total_rules': self.num_rules,
             'active_rules': active_count,
             'tested_rules': tested_count,
-            'pruned_rules': len(self.pruned_rules),
-            'rules_needing_trials': rules_needing_trials,  # This will now decrease over time
-            'avg_trials_per_rule': float(avg_trials),  # This is now number of selections, not words
+            'eliminated_rules': len(self.eliminated_rules),
+            'eliminated_percentage': eliminated_percentage,
+            'rules_needing_screening': rules_needing_screening,
+            'rules_needing_final': rules_needing_final,
+            'avg_trials_per_rule': float(avg_trials),
             'avg_words_processed_per_rule': float(avg_words_processed),
-            'avg_selections_per_rule': float(avg_selections),
             'avg_success_rate': float(avg_success_rate),
-            'min_trials_active': int(min_trials_active),
-            'max_trials_active': int(max_trials_active),
             'exploration_factor': float(self.exploration_factor),
             'total_selections': int(self.total_selections),
             'total_updates': int(self.total_updates),
-            'current_iteration': int(self.current_iteration),
-            'pruning_threshold': float(self.pruning_threshold)
+            'elimination_stats': self.elimination_stats.copy()
         }
     
     def get_top_rules(self, n=100):
@@ -334,12 +445,13 @@ class RuleBandit:
         total_failures = self.failures[active_indices] - 1
         total_trials_words = total_successes + total_failures
         
-        # Only consider rules with sufficient trials (min_trials selections)
-        sufficient_trials_mask = self.trials[active_indices] >= self.min_trials
+        # Only consider rules with sufficient trials
+        sufficient_trials_mask = self.trials[active_indices] >= self.screening_trials
         
         success_probs = np.zeros(len(active_indices))
         if np.any(sufficient_trials_mask):
-            success_probs[sufficient_trials_mask] = total_successes[sufficient_trials_mask] / total_trials_words[sufficient_trials_mask]
+            mask = sufficient_trials_mask & (total_trials_words > 0)
+            success_probs[mask] = total_successes[mask] / total_trials_words[mask]
         else:
             return []
         
@@ -368,8 +480,8 @@ class RuleBandit:
                 'rule_id': idx,
                 'rule_data': self.all_rules[idx]['rule_data'],
                 'success_probability': float(success_prob),
-                'trials': int(self.trials[idx]),  # Number of times selected
-                'words_processed': int(self.words_processed[idx]),  # Total words processed
+                'trials': int(self.trials[idx]),
+                'words_processed': int(self.words_processed[idx]),
                 'selections': int(self.selection_count[idx]),
                 'successes': int(total_s),
                 'failures': int(total_f),
@@ -388,13 +500,15 @@ MAX_RULES_IN_BATCH = 1024
 LOCAL_WORK_SIZE = 256
 
 # Default values
-DEFAULT_WORDS_PER_GPU_BATCH = 100000
+DEFAULT_WORDS_PER_GPU_BATCH = 150000
 DEFAULT_GLOBAL_HASH_MAP_BITS = 35
 DEFAULT_CRACKED_HASH_MAP_BITS = 33
 
-# MAB Configuration
+# MAB Configuration with early elimination defaults
 DEFAULT_MAB_EXPLORATION_FACTOR = 2.0
-DEFAULT_MAB_MIN_TRIALS = 50  # Increased default for better statistical significance
+DEFAULT_MAB_FINAL_TRIALS = 50
+DEFAULT_MAB_SCREENING_TRIALS = 5
+DEFAULT_MAB_ZERO_SUCCESS_ELIMINATION = True
 
 # Memory settings
 VRAM_SAFETY_MARGIN = 0.15
@@ -505,7 +619,7 @@ def select_opencl_device(device_id=None):
 # ====================================================================
 
 def estimate_word_count(path):
-    """Fast word count estimation for large files without reading entire content"""
+    """Fast word count estimation for large files"""
     print(f"{blue('ESTIMATING')}: Words in {path}...")
     
     try:
@@ -545,7 +659,7 @@ def fast_fnv1a_hash_32(data):
 
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     """
-    Massively optimized wordlist loader using memory mapping and bulk processing
+    Massively optimized wordlist loader using memory mapping
     """
     print(f"{green('OPTIMIZED')}: Using memory-mapped loader...")
     
@@ -1254,7 +1368,7 @@ def calculate_optimal_parameters_large_rules(available_vram, total_words, cracke
     )
     
     if total_rules > 100000:
-        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 50000)
+        suggested_batch_size = min(DEFAULT_WORDS_PER_GPU_BATCH, 150000)
     else:
         suggested_batch_size = DEFAULT_WORDS_PER_GPU_BATCH
     
@@ -1498,16 +1612,18 @@ def update_progress_stats(words_processed, unique_found, cracked_found):
     total_cracked_found = cracked_found
 
 # ====================================================================
-# --- MAIN RANKER FUNCTION WITH MULTI-PASS MAB ---
+# --- MAIN RANKER FUNCTION WITH MULTI-PASS MAB & EARLY ELIMINATION ---
 # ====================================================================
 
 def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k, 
                                words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
-                               preset=None, device_id=None, mab_exploration_factor=None, mab_min_trials=None):
+                               preset=None, device_id=None, mab_exploration_factor=None, mab_final_trials=None,
+                               mab_screening_trials=None, mab_zero_success_elimination=None):
     start_time = time()
     
     # 0. PRELIMINARY DATA LOADING
-    print(f"{blue('INITIALIZING')}: RANKER v4.3 with Multi-Pass Multi-Armed Bandits...")
+    print(f"{blue('INITIALIZING')}: RANKER v5.2 - MULTI-PASS MAB WITH EARLY ELIMINATION...")
+    print(f"{bold('🎓 OPTIMIZED FOR 100K - 2M+ RULES')}")
     
     # Estimate word count
     total_words = estimate_word_count(wordlist_path)
@@ -1529,7 +1645,9 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     'effectiveness_score': 0,
                     'times_tested': 0,
                     'total_successes': 0,
-                    'total_trials': 0
+                    'total_trials': 0,
+                    'eliminated': False,
+                    'eliminate_reason': ''
                 })
                 rule_id_counter += 1
     except FileNotFoundError:
@@ -1561,15 +1679,24 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     cracked_hashes_count = len(cracked_hashes_np)
     print(f"{green('LOADED')}: {cyan(f'{cracked_hashes_count:,}')} unique cracked password hashes")
     
-    # 1. INITIALIZE MULTI-ARMED BANDIT
+    # 1. INITIALIZE MULTI-PASS MAB WITH EARLY ELIMINATION
     exploration_factor = mab_exploration_factor if mab_exploration_factor else DEFAULT_MAB_EXPLORATION_FACTOR
-    min_trials = mab_min_trials if mab_min_trials else DEFAULT_MAB_MIN_TRIALS
+    final_trials = mab_final_trials if mab_final_trials else DEFAULT_MAB_FINAL_TRIALS
+    screening_trials = mab_screening_trials if mab_screening_trials else DEFAULT_MAB_SCREENING_TRIALS
+    zero_success_elimination = mab_zero_success_elimination if mab_zero_success_elimination is not None else DEFAULT_MAB_ZERO_SUCCESS_ELIMINATION
     
-    print(f"{green('MAB')}: Initializing Thompson Sampling Bandit...")
-    rule_bandit = RuleBandit(
+    print(f"\n{green('MAB')}: Initializing Multi-Pass MAB with Early Elimination...")
+    print(f"{blue('SCREENING PHASE')}: Eliminate low-performing rules after {cyan(f'{screening_trials}')} trials")
+    batch_size_for_print = words_per_gpu_batch if words_per_gpu_batch else DEFAULT_WORDS_PER_GPU_BATCH
+    print(f"{blue('EVIDENCE')}: Each rule sees {cyan(f'{screening_trials * batch_size_for_print:,}')} words before elimination decision")
+    
+    rule_bandit = MultiPassMAB(
         rules_list, 
         exploration_factor=exploration_factor,
-        min_trials=min_trials
+        final_trials=final_trials,
+        screening_trials=screening_trials,
+        zero_success_elimination=zero_success_elimination,
+        batch_size_words=words_per_gpu_batch or DEFAULT_WORDS_PER_GPU_BATCH
     )
     
     # 2. OPENCL INITIALIZATION
@@ -1664,7 +1791,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         print(f"{red('ERROR')}: OpenCL initialization failed: {e}")
         return
     
-    # 3. LOAD ALL WORD BATCHES INTO MEMORY FOR MULTIPLE PASSES
+    # 3. LOAD ALL WORD BATCHES INTO MEMORY
     print(f"{blue('LOADING')}: Loading wordlist into memory for multiple passes...")
     all_word_batches = []
     all_hash_batches = []
@@ -1715,8 +1842,11 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     np.uint32(CRACKED_HASH_MAP_MASK)).wait()
         print(f"{green('INITIALIZED')}: Cracked hash map")
     
-    # 6. MULTI-PASS MAB PROCESSING LOOP
-    print(f"{blue('STARTING')}: Multi-pass rule ranking with MAB optimization...")
+    # 6. MULTI-PASS MAB PROCESSING LOOP WITH EARLY ELIMINATION - FIXED VERSION
+    print(f"\n{bold('🚀 STARTING MULTI-PASS MAB PROCESSING')}")
+    print(f"{blue('PHASE 1')}: Screening - Eliminate low-performing rules after {cyan(screening_trials)} batches")
+    print(f"{blue('PHASE 2')}: Deep Testing - Test survivors to {cyan(final_trials)} batches")
+    print(f"{blue('EXPECTED')}: 80-90% of rules will be eliminated in Phase 1\n")
     
     # Reset counters
     words_processed_total = 0
@@ -1727,47 +1857,119 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     mab_stats_history = []
     batch_statistics = []
     
-    # Calculate total iterations needed - CRITICAL FIX
-    # We need to select each rule at least min_trials times
-    total_rule_selections_needed = total_rules * min_trials
+    # Calculate total iterations needed for screening phase
+    total_rule_selections_needed = total_rules * screening_trials
     selections_per_batch = MAX_RULES_IN_BATCH
-    estimated_iterations = int(math.ceil(total_rule_selections_needed / selections_per_batch))
-    estimated_word_passes = int(math.ceil(estimated_iterations / total_word_batches))
+    estimated_screening_iterations = int(math.ceil(total_rule_selections_needed / selections_per_batch))
+    estimated_word_passes = int(math.ceil(estimated_screening_iterations / total_word_batches))
     
-    print(f"{blue('MAB LOOP')}: Need {cyan(f'{total_rule_selections_needed:,}')} total rule selections")
-    print(f"{blue('MAB LOOP')}: Can select {cyan(f'{selections_per_batch:,}')} rules per batch")
-    print(f"{blue('MAB LOOP')}: Will process approximately {cyan(f'{estimated_iterations:,}')} batches")
-    print(f"{blue('MAB LOOP')}: Estimated {cyan(f'{estimated_word_passes}')} passes through wordlist")
-    print(f"{blue('MAB LOOP')}: Target: {cyan(f'{min_trials}')} selections per rule")
+    print(f"{blue('SCREENING PHASE ESTIMATES')}:")
+    print(f"  {blue('Selections needed')}: {cyan(f'{total_rule_selections_needed:,}')}")
+    print(f"  {blue('Iterations')}: {cyan(f'{estimated_screening_iterations:,}')}")
+    print(f"  {blue('Wordlist passes')}: {cyan(f'{estimated_word_passes}')}\n")
     
     # Initialize iteration counter and pass counter
     iteration = 0
     pass_count = 0
+    last_elimination_report = 0
+    total_rules_value = total_rules
+    
+    # PHASE TRACKING
+    current_phase = "SCREENING"
+    screening_complete = False
+    deep_testing_started = False
+    deep_testing_complete = False
     
     # Progress bar for total iterations
-    iter_pbar = tqdm(total=estimated_iterations, desc="MAB Iterations", unit="batch",
+    iter_pbar = tqdm(total=estimated_screening_iterations, desc="SCREENING Phase", unit="batch",
                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                      position=0)
     
     try:
-        # Continue until ALL active rules have been selected at least min_trials times
-        while not interrupted:
-            # Check if all active rules have reached min_trials
-            if len(rule_bandit.active_rules) > 0:
-                active_array = np.array(list(rule_bandit.active_rules))
-                min_trials_achieved = np.min(rule_bandit.trials[active_array]) >= min_trials
-                
-                if min_trials_achieved:
-                    print(f"\n{green('COMPLETE')}: All {len(active_array):,} active rules have been selected at least {min_trials} times!")
-                    break
-            else:
-                print(f"\n{yellow('WARNING')}: No active rules remaining!")
-                break
+        # Continue until processing is complete
+        while not interrupted and not deep_testing_complete:
+            # === SCREENING PHASE ===
+            if current_phase == "SCREENING" and not screening_complete:
+                # Check if all active rules have reached screening_trials
+                if len(rule_bandit.active_rules) > 0:
+                    active_array = np.array(list(rule_bandit.active_rules))
+                    min_trials_achieved = np.min(rule_bandit.trials[active_array]) >= screening_trials
+                    
+                    if min_trials_achieved:
+                        screening_complete = True
+                        active_count = len(active_array)
+                        total_eliminated = rule_bandit.elimination_stats['total_eliminated']
+                        zero_success_val = rule_bandit.elimination_stats['zero_success']
+                        low_rate_val = rule_bandit.elimination_stats['low_success_rate']
+                        threshold_val = rule_bandit.elimination_stats['worse_than_threshold']
+                        survival_rate = (active_count / total_rules_value) * 100 if total_rules_value > 0 else 0
+                        
+                        print(f"\n{green('=' * 60)}")
+                        print(f"{bold('SCREENING PHASE COMPLETE')}")
+                        print(f"{green('=' * 60)}")
+                        print(f"{blue('Active rules')}: {cyan(f'{active_count:,}')} survivors")
+                        print(f"{blue('Eliminated')}: {cyan(f'{total_eliminated:,}')} rules ({cyan(f'{100 - survival_rate:.1f}%')})")
+                        print(f"{blue('Zero success')}: {cyan(f'{zero_success_val:,}')}")
+                        print(f"{blue('Low success rate')}: {cyan(f'{low_rate_val:,}')}")
+                        print(f"{blue('Below threshold')}: {cyan(f'{threshold_val:,}')}")
+                        print(f"{blue('Survival rate')}: {cyan(f'{survival_rate:.1f}%')}")
+                        
+                        # Switch to deep testing phase if there are survivors
+                        if active_count > 0:
+                            current_phase = "DEEP_TESTING"
+                            deep_testing_started = True
+                            
+                            # Close screening progress bar
+                            iter_pbar.close()
+                            
+                            # Calculate iterations needed for deep testing
+                            # Each survivor needs (final_trials - screening_trials) more trials
+                            trials_needed_per_rule = final_trials - screening_trials
+                            total_deep_selections_needed = active_count * trials_needed_per_rule
+                            estimated_deep_iterations = int(math.ceil(total_deep_selections_needed / selections_per_batch))
+                            
+                            # Create new progress bar for deep testing
+                            iter_pbar = tqdm(total=estimated_deep_iterations, desc="DEEP TESTING Phase", unit="batch",
+                                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+                                           position=0)
+                            
+                            print(f"\n{green('DEEP TESTING PHASE')}: Testing {cyan(f'{active_count:,}')} survivors to {cyan(final_trials)} trials")
+                            print(f"{blue('Additional trials needed')}: {cyan(f'{trials_needed_per_rule}')} per rule")
+                            print(f"{blue('Estimated iterations')}: {cyan(f'{estimated_deep_iterations:,}')}\n")
+                            continue
+                        else:
+                            # No survivors, we're done
+                            deep_testing_complete = True
+                            break
             
+            # === DEEP TESTING PHASE ===
+            if current_phase == "DEEP_TESTING" and deep_testing_started and not deep_testing_complete:
+                # Check if all active rules have reached final_trials
+                if len(rule_bandit.active_rules) > 0:
+                    active_array = np.array(list(rule_bandit.active_rules))
+                    min_trials_achieved = np.min(rule_bandit.trials[active_array]) >= final_trials
+                    
+                    if min_trials_achieved:
+                        deep_testing_complete = True
+                        active_count = len(active_array)
+                        
+                        print(f"\n{green('=' * 60)}")
+                        print(f"{bold('DEEP TESTING PHASE COMPLETE')}")
+                        print(f"{green('=' * 60)}")
+                        print(f"{blue('All {active_count:,} survivors have reached {final_trials} trials!')}")
+                        break
+            
+            # === PROCESS BATCHES ===
             # Start a new pass through the wordlist
             pass_count += 1
             mab_stats = rule_bandit.get_statistics()
-            print(f"\n{green('PASS')} {pass_count}: Starting pass through wordlist (Rules needing trials: {mab_stats['rules_needing_trials']:,})")
+            
+            if current_phase == "SCREENING":
+                active_rules_val = len(rule_bandit.active_rules)
+                print(f"\n{green('PASS')} {pass_count}: SCREENING PHASE - {cyan(f'{active_rules_val:,}')} active rules")
+            else:
+                active_rules_val = len(rule_bandit.active_rules)
+                print(f"\n{green('PASS')} {pass_count}: DEEP TESTING - {cyan(f'{active_rules_val:,}')} survivors")
             
             # Cycle through all word batches
             for batch_idx in range(total_word_batches):
@@ -1794,7 +1996,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                             np.uint32(num_words_batch),
                             np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
                 
-                # MAB: Select rules for this batch - prioritizes rules needing more trials
+                # MAB: Select rules
                 selected_indices = rule_bandit.select_rules(
                     batch_size=MAX_RULES_IN_BATCH,
                     iteration=iteration
@@ -1806,7 +2008,6 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     # Force select from rules with lowest trials
                     if len(rule_bandit.active_rules) > 0:
                         active_list = list(rule_bandit.active_rules)
-                        # Sort by trials (ascending) to prioritize least-tested rules
                         active_list.sort(key=lambda x: rule_bandit.trials[x])
                         num_to_select = min(MAX_RULES_IN_BATCH, len(active_list))
                         selected_indices = active_list[:num_to_select]
@@ -1854,7 +2055,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 effectiveness_counts_selected = effectiveness_counts_np[:num_rules_in_batch]
                 rule_bandit.update(selected_indices, effectiveness_counts_selected, num_words_batch)
                 
-                # Update rule scores and track statistics
+                # Update rule scores
                 batch_unique = 0
                 batch_cracked = 0
                 
@@ -1888,62 +2089,88 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 mab_stats = rule_bandit.get_statistics()
                 mab_stats_history.append(mab_stats)
                 
+                # Get values for display
+                active_rules_val = mab_stats['active_rules']
+                eliminated_val = mab_stats['eliminated_rules']
+                eliminated_pct = mab_stats['eliminated_percentage']
+                needing_final_val = mab_stats['rules_needing_final']
+                
+                if rule_bandit.active_rules:
+                    min_trials_active_val = np.min(rule_bandit.trials[list(rule_bandit.active_rules)])
+                    max_trials_active_val = np.max(rule_bandit.trials[list(rule_bandit.active_rules)])
+                else:
+                    min_trials_active_val = 0
+                    max_trials_active_val = 0
+                
                 # Record batch statistics
                 batch_statistics.append({
                     'batch': iteration,
                     'pass': pass_count,
+                    'phase': current_phase,
                     'words_processed': num_words_batch,
                     'rules_tested': num_rules_in_batch,
                     'unique_found': batch_unique,
                     'cracked_found': batch_cracked,
-                    'active_rules': mab_stats['active_rules'],
+                    'active_rules': active_rules_val,
                     'tested_rules': mab_stats['tested_rules'],
-                    'pruned_rules': mab_stats['pruned_rules'],
+                    'eliminated_rules': eliminated_val,
+                    'eliminated_percentage': eliminated_pct,
                     'avg_trials': mab_stats['avg_trials_per_rule'],
-                    'rules_needing_trials': mab_stats['rules_needing_trials']
+                    'rules_needing_final': needing_final_val,
+                    'min_trials': min_trials_active_val,
+                    'max_trials': max_trials_active_val
                 })
                 
-                # Extract values for f-strings to avoid nested quote issues
-                tested_rules_val = mab_stats['tested_rules']
-                avg_trials_val = mab_stats['avg_trials_per_rule']
-                success_rate_val = mab_stats['avg_success_rate'] * 100
-                active_rules_val = mab_stats['active_rules']
-                pruned_rules_val = mab_stats['pruned_rules']
-                rules_needing_trials_val = mab_stats['rules_needing_trials']
-                min_trials_active_val = mab_stats['min_trials_active']
+                # Update progress description
+                if current_phase == "SCREENING":
+                    target_trials = screening_trials
+                    phase_display = "SCREEN"
+                    need_display = mab_stats['rules_needing_screening']
+                else:
+                    target_trials = final_trials
+                    phase_display = "DEEP"
+                    need_display = needing_final_val
                 
-                # Update progress description - NOW WITH CORRECT COUNTING
-                iter_pbar.set_description(f"Pass {pass_count}, Iter {iteration} | "
-                                        f"Need: {rules_needing_trials_val:,}/{active_rules_val:,} | "
-                                        f"Min Trials: {min_trials_active_val}/{min_trials} | "
-                                        f"Avg: {avg_trials_val:.1f} | "
-                                        f"Success: {success_rate_val:.3f}%")
+                iter_pbar.set_description(
+                    f"{phase_display} Pass {pass_count} | "
+                    f"Active: {active_rules_val:,} | "
+                    f"Elim: {eliminated_val:,} ({eliminated_pct:.1f}%) | "
+                    f"Need: {need_display:,} | "
+                    f"Min: {min_trials_active_val}/{target_trials}"
+                )
                 
                 # Update interrupt stats
                 update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
                 
-                # Print detailed statistics every 50 iterations
-                if iteration % 50 == 0:
-                    print(f"\n{green('STATS')} Pass {pass_count}, Iter {iteration}:")
-                    print(f"  {blue('WORDS')}: Processed {cyan(f'{words_processed_total:,}')} total words")
-                    print(f"  {blue('UNIQUE')}: Found {cyan(f'{total_unique_found:,}')} unique words")
-                    print(f"  {blue('CRACKED')}: Found {cyan(f'{total_cracked_found:,}')} true cracks")
-                    print(f"  {blue('MAB')}: Rules needing trials: {cyan(f'{rules_needing_trials_val:,}/{active_rules_val:,}')}, "
-                          f"Min trials: {cyan(f'{min_trials_active_val}/{min_trials}')}, "
-                          f"Avg trials: {cyan(f'{avg_trials_val:.1f}')}, "
-                          f"Active: {cyan(f'{active_rules_val:,}')}, "
-                          f"Pruned: {cyan(f'{pruned_rules_val:,}')}")
+                # Report elimination progress every 25 iterations during screening
+                if current_phase == "SCREENING" and iteration - last_elimination_report >= 25:
+                    last_elimination_report = iteration
+                    if rule_bandit.elimination_stats['total_eliminated'] > 0:
+                        total_eliminated_val = rule_bandit.elimination_stats['total_eliminated']
+                        zero_success_val = rule_bandit.elimination_stats['zero_success']
+                        low_rate_val = rule_bandit.elimination_stats['low_success_rate']
+                        threshold_val = rule_bandit.elimination_stats['worse_than_threshold']
+                        
+                        print(f"\n{green('ELIMINATION PROGRESS')} Iter {iteration}:")
+                        print(f"  {blue('Eliminated')}: {cyan(f'{total_eliminated_val:,}')} total rules")
+                        print(f"  {blue('Active')}: {cyan(f'{active_rules_val:,}')} rules remain ({cyan(f'{active_rules_val / total_rules_value * 100:.1f}%')})")
+                        print(f"  {blue('Zero success')}: {cyan(zero_success_val)}")
+                        print(f"  {blue('Low rate')}: {cyan(low_rate_val)}")
+                        print(f"  {blue('Below threshold')}: {cyan(threshold_val)}")
                 
-                # Early break if all active rules have reached min_trials
-                if rules_needing_trials_val == 0 and active_rules_val > 0:
-                    print(f"\n{green('COMPLETE')}: All active rules have reached {min_trials} trials!")
+                # Early break if all active rules have reached current target trials
+                if need_display == 0 and active_rules_val > 0:
+                    if current_phase == "SCREENING":
+                        print(f"\n{green('SCREENING COMPLETE')}: All active rules have reached {screening_trials} trials!")
+                    else:
+                        print(f"\n{green('DEEP TESTING PROGRESS')}: All active rules have reached {final_trials} trials!")
                     break
             
-            # Check if we should continue
-            if len(rule_bandit.active_rules) > 0:
-                active_array = np.array(list(rule_bandit.active_rules))
-                if np.min(rule_bandit.trials[active_array]) >= min_trials:
-                    break
+            # Check if we should break due to no active rules
+            if len(rule_bandit.active_rules) == 0:
+                print(f"\n{yellow('WARNING')}: No active rules remaining!")
+                deep_testing_complete = True
+                break
                 
     except Exception as e:
         print(f"{red('ERROR')}: Processing error: {e}")
@@ -1980,38 +2207,36 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
         speed = words_processed_total / total_time
         print(f"{blue('SPEED')}: {cyan(f'{speed:.0f}')} words/sec")
     
-    print(f"\n{green('FIXED MAB FINAL STATISTICS')}:")
+    print(f"\n{green('EARLY ELIMINATION STATISTICS')}:")
     active_rules = final_mab_stats['active_rules']
     total_rules_count = final_mab_stats['total_rules']
-    tested_rules = final_mab_stats['tested_rules']
-    pruned_rules = final_mab_stats['pruned_rules']
-    pruned_percentage = pruned_rules / total_rules_count * 100 if total_rules_count > 0 else 0
-    avg_trials = final_mab_stats['avg_trials_per_rule']
-    avg_selections = final_mab_stats['avg_selections_per_rule']
-    success_rate = final_mab_stats['avg_success_rate'] * 100
-    avg_words_processed_val = final_mab_stats['avg_words_processed_per_rule']
-    min_trials_active_val = final_mab_stats['min_trials_active']
-    pruning_threshold_val = final_mab_stats['pruning_threshold']
+    eliminated_rules = final_mab_stats['eliminated_rules']
+    eliminated_percentage = final_mab_stats['eliminated_percentage']
     
-    print(f"  {blue('ACTIVE RULES')}: {cyan(f'{active_rules:,}/{total_rules_count:,}')}")
-    print(f"  {blue('TESTED RULES')}: {cyan(f'{tested_rules:,}/{total_rules_count:,}')}")
-    print(f"  {blue('PRUNED RULES')}: {cyan(f'{pruned_rules:,}')} ({pruned_percentage:.1f}%)")
-    print(f"  {blue('MIN TRIALS ACTIVE')}: {cyan(f'{min_trials_active_val}/{min_trials}')}")
-    print(f"  {blue('AVG TRIALS PER RULE')}: {cyan(f'{avg_trials:.1f}')} (each trial = 1 batch of words)")
-    print(f"  {blue('AVG WORDS PROCESSED PER RULE')}: {cyan(f'{avg_words_processed_val:.0f}')}")
-    print(f"  {blue('AVG SELECTIONS PER RULE')}: {cyan(f'{avg_selections:.1f}')}")
-    print(f"  {blue('AVG SUCCESS RATE')}: {cyan(f'{success_rate:.6f}%')}")
-    if pruning_threshold_val > 0:
-        print(f"  {blue('PRUNING THRESHOLD')}: {cyan(f'{pruning_threshold_val:.8f}')}")
+    print(f"  {blue('ORIGINAL RULES')}: {cyan(f'{total_rules_count:,}')}")
+    print(f"  {blue('SURVIVING RULES')}: {cyan(f'{active_rules:,}')}")
+    print(f"  {blue('ELIMINATED RULES')}: {cyan(f'{eliminated_rules:,}')} ({eliminated_percentage:.1f}%)")
     
-    print(f"\n{green('TOP 10 RULES BY MAB SUCCESS PROBABILITY')}:")
+    if iteration > 0:
+        elimination_efficiency = eliminated_rules / iteration
+        print(f"  {blue('ELIMINATION EFFICIENCY')}: {cyan(f'{elimination_efficiency:.1f}')} rules eliminated per iteration")
+    
+    zero_success_final = rule_bandit.elimination_stats.get('zero_success', 0)
+    low_success_rate_final = rule_bandit.elimination_stats.get('low_success_rate', 0)
+    below_threshold_final = rule_bandit.elimination_stats.get('worse_than_threshold', 0)
+    
+    print(f"\n{green('ELIMINATION BREAKDOWN')}:")
+    print(f"  {blue('Zero success')}: {cyan(zero_success_final)}")
+    print(f"  {blue('Low success rate')}: {cyan(low_success_rate_final)}")
+    print(f"  {blue('Below threshold')}: {cyan(below_threshold_final)}")
+    
+    print(f"\n{green('TOP 10 SURVIVING RULES')}:")
     if top_mab_rules:
         for i, rule in enumerate(top_mab_rules[:10], 1):
             rule_data = rule['rule_data']
             success_prob = rule['success_probability']
-            trials = rule['trials']  # Number of times selected
-            words_processed = rule['words_processed']  # Total words processed
-            selections = rule['selections']
+            trials = rule['trials']
+            words_processed_val = rule['words_processed']
             successes = rule['successes']
             total_tested = rule['total_tested']
             success_rate_percent = (successes / total_tested * 100) if total_tested > 0 else 0
@@ -2019,7 +2244,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             print(f"  {blue(f'{i:2}.')} {cyan(rule_data):30} "
                   f"Success: {success_prob:.6f} "
                   f"Trials: {trials:,} "
-                  f"Words: {words_processed:,} "
+                  f"Words: {words_processed_val:,} "
                   f"Successes: {successes:,} "
                   f"Rate: {success_rate_percent:.4f}%")
     else:
@@ -2030,6 +2255,20 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
     # Save ranking data
     print(f"\n{blue('SAVING')}: Ranking results to {ranking_output_path}...")
     
+    # Mark eliminated rules in the rules list
+    for rule in rules_list:
+        rule_idx = rule['rule_id']
+        if rule_idx in rule_bandit.eliminated_rules:
+            rule['eliminated'] = True
+            # Determine eliminate reason
+            if rule_bandit.successes[rule_idx] <= 1.0:
+                rule['eliminate_reason'] = 'zero_success'
+            elif rule_bandit.trials[rule_idx] >= rule_bandit.screening_trials:
+                rule['eliminate_reason'] = 'low_success_rate'
+            else:
+                rule['eliminate_reason'] = 'below_threshold'
+    
+    # Calculate combined scores
     for rule in rules_list:
         rule_idx = rule['rule_id']
         total_successes = rule['total_successes']
@@ -2041,22 +2280,30 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             actual_success_rate = 0
         
         rule['mab_success_prob'] = actual_success_rate
-        rule['selections'] = rule_bandit.selection_count[rule_idx] if rule_idx < len(rule_bandit.selection_count) else 0
-        rule['mab_trials'] = rule_bandit.trials[rule_idx] if rule_idx < len(rule_bandit.trials) else 0
+        if rule_idx < len(rule_bandit.selection_count):
+            rule['selections'] = rule_bandit.selection_count[rule_idx]
+        else:
+            rule['selections'] = 0
+        if rule_idx < len(rule_bandit.trials):
+            rule['mab_trials'] = rule_bandit.trials[rule_idx]
+        else:
+            rule['mab_trials'] = 0
         rule['combined_score'] = (
             rule.get('effectiveness_score', 0) * 10 + 
             rule.get('uniqueness_score', 0) +
             actual_success_rate * 1000
         )
     
-    ranked_rules = sorted(rules_list, key=lambda x: x['combined_score'], reverse=True)
+    # Sort - eliminated rules go to bottom
+    ranked_rules = sorted(rules_list, 
+                         key=lambda x: (x.get('eliminated', False), -x['combined_score']))
     
     try:
         with open(ranking_output_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 
                            'MAB_Success_Prob', 'Times_Tested', 'MAB_Trials', 'Selections', 
-                           'Total_Successes', 'Total_Trials', 'Rule_Data'])
+                           'Total_Successes', 'Total_Trials', 'Eliminated', 'Eliminate_Reason', 'Rule_Data'])
             
             for rank, rule in enumerate(ranked_rules, 1):
                 writer.writerow([
@@ -2070,74 +2317,52 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                     rule.get('selections', 0),
                     rule.get('total_successes', 0),
                     rule.get('total_trials', 0),
+                    rule.get('eliminated', False),
+                    rule.get('eliminate_reason', ''),
                     rule['rule_data']
                 ])
         
         print(f"{green('SAVED')}: {cyan(f'{len(ranked_rules):,}')} rules ranked and saved")
         
+        # Save only active (non-eliminated) top rules
         if top_k > 0:
             optimized_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-            print(f"{blue('SAVING')}: Top {cyan(f'{top_k}')} rules to {optimized_path}...")
+            print(f"{blue('SAVING')}: Top {cyan(f'{top_k}')} ACTIVE rules to {optimized_path}...")
+            
+            # Get only non-eliminated rules for optimized output
+            active_ranked = [r for r in ranked_rules if not r.get('eliminated', False)]
             
             with open(optimized_path, 'w', encoding='utf-8') as f:
                 f.write(":\n")
-                for rule in ranked_rules[:top_k]:
+                for rule in active_ranked[:top_k]:
                     f.write(f"{rule['rule_data']}\n")
             
-            print(f"{green('SAVED')}: Top {cyan(f'{min(top_k, len(ranked_rules)):,}')} rules saved")
+            print(f"{green('SAVED')}: Top {cyan(f'{min(top_k, len(active_ranked)):,}')} active rules saved")
         
-        # Save MAB statistics
-        mab_stats_path = os.path.splitext(ranking_output_path)[0] + "_mab_stats.csv"
-        with open(mab_stats_path, 'w', newline='', encoding='utf-8') as f:
+        # Save elimination statistics
+        eliminate_stats_path = os.path.splitext(ranking_output_path)[0] + "_elimination_stats.csv"
+        with open(eliminate_stats_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Iteration', 'Pass', 'Active_Rules', 'Tested_Rules', 'Pruned_Rules', 
-                           'Rules_Needing_Trials', 'Min_Trials_Active', 'Avg_Trials', 'Avg_Words_Processed', 
-                           'Avg_Selections', 'Avg_Success_Rate', 'Total_Selections', 'Total_Updates'])
-            
-            for i, stats in enumerate(mab_stats_history):
-                pass_val = batch_statistics[i]['pass'] if i < len(batch_statistics) else 0
-                writer.writerow([
-                    i,
-                    pass_val,
-                    stats['active_rules'],
-                    stats['tested_rules'],
-                    stats['pruned_rules'],
-                    stats['rules_needing_trials'],
-                    stats['min_trials_active'],
-                    f"{stats['avg_trials_per_rule']:.2f}",
-                    f"{stats['avg_words_processed_per_rule']:.0f}",
-                    f"{stats['avg_selections_per_rule']:.2f}",
-                    f"{stats['avg_success_rate']:.8f}",
-                    stats['total_selections'],
-                    stats['total_updates']
-                ])
-        
-        print(f"{green('SAVED')}: MAB statistics to {cyan(mab_stats_path)}")
-        
-        # Save batch statistics
-        batch_stats_path = os.path.splitext(ranking_output_path)[0] + "_batch_stats.csv"
-        with open(batch_stats_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Iteration', 'Pass', 'Words_Processed', 'Rules_Tested', 'Unique_Found', 
-                           'Cracked_Found', 'Active_Rules', 'Tested_Rules', 'Pruned_Rules', 
-                           'Avg_Trials', 'Rules_Needing_Trials'])
+            writer.writerow(['Iteration', 'Phase', 'Pass', 'Active_Rules', 'Eliminated_Rules', 'Eliminated_Percentage', 
+                           'Min_Trials', 'Max_Trials', 'Rules_Needing_Final', 'Zero_Success', 'Low_Success_Rate', 'Below_Threshold'])
             
             for stats in batch_statistics:
                 writer.writerow([
                     stats['batch'],
+                    stats['phase'],
                     stats['pass'],
-                    stats['words_processed'],
-                    stats['rules_tested'],
-                    stats['unique_found'],
-                    stats['cracked_found'],
                     stats['active_rules'],
-                    stats['tested_rules'],
-                    stats['pruned_rules'],
-                    f"{stats['avg_trials']:.2f}",
-                    stats.get('rules_needing_trials', 0)
+                    stats['eliminated_rules'],
+                    f"{stats['eliminated_percentage']:.2f}",
+                    stats['min_trials'],
+                    stats['max_trials'],
+                    stats['rules_needing_final'],
+                    rule_bandit.elimination_stats.get('zero_success', 0),
+                    rule_bandit.elimination_stats.get('low_success_rate', 0),
+                    rule_bandit.elimination_stats.get('worse_than_threshold', 0)
                 ])
         
-        print(f"{green('SAVED')}: Batch statistics to {cyan(batch_stats_path)}")
+        print(f"{green('SAVED')}: Elimination statistics to {cyan(eliminate_stats_path)}")
         
     except Exception as e:
         print(f"{red('ERROR')}: Failed to save results: {e}")
@@ -2147,7 +2372,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
 # ====================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Pass Multi-Armed Bandits")
+    parser = argparse.ArgumentParser(description="GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Pass MAB and Early Elimination")
     
     # Required arguments
     parser.add_argument('-w', '--wordlist', help='Path to the base wordlist file')
@@ -2161,24 +2386,25 @@ if __name__ == '__main__':
     parser.add_argument('--global-bits', type=int, help='Bits for global hash map (auto-calculated)')
     parser.add_argument('--cracked-bits', type=int, help='Bits for cracked hash map (auto-calculated)')
     
-    # MAB configuration flags - CRITICAL: min_trials is now number of TIMES each rule is selected
+    # MAB configuration flags
     parser.add_argument('--mab-exploration', type=float, default=DEFAULT_MAB_EXPLORATION_FACTOR,
                        help=f'Multi-Armed Bandit exploration factor (default: {DEFAULT_MAB_EXPLORATION_FACTOR})')
-    parser.add_argument('--mab-min-trials', type=int, default=DEFAULT_MAB_MIN_TRIALS,
-                       help=f'MAB minimum number of TIMES each rule must be selected (default: {DEFAULT_MAB_MIN_TRIALS})')
+    parser.add_argument('--mab-final-trials', type=int, default=DEFAULT_MAB_FINAL_TRIALS,
+                       help=f'MAB final trials for deep testing (default: {DEFAULT_MAB_FINAL_TRIALS})')
+    parser.add_argument('--mab-screening-trials', type=int, default=DEFAULT_MAB_SCREENING_TRIALS,
+                       help=f'MAB screening trials - eliminate low performers after N trials (default: {DEFAULT_MAB_SCREENING_TRIALS})')
+    parser.add_argument('--mab-no-zero-eliminate', action='store_false', dest='mab_zero_success_elimination',
+                       help='DISABLE zero-success elimination (not recommended)')
+    parser.set_defaults(mab_zero_success_elimination=True)
     
     # Preset configuration flag
     parser.add_argument('--preset', type=str, default=None,
-                       help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend" (auto-selects best)')
+                       help='Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend"')
     
     # Device selection arguments
     parser.add_argument('--device', type=int, help='OpenCL device ID')
     parser.add_argument('--list-devices', action='store_true',
                        help='List all available OpenCL devices and exit')
-    
-    # Additional options
-    parser.add_argument('--max-passes', type=int, default=0,
-                       help='Maximum number of passes through wordlist (0 = unlimited until all rules tested)')
     
     args = parser.parse_args()
     
@@ -2193,22 +2419,22 @@ if __name__ == '__main__':
         sys.exit(1)
     
     print(f"{green('=' * 80)}")
-    print(f"{bold('HASHCAT RULE RANKER v4.0 - WITH MULTI-PASS MULTI-ARMED BANDITS')}")
+    print(f"{bold('HASHCAT RULE RANKER v4.0 - MULTI-PASS MAB WITH EARLY RULES ELIMINATION')}")
     print(f"{green('=' * 80)}")
-    print(f"{bold('🎓 MINIMUM VIABLE PRODUCT (MVP) PROJECT')}")
-    print(f"{bold('   GPU-Accelerated Rule Ranking with Multi-Armed Bandits')}")
+    print(f"{bold('🎓 OPTIMIZED FOR 100K+ RULES')}")
+    print(f"{bold('   Eliminates low-performing rules after only 5 trials!')}")
     print(f"{green('=' * 80)}")
-    print(f"{blue('MVP FEATURES')}:")
-    print(f"  {green('✓')} Multi-pass wordlist processing for repeated rule testing")
-    print(f"  {green('✓')} Thompson Sampling Multi-Armed Bandit for intelligent rule selection")
-    print(f"  {green('✓')} Proper trial counting (each selection = 1 trial, not words processed)")
-    print(f"  {green('✓')} Continues until ALL rules reach min_trials threshold")
-    print(f"  {green('✓')} Prunes rules that are 1000x worse than top 100 average")
-    print(f"  {green('✓')} Separate tracking of selections, words processed, and success rates")
+    print(f"{blue('MULTI-PASS MAB FEATURES')}:")
+    print(f"  {green('✓')} Two-phase processing: Screening → Deep Testing")
+    print(f"  {green('✓')} Eliminate zero-success rules after {cyan(f'{args.mab_screening_trials}')} trials")
+    print(f"  {green('✓')} Tiered elimination thresholds (0.00001% → 0.001% → 0.01% success rate)")
+    print(f"  {green('✓')} Consecutive zero-batch detection")
+    print(f"  {green('✓')} Statistical elimination (1000x worse than top 100)")
+    print(f"  {green('✓')} Typically eliminates 80-90% of rules in screening phase")
     print(f"{green('=' * 80)}")
-    print(f"{blue('MAB CONFIG')}: min_trials = {cyan(f'{args.mab_min_trials}')} selections per rule")
-    print(f"{blue('MAB CONFIG')}: exploration = {cyan(f'{args.mab_exploration}')}")
-    print(f"{blue('PROJECT STATUS')}: {cyan('MVP - Core functionality complete, testing in progress')}")
+    print(f"{blue('MAB CONFIG')}: screening_trials = {cyan(f'{args.mab_screening_trials}')} selections")
+    print(f"{blue('MAB CONFIG')}: zero_success_elimination = {cyan(args.mab_zero_success_elimination)}")
+    print(f"{blue('MAB CONFIG')}: final_trials = {cyan(f'{args.mab_final_trials}')} (for survivors)")
     print(f"{green('=' * 80)}")
     
     rank_rules_uniqueness_large(
@@ -2223,5 +2449,7 @@ if __name__ == '__main__':
         preset=args.preset,
         device_id=args.device,
         mab_exploration_factor=args.mab_exploration,
-        mab_min_trials=args.mab_min_trials
+        mab_final_trials=args.mab_final_trials,
+        mab_screening_trials=args.mab_screening_trials,
+        mab_zero_success_elimination=args.mab_zero_success_elimination
     )
