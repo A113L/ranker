@@ -10,9 +10,9 @@ A high-performance GPU-accelerated tool for ranking and optimizing Hashcat rules
 
 ## ✨ Features
 
-- **🚀 GPU Acceleration**: Uses OpenCL for massively parallel rule processing
-- **📊 Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
-- **🎯 Smart Presets**: Auto-configures based on GPU memory and dataset size
+- **GPU Acceleration**: Uses OpenCL for massively parallel rule processing
+- **Dual Scoring**: Calculates both uniqueness and effectiveness scores for rules
+- **Smart Presets**: Auto-configures based on GPU memory and dataset size
 
 [![mab.jpg](https://i.postimg.cc/TwWGZ2ZR/mab.jpg)](https://postimg.cc/BLsdF3Sy)
 
@@ -24,24 +24,20 @@ pip install pyopencl numpy tqdm
 📝 Usage
 bash
 python3 ranker.py -h
-usage: rmab.py [-h] [-w WORDLIST] [-r RULES] [-c CRACKED] [-o OUTPUT]
-               [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
-               [--cracked-bits CRACKED_BITS]
-               [--mab-exploration MAB_EXPLORATION]
-               [--mab-min-trials MAB_MIN_TRIALS] [--preset PRESET]
-               [--device DEVICE] [--list-devices] [--max-passes MAX_PASSES]
+usage: ranket.py [-h] [-w WORDLIST] [-r RULES] [-c CRACKED] [-o OUTPUT] [-k TOPK] [--batch-size BATCH_SIZE] [--global-bits GLOBAL_BITS]
+              [--cracked-bits CRACKED_BITS] [--mab-exploration MAB_EXPLORATION] [--mab-final-trials MAB_FINAL_TRIALS]
+              [--mab-screening-trials MAB_SCREENING_TRIALS] [--mab-no-zero-eliminate] [--preset PRESET] [--device DEVICE] [--list-devices]
 
-GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Pass Multi-Armed Bandits
+GPU-Accelerated Hashcat Rule Ranking Tool with Multi-Pass MAB and Early Elimination
 
-options:
+optional arguments:
   -h, --help            show this help message and exit
   -w WORDLIST, --wordlist WORDLIST
                         Path to the base wordlist file
   -r RULES, --rules RULES
                         Path to the Hashcat rules file to rank
   -c CRACKED, --cracked CRACKED
-                        Path to a list of cracked passwords for effectiveness
-                        scoring
+                        Path to a list of cracked passwords for effectiveness scoring
   -o OUTPUT, --output OUTPUT
                         Path to save the ranking CSV
   -k TOPK, --topk TOPK  Number of top rules to save (0 to skip)
@@ -53,48 +49,40 @@ options:
                         Bits for cracked hash map (auto-calculated)
   --mab-exploration MAB_EXPLORATION
                         Multi-Armed Bandit exploration factor (default: 2.0)
-  --mab-min-trials MAB_MIN_TRIALS
-                        MAB minimum number of TIMES each rule must be selected
-                        (default: 50)
-  --preset PRESET       Use preset configuration: "low_memory",
-                        "medium_memory", "high_memory", "recommend" (auto-
-                        selects best)
+  --mab-final-trials MAB_FINAL_TRIALS
+                        MAB final trials for deep testing (default: 50)
+  --mab-screening-trials MAB_SCREENING_TRIALS
+                        MAB screening trials - eliminate low performers after N trials (default: 5)
+  --mab-no-zero-eliminate
+                        DISABLE zero-success elimination (not recommended)
+  --preset PRESET       Use preset configuration: "low_memory", "medium_memory", "high_memory", "recommend"
   --device DEVICE       OpenCL device ID
   --list-devices        List all available OpenCL devices and exit
-  --max-passes MAX_PASSES
-                        Maximum number of passes through wordlist (0 =
-                        unlimited until all rules tested)
+
 
 
 ```
-The Combined Score is a weighted heuristic used to rank the strategic value of Hashcat rules.
+**Core Architecture**
 
-*Effectiveness:* The total number of passwords a rule successfully cracks.
+A GPU-accelerated Multi-Armed Bandit (MAB) system that intelligently ranks Hashcat rules using Thompson Sampling. Built for massive scale - handles 100,000+ rules efficiently.
 
-*Uniqueness:* The number of passwords cracked only by that specific rule.
+**Two-Phase Processing**
 
-By applying a 10x multiplier to Effectiveness, the formula prioritizes "high-yield" rules that deliver bulk results. The addition of Uniqueness ensures that "specialist" rules, which uncover rare patterns others miss, still gain a competitive rank. This balance creates an optimized rule set that maximizes total cracks while retaining the ability to hit complex, non-standard passwords.
+- *Screening Phase*: Every rule receives exactly 5 trials (configurable) (750,000+ words each). Zero-success rules are immediately eliminated. Typically removes 80-90% of useless rules.
 
-**Key Mechanisms**
+- *Deep Testing Phase*: Survivors receive 45 additional trials (50 total) (configurable) . Statistical elimination based on success rate thresholds (0.00001% → 0.001% → 0.01%).
 
-*Statistical Selection:* Each rule is modeled using a Beta Distribution ($\alpha$ for hits, $\beta$ for misses). Before each GPU batch, the script draws a random sample for every rule. High-performing rules yield higher samples, naturally prioritizing them for the next processing cycle.
+**Key Technical Features**
 
-*Hybrid Exploration:* To prevent "cold start" neglect, a UCB-inspired exploration bonus is applied to less-tested rules. This ensures every transformation is evaluated fairly. An Exploration Decay mechanism gradually reduces this bonus, shifting the strategy from discovery to pure exploitation of known "winners."
+- OpenCL kernel executes 150,000 words/sec per rule batch (on RTX 3060Ti *GB)
+- FNV-1a hash tables for global uniqueness & cracked hash detection
+- Memory-mapped I/O for multi-GB wordlists
+- Real-time progress tracking with interrupt
+- Comprehensive CSV output with ranking, success probabilities, and elimination reasons
 
-*Probabilistic Pruning:* The script implements "survival of the fittest" through automated pruning. Rules consistently performing below a 0.01% effectiveness threshold face a 10% chance of removal per batch. This purges "junk" rules, maximizing VRAM and GPU throughput for high-yield candidates.
+**Performance**
 
-Scoring:
-
-- Uniqueness: Counts how many unique new words each rule generates
-- Effectiveness: Counts how many cracked passwords each rule produces
-- Ranking: Combines scores and ranks rules by effectiveness
-- Output: Saves ranked list and optionally top-K optimized rules
-
-📊 **Output Files**
-
-- results.csv: Full ranking data with scores for all rules
-- results_optimized.rule: Optimized rule file (if -k specified)
-- results_INTERRUPTED.csv: Intermediate results if processing is interrupted
+Cuts ranking time from weeks to hours by focusing compute power on promising rules while ruthlessly pruning the rest.
 
 📄 **Licence**
 
