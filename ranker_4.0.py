@@ -219,12 +219,15 @@ class RuleBandit:
         valid_indices = active_indices[sufficient_trials_mask]
         
         success_rates = []
+        success_rates_dict = {}
         for idx in valid_indices:
             total_s = self.successes[idx] - 1
             total_f = self.failures[idx] - 1
             total_t = total_s + total_f
             if total_t > 0:
-                success_rates.append((idx, total_s / total_t))
+                rate = total_s / total_t
+                success_rates.append((idx, rate))
+                success_rates_dict[idx] = rate
         
         if len(success_rates) < 100:
             return
@@ -274,8 +277,11 @@ class RuleBandit:
             min_trials_active = np.min(self.trials[active_indices]) if len(active_indices) > 0 else 0
             max_trials_active = np.max(self.trials[active_indices]) if len(active_indices) > 0 else 0
             
-            # Count how many rules still need more trials
-            rules_needing_trials = sum(1 for idx in active_indices if self.trials[idx] < self.min_trials)
+            # FIXED: Count rules that still need more trials (trials < min_trials)
+            rules_needing_trials = 0
+            for idx in active_indices:
+                if self.trials[idx] < self.min_trials:
+                    rules_needing_trials += 1
             
             # Calculate success rates for active rules
             total_successes = self.successes[active_indices] - 1
@@ -302,7 +308,7 @@ class RuleBandit:
             'active_rules': active_count,
             'tested_rules': tested_count,
             'pruned_rules': len(self.pruned_rules),
-            'rules_needing_trials': rules_needing_trials,
+            'rules_needing_trials': rules_needing_trials,  # This will now decrease over time
             'avg_trials_per_rule': float(avg_trials),  # This is now number of selections, not words
             'avg_words_processed_per_rule': float(avg_words_processed),
             'avg_selections_per_rule': float(avg_selections),
@@ -1760,7 +1766,8 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
             
             # Start a new pass through the wordlist
             pass_count += 1
-            print(f"\n{green('PASS')} {pass_count}: Starting pass through wordlist (Rules needing trials: {rule_bandit.get_statistics()['rules_needing_trials']:,})")
+            mab_stats = rule_bandit.get_statistics()
+            print(f"\n{green('PASS')} {pass_count}: Starting pass through wordlist (Rules needing trials: {mab_stats['rules_needing_trials']:,})")
             
             # Cycle through all word batches
             for batch_idx in range(total_word_batches):
@@ -1905,7 +1912,7 @@ def rank_rules_uniqueness_large(wordlist_path, rules_path, cracked_list_path, ra
                 rules_needing_trials_val = mab_stats['rules_needing_trials']
                 min_trials_active_val = mab_stats['min_trials_active']
                 
-                # Update progress description
+                # Update progress description - NOW WITH CORRECT COUNTING
                 iter_pbar.set_description(f"Pass {pass_count}, Iter {iteration} | "
                                         f"Need: {rules_needing_trials_val:,}/{active_rules_val:,} | "
                                         f"Min Trials: {min_trials_active_val}/{min_trials} | "
