@@ -25,7 +25,7 @@
 |---|---|
 | Python 3.8+ | |
 | `pyopencl` | Requires a working OpenCL runtime (GPU driver or CPU fallback) |
-| `numpy` | |
+| `numpy` | Numerical operations & data preparation |
 | `tqdm` | Progress bars |
 
 Install dependencies:
