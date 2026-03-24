@@ -23,7 +23,7 @@
 
 | Dependency | Notes |
 |---|---|
-| Python 3.8+ | Minimum Python 3.8 reqired to run script |
+| Python 3.8+ | Minimum Python 3.8 required to run script |
 | `pyopencl` | Requires a working OpenCL runtime (GPU driver or CPU fallback) |
 | `numpy` | Numerical operations & data preparation |
 | `tqdm` | Progress bars |
