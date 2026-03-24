@@ -8,7 +8,7 @@
 
 | File | Version | Algorithm |
 |------|---------|-----------|
-| `ranker.py` | **v3.2** — Optimized Large File Loading | Exhaustive brute-force |
+| `ranker_v3.2.py` | **v3.2** — Optimized Large File Loading | Exhaustive brute-force |
 | `ranker_v4_0.py` | **v4.0** — Multi-Pass MAB with Early Rules Elimination | Thompson Sampling + 2-phase MAB |
 
 ---
