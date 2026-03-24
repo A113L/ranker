@@ -1,373 +1,182 @@
-# 🔐 Hashcat Rule Ranker — GPU-Accelerated Ranking Tool
+# Hashcat Rule Ranker v5.0
 
-> GPU-accelerated Hashcat rule ranking using OpenCL. Scores rules by **uniqueness** (generates unseen words) and **effectiveness** (matches known cracked passwords). Built for large rule sets and large wordlists.
+> **GPU-Accelerated Hashcat Rule Ranking using Multi-Armed Bandit (MAB) with Early Elimination**
 
----
-
-## 📁 Versions
-
-| File | Version | Algorithm |
-|------|---------|-----------|
-| `ranker_v3.2.py` | **v3.2** — Optimized Large File Loading | Exhaustive brute-force |
-| `ranker_v4_0.py` | **v4.0** — Multi-Pass MAB with Early Rules Elimination | Thompson Sampling + 2-phase MAB |
+`ranker.py` evaluates and ranks a Hashcat ruleset against a wordlist and a list of known-cracked passwords. It applies each rule on the GPU via OpenCL, scores rules by how many unique and real-world cracked passwords they produce, and outputs a ranked CSV plus an optimized `.rule` file containing only the top performers.
 
 ---
 
-## 🆕 What Changed: v3.2 → v4.0
+## Features
 
-### Core Algorithm
-
-| | v3.2 | v4.0 |
-|---|---|---|
-| **Strategy** | Tests **every rule** against **every word batch** | Multi-Armed Bandit — selects rules probabilistically |
-| **Rule elimination** | None — all rules run to completion | Eliminates 80–90% of low-performing rules early |
-| **Phases** | Single pass | Phase 1: Screening → Phase 2: Deep Testing |
-| **Designed for** | General use | 100K – 2M+ rule sets |
-
-### New Class: `MultiPassMAB`
-
-v4.0 introduces a full `MultiPassMAB` class implementing Thompson Sampling with early elimination:
-
-```
-MultiPassMAB
-├── Thompson Sampling  — Beta distribution per rule (α successes, β failures)
-├── Screening Phase    — Eliminate rules after N trials (default: 5)
-├── Deep Testing       — Test survivors to final_trials (default: 50)
-└── 4 elimination strategies:
-    ├── Zero-success after screening_trials
-    ├── Phase-based success rate thresholds (0.00001% → 0.01%)
-    ├── 1000× worse than top-100 average
-    └── 3 consecutive zero-success batches
-```
-
-### OpenCL Kernel Differences
-
-| | v3.2 | v4.0 |
-|---|---|---|
-| **Kernel name** | `bfs_kernel` | `ranker_kernel` |
-| **Rule encoding** | Packed into 2× `uint32` (max ~8 chars usable) | Full `uint8[255]` array — all rule lengths supported |
-| **`MAX_RULE_LEN`** | `16` | `255` |
-| **Global hash map** | Read-only during kernel | **Read-write** — atomic `OR` writes uniqueness data back |
-| **Constants in kernel** | String-interpolated masks | `#define` macros via f-string |
-
-### Output Files
-
-| File | v3.2 | v4.0 |
-|---|---|---|
-| `*_output.csv` | Rank, Combined/Effectiveness/Uniqueness Score, Rule_Data | + MAB fields: `MAB_Success_Prob`, `Times_Tested`, `MAB_Trials`, `Selections`, `Total_Successes`, `Total_Trials`, `Eliminated`, `Eliminate_Reason` |
-| `*_optimized.rule` | Top K rules by combined score | Top K **active (non-eliminated)** rules only |
-| `*_elimination_stats.csv` | ❌ | ✅ Per-iteration elimination tracking |
-
-### CLI Arguments
-
-**Shared arguments:**
-
-```
--w / --wordlist       Path to base wordlist
--r / --rules          Path to Hashcat rules file
--c / --cracked        Path to cracked passwords list
--o / --output         Output CSV path (default: ranker_output.csv)
--k / --topk           Top K rules to save (default: 1000)
---batch-size          Words per GPU batch (auto if omitted)
---global-bits         Global hash map bits
---cracked-bits        Cracked hash map bits
---preset              low_memory | medium_memory | high_memory | recommend
-```
-
-**v3.2 only:**
-
-```
---list-platforms      List all OpenCL platforms and devices
---platform INT        Select OpenCL platform index
---device INT          Select device index within platform
-```
-
-**v4.0 only:**
-
-```
---device INT                    Single global device ID (flat index)
---list-devices                  List all OpenCL devices (flat list)
---mab-exploration FLOAT         Exploration factor (default: 2.0)
---mab-final-trials INT          Trials for deep testing phase (default: 50)
---mab-screening-trials INT      Trials before elimination decision (default: 5)
---mab-no-zero-eliminate         Disable zero-success rule elimination
-```
-
-### Device Selection
-
-| | v3.2 | v4.0 |
-|---|---|---|
-| **Selection model** | Platform index + device index within platform | Flat device ID across all platforms |
-| **Auto-select GPU** | Prefers NVIDIA → AMD → Intel → first | Largest VRAM GPU wins |
-| **List command** | `--list-platforms` | `--list-devices` |
+- **GPU-accelerated** rule application via [PyOpenCL](https://documen.tician.de/pyopencl/) — supports NVIDIA, AMD, and Intel devices
+- **Multi-Pass MAB mode** (default) — Thompson Sampling bandit with a screening phase and early elimination of low-performing rules, dramatically reducing compute time on large rulesets
+- **Legacy exhaustive mode** — tests every rule against every word (v3.2 behaviour)
+- **Full Hashcat rule support** — all GPU-compatible rules up to 255 characters
+- **Adaptive VRAM management** — auto-tunes batch size and hash map dimensions to available GPU memory; supports `low_memory / medium_memory / high_memory / recommend` presets
+- **Memory-mapped file I/O** — handles wordlists of any size with minimal RAM overhead
+- **Graceful interrupt handling** — `Ctrl+C` saves intermediate results so a run can be inspected
+- **Dual output** — ranked CSV with full statistics and a ready-to-use `.rule` file of top-K rules
 
 ---
 
-## 🚀 Quick Start
+## Requirements
 
-### Requirements
+| Dependency | Notes |
+|---|---|
+| Python 3.8+ | |
+| `pyopencl` | Requires a working OpenCL runtime (GPU driver or CPU fallback) |
+| `numpy` | |
+| `tqdm` | Progress bars |
+
+Install dependencies:
 
 ```bash
 pip install pyopencl numpy tqdm
 ```
 
-OpenCL runtime required for your GPU (CUDA Toolkit / ROCm / Intel OpenCL).
+> **OpenCL runtime** — you also need a platform-specific runtime installed:
+> - NVIDIA: CUDA Toolkit (includes OpenCL)
+> - AMD: ROCm or AMDGPU-PRO drivers
+> - Intel: Intel OpenCL Runtime
 
-### v3.2 — Exhaustive Ranking
+---
 
-Best for small-to-medium rule sets where you want every rule scored.
+## Quick Start
 
 ```bash
-# Basic run
-python3 ranker.py \
-  -w wordlist.txt \
-  -r rules.rule \
-  -c cracked.txt \
+# Rank rules using MAB mode (recommended)
+python ranker.py \
+  -w rockyou.txt \
+  -r best64.rule \
+  -c cracked_passwords.txt \
   -o ranked_output.csv \
-  -k 1000
+  -k 500
 
-# List available OpenCL platforms/devices
-python3 ranker.py --list-platforms
-
-# Select specific GPU (platform 0, device 1)
-python3 ranker.py -w wordlist.txt -r rules.rule -c cracked.txt \
-  --platform 0 --device 1
-
-# Use memory preset
-python3 ranker.py -w wordlist.txt -r rules.rule -c cracked.txt \
-  --preset high_memory
+# List available OpenCL devices
+python ranker.py --list-devices
 ```
 
-### v4.0 — MAB with Early Elimination
+---
 
-Best for very large rule sets (100K+). Eliminates weak rules early, concentrates compute on strong ones.
+## Arguments
+
+### Required
+
+| Argument | Description |
+|---|---|
+| `-w`, `--wordlist` | Path to the base wordlist |
+| `-r`, `--rules` | Path to the Hashcat `.rule` file |
+| `-c`, `--cracked` | Path to the list of known-cracked passwords (used for effectiveness scoring) |
+
+### Output
+
+| Argument | Default | Description |
+|---|---|---|
+| `-o`, `--output` | `ranker_output.csv` | Output CSV file path |
+| `-k`, `--topk` | `1000` | Number of top-ranked rules to write to the optimized `.rule` file |
+
+### Performance Tuning
+
+| Argument | Default | Description |
+|---|---|---|
+| `--batch-size` | auto | Words per GPU batch (overrides auto-detection) |
+| `--global-bits` | `35` | Bit width of the global uniqueness hash map |
+| `--cracked-bits` | `33` | Bit width of the cracked-password hash map |
+| `--preset` | — | Memory preset: `low_memory`, `medium_memory`, `high_memory`, or `recommend` |
+
+### MAB Options
+
+| Argument | Default | Description |
+|---|---|---|
+| `--mab-exploration` | `2.0` | UCB / Thompson exploration factor |
+| `--mab-final-trials` | `50` | Minimum trials required before a surviving rule is finalised |
+| `--mab-screening-trials` | `5` | Trials before a rule is eligible for early elimination |
+| `--mab-no-zero-eliminate` | — | Flag — disables automatic elimination of rules with zero successes |
+
+### Mode & Device
+
+| Argument | Description |
+|---|---|
+| `--legacy` | Run in exhaustive mode (v3.2) — tests all rules against all words |
+| `--device` | OpenCL device ID to use (see `--list-devices`) |
+| `--list-devices` | Print all available OpenCL platforms and devices, then exit |
+
+---
+
+## How It Works
+
+### MAB Mode (default)
+
+1. **Screening phase** — every rule receives a minimum number of trials (`--mab-screening-trials`). Rules that produce zero successes are eliminated early.
+2. **Deep-testing phase** — surviving rules are selected by a Thompson Sampling bandit. Rules that consistently underperform are eliminated; high-performing rules receive more trials until all survivors reach `--mab-final-trials`.
+3. **Scoring** — each rule accumulates an *effectiveness score* (transforms that match a cracked password) and a *uniqueness score* (transforms that produce any new candidate). The combined score is `effectiveness × 10 + uniqueness + mab_success_probability × 1000`.
+
+### Legacy Mode (`--legacy`)
+
+Every rule is applied to every word in the wordlist in a single exhaustive pass. Use this when you need reproducible, fully-deterministic rankings or when the ruleset is small enough that MAB overhead is not worthwhile.
+
+---
+
+## Output Files
+
+| File | Description |
+|---|---|
+| `<output>.csv` | Full ranked list of all rules with scores and MAB statistics |
+| `<output>_optimized.rule` | Top-K rules in Hashcat `.rule` format, ready to use |
+| `<output>_INTERRUPTED.csv` | Saved automatically on `Ctrl+C` |
+| `<output>_INTERRUPTED.rule` | Saved automatically on `Ctrl+C` |
+
+### CSV Columns (MAB mode)
+
+| Column | Description |
+|---|---|
+| `Rank` | Final rank (1 = best) |
+| `Combined_Score` | Weighted composite score |
+| `Effectiveness_Score` | Transforms matching known-cracked passwords |
+| `Uniqueness_Score` | Unique candidate words generated |
+| `MAB_Success_Prob` | Thompson Sampling success probability |
+| `Times_Tested` | Number of batches this rule was tested in |
+| `MAB_Trials` | Total MAB trial count |
+| `Selections` | Times selected by the bandit |
+| `Total_Successes` | Cumulative successes across all trials |
+| `Total_Trials` | Cumulative trials across all batches |
+| `Eliminated` | Whether the rule was eliminated early |
+| `Eliminate_Reason` | `zero_success` or `low_success_rate` |
+| `Rule_Data` | Original Hashcat rule string |
+
+---
+
+## Examples
 
 ```bash
-# Basic run
-python3 ranker_v4_0.py \
-  -w wordlist.txt \
-  -r rules.rule \
-  -c cracked.txt \
-  -o ranked_output.csv \
-  -k 1000
+# Use a specific GPU (device 1)
+python ranker.py -w words.txt -r rules.rule -c cracked.txt --device 1
 
-# List available OpenCL devices (flat index)
-python3 ranker_v4_0.py --list-devices
+# Low-VRAM machine
+python ranker.py -w words.txt -r rules.rule -c cracked.txt --preset low_memory
 
-# Select GPU by device ID
-python3 ranker_v4_0.py -w wordlist.txt -r rules.rule -c cracked.txt \
-  --device 0
+# Aggressive exploration with more final trials
+python ranker.py -w words.txt -r rules.rule -c cracked.txt \
+  --mab-exploration 3.0 --mab-final-trials 100
 
-# Tune MAB parameters
-python3 ranker_v4_0.py -w wordlist.txt -r rules.rule -c cracked.txt \
-  --mab-screening-trials 10 \
-  --mab-final-trials 100 \
-  --mab-exploration 3.0
+# Legacy exhaustive mode, save top 2000 rules
+python ranker.py -w words.txt -r rules.rule -c cracked.txt --legacy -k 2000
 
-# Disable zero-success elimination (not recommended for large sets)
-python3 ranker_v4_0.py -w wordlist.txt -r rules.rule -c cracked.txt \
-  --mab-no-zero-eliminate
+# Interrupt safely — progress is written to *_INTERRUPTED files
+# Press Ctrl+C at any time during a run
 ```
 
 ---
 
-## ⚙️ Performance Tuning
+## Notes
 
-### Memory Presets
-
-| Preset | Batch Size | Global Map | Cracked Map | Target GPU |
-|--------|-----------|------------|-------------|------------|
-| `low_memory` | 25,000 | 30 bits | 28 bits | < 4 GB VRAM |
-| `medium_memory` | 75,000 | 33 bits | 31 bits | 4–8 GB VRAM |
-| `high_memory` | 150,000 | 35 bits | 33 bits | > 8 GB VRAM |
-| `recommend` | auto | auto | auto | auto-detected |
-
-```bash
-python3 ranker.py      --preset recommend ...
-python3 ranker_v4_0.py --preset recommend ...
-```
-
-### Manual Tuning
-
-```bash
-python3 ranker.py \
-  --batch-size 100000 \
-  --global-bits 35 \
-  --cracked-bits 33 \
-  ...
-```
+- The cracked passwords file is used **only** for scoring (effectiveness); it is not required to be the original hash file — a plaintext dump of previously cracked passwords works perfectly.
+- Comments (`#`) and blank lines in the rules file are ignored automatically.
+- Words longer than 256 bytes are silently skipped.
+- On systems with multiple OpenCL platforms (e.g., both an NVIDIA GPU and an Intel integrated GPU), the tool auto-selects in preference order: NVIDIA → AMD → Intel → first available. Use `--device` to override.
 
 ---
 
-## 🔢 Scoring
-
-### v3.2 Scoring Formula
-
-```
-combined_score = effectiveness_score × 10 + uniqueness_score
-```
-
-- **uniqueness_score** — how many transformed words are NOT in the base wordlist
-- **effectiveness_score** — how many transformed words ARE in the cracked list
-
-### v4.0 Scoring Formula
-
-```
-combined_score = effectiveness_score × 10 + uniqueness_score + mab_success_prob × 1000
-```
-
-Additional MAB-derived fields per rule in the output CSV:
-
-| Field | Description |
-|-------|-------------|
-| `MAB_Success_Prob` | `total_successes / total_trials` — empirical hit rate |
-| `Times_Tested` | Number of batches this rule was selected for |
-| `MAB_Trials` | Number of MAB selection rounds |
-| `Selections` | Total times selected by the bandit |
-| `Total_Successes` | Cumulative cracked-hash matches |
-| `Total_Trials` | Cumulative words tested against this rule |
-| `Eliminated` | `True` if discarded during screening |
-| `Eliminate_Reason` | `zero_success` / `low_success_rate` / `below_threshold` |
-
----
-
-## 🏗️ Architecture
-
-### Shared Components (both versions)
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                     RANKER PIPELINE                      │
-├──────────────────┬──────────────────────────────────────┤
-│  File Loading    │  Memory-mapped I/O (mmap)             │
-│                  │  FNV-1a hash pre-computation          │
-│                  │  Fast word-count estimation           │
-├──────────────────┼──────────────────────────────────────┤
-│  Hash Maps       │  Global bitmap  — base wordlist       │
-│                  │  Cracked bitmap — cracked passwords   │
-│                  │  Bloom-filter style (bit-level OR)    │
-├──────────────────┼──────────────────────────────────────┤
-│  OpenCL Kernel   │  Hashcat rule application (GPU)      │
-│                  │  FNV-1a hash per output word         │
-│                  │  Dual uniqueness/effectiveness count  │
-├──────────────────┼──────────────────────────────────────┤
-│  Interrupt       │  SIGINT handler saves progress       │
-│  Recovery        │  Writes *_INTERRUPTED.csv / .rule   │
-└──────────────────┴──────────────────────────────────────┘
-```
-
-### v3.2 Processing Loop
-
-```
-for each word_batch:
-    upload to GPU
-    update global hash map
-    for each rule_batch (1024 rules at a time):
-        run bfs_kernel
-        accumulate scores
-```
-
-Time complexity: `O(words × rules)`
-
-### v4.0 Processing Loop
-
-```
-Phase 1 — SCREENING:
-    repeat until all rules have ≥ screening_trials selections:
-        select_rules() via Thompson Sampling
-        for each word_batch:
-            run ranker_kernel
-            update MAB (successes/failures)
-            eliminate_low_performers()
-
-Phase 2 — DEEP TESTING:
-    repeat until survivors have ≥ final_trials selections:
-        same loop, only active (non-eliminated) rules selected
-```
-
-Time complexity: `O(words × active_rules × final_trials)` — active_rules << total_rules
-
----
-
-## 📊 Supported Hashcat Rule Operations
-
-Both versions implement the same rule set:
-
-| Category | Rules |
-|----------|-------|
-| Case | `l` `u` `c` `C` `t` `Tn` `E` |
-| Reverse / Rotate | `r` `{` `}` |
-| Duplicate | `d` `f` `p` `q` `z` `Z` |
-| Delete | `Dn` `Ln` `Rn` `[n` `]n` `@X` |
-| Insert / Overwrite | `^X` `$X` `in X` `on X` |
-| Substitute | `sXY` |
-| Extract / Swap | `xn m` `*n m` `kK` |
-| ASCII modify | `+n` `-n` |
-| Reject | `!X` `/X` |
-
----
-
-## 📂 Output Files
-
-### v3.2
-
-| File | Contents |
-|------|----------|
-| `<output>.csv` | All rules ranked by combined score |
-| `<output>_optimized.rule` | Top K rules, ready for Hashcat |
-| `<output>_INTERRUPTED.csv` | Saved on Ctrl+C |
-| `<output>_INTERRUPTED.rule` | Saved on Ctrl+C |
-
-### v4.0
-
-| File | Contents |
-|------|----------|
-| `<output>.csv` | All rules with MAB metadata + eliminated flag |
-| `<output>_optimized.rule` | Top K **active** rules only |
-| `<output>_elimination_stats.csv` | Per-iteration elimination history |
-| `<output>_INTERRUPTED.csv` | Saved on Ctrl+C |
-| `<output>_INTERRUPTED.rule` | Saved on Ctrl+C |
-
----
-
-## 🛠️ When to Use Which Version
-
-| Scenario | Recommended |
-|----------|-------------|
-| Rule file < 50K rules | **v3.2** — exhaustive is fast enough, all rules scored equally |
-| Rule file 50K–500K rules | **v4.0** — MAB avoids testing irrelevant rules |
-| Rule file 500K–2M+ rules | **v4.0** — essential; exhaustive would take impractical time |
-| Need every rule scored | **v3.2** — v4.0 skips eliminated rules |
-| Cracked list is small / absent | **v3.2** — effectiveness scoring less meaningful for MAB |
-| Rapid iteration / prototyping | **v4.0** with low `--mab-screening-trials` |
-
----
-
-## 🐛 Common Issues
-
-**`MEM_OBJECT_ALLOCATION_FAILURE`** — GPU OOM.
-Use `--preset low_memory` or manually lower `--batch-size` and `--global-bits`.
-
-**`No OpenCL platforms found`** — Runtime not installed.
-Install CUDA Toolkit (NVIDIA), ROCm (AMD), or Intel OpenCL runtime.
-
-**Cracked list not found** — Effectiveness scores will all be zero.
-Both versions continue and score uniqueness only.
-
-**v4.0: "No rules with sufficient trials"** — Run longer or lower `--mab-screening-trials`.
-This appears when no rule has reached `screening_trials` yet.
-
----
-
-## 📦 Dependencies
-
-```
-pyopencl    >= 2023.1
-numpy       >= 1.24
-tqdm        >= 4.65
-```
-
----
 
 ## 📄 License
 
