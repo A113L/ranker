@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 RULE SCORING ANALYSIS TOOL - OPTIMIZED VERSION
 ===============================================
@@ -13,6 +14,8 @@ Performance improvements:
 - 5-10x faster processing of large rule sets
 - Lower memory usage
 - Efficient top-N extraction without full sort
+
+Supports both legacy (5-column) and MAB (13-column) ranking CSV files.
 """
 
 import argparse
@@ -53,8 +56,8 @@ def magenta(text): return f"{Colors.MAGENTA}{text}{Colors.END}"
 def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
 def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
 
-# Helper function to format numbers with commas
 def fmt_num(num):
+    """Format number with commas"""
     return f"{num:,}"
 
 # LRU cache for cleaning rules (common patterns repeat)
@@ -87,162 +90,88 @@ def clean_rule_cached(rule_data: str) -> str:
     
     return rule.strip()
 
-def parse_chunk(chunk: List[str], filename: str, chunk_num: int, total_chunks: int) -> List[Dict]:
-    """Parse a chunk of lines from a file"""
-    rules_data = []
-    
-    for line in chunk:
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        
-        # Fast parsing - try comma first (most common)
-        if ',' in line:
-            parts = line.split(',', 4)  # Split into max 5 parts
-            if len(parts) >= 5:
-                try:
-                    rules_data.append({
-                        'rank': int(parts[0]),
-                        'combined_score': int(parts[1]),
-                        'effectiveness_score': int(parts[2]),
-                        'uniqueness_score': int(parts[3]),
-                        'rule_data': parts[4].strip(),
-                        'source_file': filename
-                    })
-                except ValueError:
-                    continue
-        else:
-            # Try tab or space separation
-            parts = line.split('\t') if '\t' in line else line.split()
-            if len(parts) >= 5:
-                try:
-                    rules_data.append({
-                        'rank': int(parts[0]),
-                        'combined_score': int(parts[1]),
-                        'effectiveness_score': int(parts[2]),
-                        'uniqueness_score': int(parts[3]),
-                        'rule_data': ' '.join(parts[4:]),  # Join remaining parts
-                        'source_file': filename
-                    })
-                except ValueError:
-                    continue
-    
-    return rules_data
-
 def parse_ranking_file_fast(filepath: str, chunk_size: int = 10000, show_progress: bool = True) -> List[Dict]:
-    """Fast file parsing with chunking and progress bar"""
+    """
+    Fast file parsing for both legacy (5‑col) and MAB (13‑col) CSV files.
+    Extracts rank, combined_score, effectiveness_score, uniqueness_score, rule_data.
+    """
     rules_data = []
     filename = os.path.basename(filepath)
     
-    print(f"{blue('📊')} {bold('Processing:')} {filepath}")
+    print(f"{blue('->')} {bold('Processing:')} {filepath}")
     
     try:
+        # First, count total lines for progress bar
+        total_lines = 0
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            # Get file size for progress bar
-            file_size = os.path.getsize(filepath)
-            
-            # Skip header if present
-            first_line = f.readline()
-            f.seek(0)
-            
-            has_header = 'Rank' in first_line or 'Combined_Score' in first_line
-            
-            if filepath.lower().endswith('.csv') or has_header:
-                # Use CSV reader for structured data
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames
-                
-                # Map column names
-                rank_col = next((col for col in ['Rank', 'rank', 'RANK'] if col in fieldnames), None)
-                combined_col = next((col for col in ['Combined_Score', 'combined_score', 'COMBINED_SCORE'] if col in fieldnames), None)
-                effect_col = next((col for col in ['Effectiveness_Score', 'effectiveness_score', 'EFFECTIVENESS_SCORE'] if col in fieldnames), None)
-                unique_col = next((col for col in ['Uniqueness_Score', 'uniqueness_score', 'UNIQUENESS_SCORE'] if col in fieldnames), None)
-                rule_col = next((col for col in ['Rule_Data', 'rule_data', 'RULE_DATA'] if col in fieldnames), None)
-                
-                if not all([rank_col, combined_col, effect_col, unique_col, rule_col]):
-                    # Fall back to positional parsing
-                    f.seek(0)
-                    lines = f.readlines()
-                    if has_header:
-                        lines = lines[1:]  # Skip header
-                    
-                    # Create progress bar for chunk processing
-                    if show_progress:
-                        pbar = tqdm(total=len(lines), 
-                                   desc=f"{cyan('📄')} Reading {filename[:20]}",
-                                   unit=" lines",
-                                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-                    
-                    # Process in chunks with progress
-                    for i in range(0, len(lines), chunk_size):
-                        chunk = lines[i:i + chunk_size]
-                        rules_data.extend(parse_chunk(chunk, filename, i//chunk_size, len(lines)//chunk_size))
-                        if show_progress:
-                            pbar.update(len(chunk))
-                    
-                    if show_progress:
-                        pbar.close()
-                else:
-                    # Use DictReader with progress
-                    row_count = 0
-                    if show_progress:
-                        # Estimate row count for progress bar
-                        f.seek(0)
-                        row_count = sum(1 for _ in f) - 1  # Subtract header
-                        f.seek(0)
-                        next(f)  # Skip header
-                        pbar = tqdm(total=row_count, 
-                                   desc=f"{cyan('📊')} Parsing {filename[:20]}",
-                                   unit=" rows",
-                                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-                    
-                    # Reset file position
-                    f.seek(0)
-                    reader = csv.DictReader(f)
-                    
-                    for row in reader:
-                        try:
-                            rules_data.append({
-                                'rank': int(row[rank_col]),
-                                'combined_score': int(row[combined_col]),
-                                'effectiveness_score': int(row[effect_col]),
-                                'uniqueness_score': int(row[unique_col]),
-                                'rule_data': row[rule_col].strip(),
-                                'source_file': filename
-                            })
-                            if show_progress:
-                                pbar.update(1)
-                        except (ValueError, KeyError):
-                            if show_progress:
-                                pbar.update(1)
-                            continue
-                    
-                    if show_progress:
-                        pbar.close()
-            else:
-                # Read all lines and process in chunks with progress
-                lines = f.readlines()
-                
-                if show_progress:
-                    pbar = tqdm(total=len(lines), 
-                               desc=f"{cyan('📄')} Reading {filename[:20]}",
-                               unit=" lines",
-                               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
-                
-                for i in range(0, len(lines), chunk_size):
-                    chunk = lines[i:i + chunk_size]
-                    rules_data.extend(parse_chunk(chunk, filename, i//chunk_size, len(lines)//chunk_size))
-                    if show_progress:
-                        pbar.update(len(chunk))
-                
-                if show_progress:
-                    pbar.close()
+            total_lines = sum(1 for _ in f)
         
-        print(f"{green('✅')} {bold('Loaded:')} {cyan(fmt_num(len(rules_data)))} {bold('rules')}")
+        # Now parse with csv.reader (handles quoting automatically)
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            reader = csv.reader(f)
+            
+            # Create progress bar if requested
+            if show_progress:
+                pbar = tqdm(total=total_lines, 
+                           desc=f"{cyan('File')} Reading {filename[:20]}",
+                           unit=" lines",
+                           bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+            
+            # Flag to skip header detection after first data line
+            header_skipped = False
+            line_count = 0
+            
+            for row in reader:
+                # Skip empty rows
+                if not row or len(row) < 5:
+                    if show_progress:
+                        pbar.update(1)
+                    continue
+                
+                # Try to detect header: if first cell is not numeric, it's a header
+                if not header_skipped and not row[0].strip().lstrip('-').replace(',', '').isdigit():
+                    # This is a header row – skip it
+                    header_skipped = True
+                    if show_progress:
+                        pbar.update(1)
+                    continue
+                
+                # Now we have a data row.
+                # For both legacy (5 cols) and MAB (13 cols), the rule is always the last column.
+                # The first four columns are: rank, combined_score, effectiveness_score, uniqueness_score.
+                try:
+                    rank = int(row[0].strip())
+                    combined = int(row[1].strip())
+                    effectiveness = int(row[2].strip())
+                    uniqueness = int(row[3].strip())
+                    rule = row[-1].strip()
+                    
+                    rules_data.append({
+                        'rank': rank,
+                        'combined_score': combined,
+                        'effectiveness_score': effectiveness,
+                        'uniqueness_score': uniqueness,
+                        'rule_data': rule,
+                        'source_file': filename
+                    })
+                except (ValueError, IndexError):
+                    # Skip malformed lines
+                    pass
+                
+                if show_progress:
+                    pbar.update(1)
+                line_count += 1
+                
+                # Optional: yield in chunks for memory efficiency? But we collect all anyway.
+            
+            if show_progress:
+                pbar.close()
+        
+        print(f"{green('OK')} {bold('Loaded:')} {cyan(fmt_num(len(rules_data)))} {bold('rules')}")
         return rules_data
         
     except Exception as e:
-        print(f"{red('❌')} {bold('Error reading file')} {filepath}: {e}")
+        print(f"{red('ERROR')} {bold('Error reading file')} {filepath}: {e}")
         return []
 
 def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] = None, show_progress: bool = True) -> Dict:
@@ -265,9 +194,9 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     total_rules_to_process = sum(len(rules) for rules in rules_data_list)
     
     if show_progress:
-        print(f"{blue('🔍')} {bold('Analyzing')} {cyan(fmt_num(total_rules_to_process))} {bold('rules...')}")
+        print(f"{blue('->')} {bold('Analyzing')} {cyan(fmt_num(total_rules_to_process))} {bold('rules...')}")
         pbar = tqdm(total=total_rules_to_process, 
-                   desc=f"{magenta('⚡')} Processing rules",
+                   desc=f"{magenta('->')} Processing rules",
                    unit=" rules",
                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
     
@@ -316,9 +245,9 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     
     # Extract top N rules using heap (O(n log k) instead of O(n log n))
     if show_progress:
-        print(f"{blue('📈')} {bold('Sorting and extracting top rules...')}")
+        print(f"{blue('->')} {bold('Sorting and extracting top rules...')}")
         sort_pbar = tqdm(total=total_rules, 
-                        desc=f"{yellow('🏆')} Sorting",
+                        desc=f"{yellow('->')} Sorting",
                         unit=" rules",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
     
@@ -342,7 +271,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
         # Get indices of top rules
         top_indices = [idx for _, idx in heap]
         if show_progress:
-            print(f"{blue('📋')} {bold('Extracting top rules...')}")
+            print(f"{blue('->')} {bold('Extracting top rules...')}")
         
         top_indices.sort(key=lambda x: all_combined_scores[x], reverse=True)
         
@@ -365,7 +294,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
         if show_progress:
             sort_pbar.update(total_rules)
             sort_pbar.close()
-            print(f"{blue('📋')} {bold('Extracting sorted rules...')}")
+            print(f"{blue('->')} {bold('Extracting sorted rules...')}")
         
         top_rules = []
         for rank, idx in enumerate(indices, 1):
@@ -381,7 +310,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     
     # Prepare occurrence data for output
     if show_progress:
-        print(f"{blue('📊')} {bold('Preparing statistics...')}")
+        print(f"{blue('->')} {bold('Preparing statistics...')}")
     
     detailed_occurrences = {}
     for rule, files in rule_file_occurrences.items():
@@ -394,7 +323,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
             }
     
     elapsed = time.time() - start_time
-    print(f"{green('⚡')} {bold('Analysis completed in:')} {cyan(f'{elapsed:.2f}s')} "
+    print(f"{green('Fast')} {bold('Analysis completed in:')} {cyan(f'{elapsed:.2f}s')} "
           f"{bold(f'({total_rules/max(elapsed, 0.001):.0f} rules/sec)')}")
     
     return {
@@ -414,7 +343,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
 def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[int] = None) -> bool:
     """Fast summary saving with buffered writes"""
     try:
-        print(f"{blue('💾')} {bold('Saving analysis summary to:')} {cyan(output_file)}")
+        print(f"{blue('Save')} {bold('Saving analysis summary to:')} {cyan(output_file)}")
         
         with open(output_file, 'w', encoding='utf-8') as f:
             # Write in chunks for efficiency
@@ -490,10 +419,10 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             flush_buffer()
             
             # Write top rules in chunks with progress
-            print(f"{blue('📝')} {bold('Writing')} {cyan(fmt_num(len(top_rules)))} {bold('top rules...')}")
+            print(f"{blue('Write')} {bold('Writing')} {cyan(fmt_num(len(top_rules)))} {bold('top rules...')}")
             chunk_size = 1000
             
-            with tqdm(total=len(top_rules), desc=f"{green('✍️')} Writing rules", unit=" rules") as pbar:
+            with tqdm(total=len(top_rules), desc=f"{green('Write')} Writing rules", unit=" rules") as pbar:
                 for i in range(0, len(top_rules), chunk_size):
                     chunk = top_rules[i:i + chunk_size]
                     for j, rule in enumerate(chunk, i + 1):
@@ -517,7 +446,7 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             
             # Limit detailed view to first 100 rules
             detailed_limit = min(100, len(top_rules))
-            with tqdm(total=detailed_limit, desc=f"{yellow('📋')} Writing details", unit=" rules") as pbar:
+            with tqdm(total=detailed_limit, desc=f"{yellow('Write')} Writing details", unit=" rules") as pbar:
                 for i in range(detailed_limit):
                     rule = top_rules[i]
                     buffer.append(f"#{i + 1}: {rule['cleaned_rule']}\n")
@@ -534,11 +463,11 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             
             flush_buffer()
         
-        print(f"{green('✅')} {bold('Analysis summary saved to:')} {cyan(output_file)}")
+        print(f"{green('OK')} {bold('Analysis summary saved to:')} {cyan(output_file)}")
         return True
         
     except Exception as e:
-        print(f"{red('❌')} {bold('Error saving summary:')} {e}")
+        print(f"{red('ERROR')} {bold('Error saving summary:')} {e}")
         return False
 
 def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optional[int] = None) -> bool:
@@ -549,7 +478,7 @@ def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optio
         else:
             rules_to_save = analysis_results['top_rules']
         
-        print(f"{blue('💾')} {bold('Saving')} {cyan(fmt_num(len(rules_to_save)))} {bold('clean Hashcat rules to:')} {cyan(output_file)}")
+        print(f"{blue('Save')} {bold('Saving')} {cyan(fmt_num(len(rules_to_save)))} {bold('clean Hashcat rules to:')} {cyan(output_file)}")
         
         # Track unique rules to avoid duplicates
         unique_rules = set()
@@ -562,7 +491,7 @@ def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optio
                 unique_rules.add(clean_rule)
                 clean_rules_list.append(clean_rule)
         
-        print(f"{green('🔍')} {bold('Unique clean rules:')} {cyan(fmt_num(len(clean_rules_list)))}")
+        print(f"{green('->')} {bold('Unique clean rules:')} {cyan(fmt_num(len(clean_rules_list)))}")
         
         with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
             # Write in chunks for speed
@@ -572,7 +501,7 @@ def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optio
             # IMPORTANT: Add the colon rule first (empty rule) as standard Hashcat practice
             buffer.append(":\n")
             
-            with tqdm(total=len(clean_rules_list), desc=f"{green('✍️')} Writing clean rules", unit=" rules") as pbar:
+            with tqdm(total=len(clean_rules_list), desc=f"{green('Write')} Writing clean rules", unit=" rules") as pbar:
                 for clean_rule in clean_rules_list:
                     buffer.append(f"{clean_rule}\n")
                     
@@ -586,12 +515,12 @@ def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optio
                 if buffer:
                     f.write(''.join(buffer))
         
-        print(f"{green('✅')} {bold('Clean Hashcat rules saved to:')} {cyan(output_file)}")
-        print(f"{yellow('💡')} {bold('Note:')} File starts with ':' (empty rule) as per Hashcat convention")
+        print(f"{green('OK')} {bold('Clean Hashcat rules saved to:')} {cyan(output_file)}")
+        print(f"{yellow('Info')} {bold('Note:')} File starts with ':' (empty rule) as per Hashcat convention")
         return True
         
     except Exception as e:
-        print(f"{red('❌')} {bold('Error saving clean rules:')} {e}")
+        print(f"{red('ERROR')} {bold('Error saving clean rules:')} {e}")
         return False
 
 def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, top_n: Optional[int] = None) -> bool:
@@ -602,7 +531,7 @@ def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, 
         else:
             rules_to_save = analysis_results['top_rules']
         
-        print(f"{blue('💾')} {bold('Saving')} {cyan(fmt_num(len(rules_to_save)))} {bold('rules with scores to:')} {cyan(output_file)}")
+        print(f"{blue('Save')} {bold('Saving')} {cyan(fmt_num(len(rules_to_save)))} {bold('rules with scores to:')} {cyan(output_file)}")
         
         with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
             # Write in chunks for speed
@@ -615,7 +544,7 @@ def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, 
             buffer.append("# Includes colon rule (empty rule) as first line\n")
             buffer.append("0:0:0::\n")  # Colon rule with zero scores
             
-            with tqdm(total=len(rules_to_save), desc=f"{green('✍️')} Writing rules with scores", unit=" rules") as pbar:
+            with tqdm(total=len(rules_to_save), desc=f"{green('Write')} Writing rules with scores", unit=" rules") as pbar:
                 for rule in rules_to_save:
                     buffer.append(f"{rule['combined_score']}:{rule['effectiveness_score']}:{rule['uniqueness_score']}:{rule['cleaned_rule']}\n")
                     
@@ -629,23 +558,23 @@ def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, 
                 if buffer:
                     f.write(''.join(buffer))
         
-        print(f"{green('✅')} {bold('Rules with scores saved to:')} {cyan(output_file)}")
+        print(f"{green('OK')} {bold('Rules with scores saved to:')} {cyan(output_file)}")
         return True
         
     except Exception as e:
-        print(f"{red('❌')} {bold('Error saving rules with scores:')} {e}")
+        print(f"{red('ERROR')} {bold('Error saving rules with scores:')} {e}")
         return False
 
 def print_summary_to_console_fast(analysis_results: Dict, top_n: int = 20) -> None:
     """Fast console printing with minimal formatting overhead"""
     print(f"\n{green('=' * 80)}")
-    print(f"{bold('📊 RULE ANALYSIS SUMMARY')}")
+    print(f"{bold('RULE ANALYSIS SUMMARY')}")
     print(f"{green('=' * 80)}{Colors.END}")
     
     # Extract values
     stats = analysis_results
     
-    # Statistics - FIXED: Use separate variables or format differently
+    # Statistics
     total_rules_fmt = f"{stats['total_rules']:,}"
     unique_rules_fmt = f"{stats['unique_rules']:,}"
     common_rules_fmt = f"{len(stats['common_rules']):,}"
@@ -657,26 +586,26 @@ def print_summary_to_console_fast(analysis_results: Dict, top_n: int = 20) -> No
     avg_uniqueness_fmt = f"{stats['avg_uniqueness_score']:,.2f}"
     processing_time_fmt = f"{stats.get('processing_time', 0):.2f}"
     
-    print(f"{blue('📈')} {bold('Overall Statistics:')}")
+    print(f"{blue('->')} {bold('Overall Statistics:')}")
     print(f"  {bold('Total Rules:')} {cyan(total_rules_fmt)}")
     print(f"  {bold('Unique Rules:')} {cyan(unique_rules_fmt)}")
     print(f"  {bold('Rules in Multiple Files:')} {cyan(common_rules_fmt)}")
     print(f"  {bold('Processing Time:')} {cyan(processing_time_fmt)}s")
     
     # Scores
-    print(f"\n{blue('🏆')} {bold('Total Scores:')}")
+    print(f"\n{blue('->')} {bold('Total Scores:')}")
     print(f"  {bold('Combined:')} {cyan(total_combined_fmt)}")
     print(f"  {bold('Effectiveness:')} {cyan(total_effectiveness_fmt)}")
     print(f"  {bold('Uniqueness:')} {cyan(total_uniqueness_fmt)}")
     
-    print(f"\n{blue('📊')} {bold('Average Scores:')}")
+    print(f"\n{blue('->')} {bold('Average Scores:')}")
     print(f"  {bold('Combined:')} {cyan(avg_combined_fmt)}")
     print(f"  {bold('Effectiveness:')} {cyan(avg_effectiveness_fmt)}")
     print(f"  {bold('Uniqueness:')} {cyan(avg_uniqueness_fmt)}")
     
     # Common rules (top 5 only for console)
     if stats['common_rules']:
-        print(f"\n{yellow('🔄')} {bold('Top Common Rules:')}")
+        print(f"\n{yellow('->')} {bold('Top Common Rules:')}")
         common_items = sorted(
             stats['common_rules'].items(),
             key=lambda x: x[1]['count'],
@@ -691,7 +620,7 @@ def print_summary_to_console_fast(analysis_results: Dict, top_n: int = 20) -> No
     # Top rules
     if top_n > 0:
         top_rules = stats['top_rules'][:top_n]
-        print(f"\n{green('🏅')} {bold(f'Top {len(top_rules)} Rules:')}")
+        print(f"\n{green('->')} {bold(f'Top {len(top_rules)} Rules:')}")
         print(f"{'Rank':>5} {'Combined':>12} {'Rule':<60}")
         print(f"{'-' * 80}")
         
@@ -780,7 +709,7 @@ Examples:
     args = parser.parse_args()
     
     print(f"{green('=' * 70)}")
-    print(f"{bold('⚡ FAST RULE SCORING ANALYSIS TOOL')}")
+    print(f"{bold('FAST RULE SCORING ANALYSIS TOOL')}")
     print(f"{green('=' * 70)}{Colors.END}")
     
     start_time = time.time()
@@ -789,7 +718,7 @@ Examples:
     all_rules_data = []
     
     if args.parallel and len(args.input) > 1:
-        print(f"{blue('🔄')} {bold('Using parallel processing...')}")
+        print(f"{blue('Parallel')} {bold('Using parallel processing...')}")
         
         # Determine optimal worker count
         cpu_count = multiprocessing.cpu_count()
@@ -809,9 +738,9 @@ Examples:
                     rules_data = future.result()
                     if rules_data:
                         all_rules_data.append(rules_data)
-                        print(f"{green('✅')} {bold('Completed:')} {filepath}")
+                        print(f"{green('OK')} {bold('Completed:')} {filepath}")
                 except Exception as e:
-                    print(f"{red('❌')} {bold('Error processing')} {filepath}: {e}")
+                    print(f"{red('ERROR')} {bold('Error processing')} {filepath}: {e}")
     else:
         # Sequential processing with progress
         for input_file in args.input:
@@ -820,15 +749,15 @@ Examples:
                 all_rules_data.append(rules_data)
     
     if not all_rules_data:
-        print(f"{red('❌')} {bold('No valid rule data found!')}")
+        print(f"{red('ERROR')} {bold('No valid rule data found!')}")
         return
     
     total_files_time = time.time() - start_time
     total_files_time_fmt = f"{total_files_time:.2f}"
-    print(f"\n{green('📦')} {bold('Files processed in:')} {cyan(total_files_time_fmt)}s")
+    print(f"\n{green('Files')} {bold('Files processed in:')} {cyan(total_files_time_fmt)}s")
     
     # Analyze the data
-    print(f"\n{blue('📊')} {bold('Analyzing rule data...')}")
+    print(f"\n{blue('->')} {bold('Analyzing rule data...')}")
     analysis_start = time.time()
     analysis_results = analyze_rules_fast(all_rules_data, args.top, not args.no_progress)
     analysis_time = time.time() - analysis_start
@@ -862,7 +791,7 @@ Examples:
         print_summary_to_console_fast(analysis_results, args.console_top)
         
         # Show timing summary
-        print(f"\n{blue('⏱️')} {bold('Performance Summary:')}")
+        print(f"\n{blue('Time')} {bold('Performance Summary:')}")
         print(f"  {bold('File Loading:')} {cyan(f'{total_files_time:.2f}s')}")
         print(f"  {bold('Analysis:')} {cyan(f'{analysis_time:.2f}s')}")
         if 'save_time' in analysis_results:
@@ -883,8 +812,8 @@ Examples:
         rules_per_sec_fmt = f"{rules_per_sec:,.0f}"
         print(f"  {bold('Rules/sec:')} {cyan(rules_per_sec_fmt)}")
     
-    print(f"\n{green('✅')} {bold('Analysis complete!')}")
-    print(f"{yellow('📁')} {bold('Output files created:')}")
+    print(f"\n{green('OK')} {bold('Analysis complete!')}")
+    print(f"{yellow('Output')} {bold('Output files created:')}")
     if args.output and not args.rules_only:
         print(f"  • Analysis summary: {cyan(args.output)}")
     if args.rules_output:
