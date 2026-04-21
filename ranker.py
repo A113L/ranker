@@ -2158,9 +2158,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     print(f"{blue('Total Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
     print(f"{blue('Execution Time:')} {cyan(f'{end_time - start_time:.2f} s')}")
     print(f"\n{blue('Early Elimination Summary:')}")
-    print(f"   {blue('Original rules:')} {cyan(f'{final_stats["total_rules"]:,}')}")
-    print(f"   {blue('Surviving rules:')} {cyan(f'{final_stats["active_rules"]:,}')}")
-    print(f"   {blue('Eliminated rules:')} {cyan(f'{final_stats["eliminated_rules"]:,}')} ({final_stats['eliminated_percentage']:.1f}%)")
+    print("   " + blue('Original rules:') + " " + cyan("{:,}".format(final_stats['total_rules'])))
+    print("   " + blue('Surviving rules:') + " " + cyan("{:,}".format(final_stats['active_rules'])))
+    print("   " + blue('Eliminated rules:') + " " + cyan("{:,}".format(final_stats['eliminated_rules'])) + " ({:.1f}%)".format(final_stats['eliminated_percentage']))
     print(f"\n{blue('Top 10 Surviving Rules:')}")
     for i, r in enumerate(top_rules[:10], 1):
         print(f"   {blue(f'{i:2}.')} {cyan(r['rule_data']):30} success={r['success_probability']:.6f} trials={r['trials']:,}")
