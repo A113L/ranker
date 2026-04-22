@@ -208,18 +208,11 @@ def estimate_word_count(path):
         return 1000000
 
 def fast_fnv1a_hash_32(data):
-    """Optimized FNV-1a hash for bytes"""
-    if isinstance(data, np.ndarray):
-        hash_val = np.uint32(2166136261)
-        for byte in data:
-            hash_val ^= np.uint32(byte)
-            hash_val *= np.uint32(16777619)
-        return hash_val
-    else:
-        hash_val = 2166136261
-        for byte in data:
-            hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
-        return hash_val
+    """Optimized FNV-1a hash for bytes - pure integer arithmetic (no numpy overhead)"""
+    hash_val = 2166136261
+    for byte in data:
+        hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
+    return hash_val
 
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     """Memory‑mapped iterator over words, returning batches of words and hashes"""
@@ -1463,9 +1456,13 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
     total_word_batches = len(word_batches)
     print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
 
-    # Pre‑encode all rules into fixed‑length byte arrays
+    # Pre‑encode all rules into a single contiguous 2D array (total_rules × MAX_RULE_LEN).
+    # A 2D ndarray allows filling rules_batch_np with one slice instead of a Python for-loop.
     print(f"{blue('Encoding rules...')}")
-    encoded_rules = [encode_rule_fixed(rule['rule_data'], rule['rule_id']) for rule in rules_list]
+    encoded_rules_2d = np.zeros((total_rules, MAX_RULE_LEN), dtype=np.uint8)
+    for i, rule in enumerate(rules_list):
+        rb = rule['rule_data'].encode('latin-1')
+        encoded_rules_2d[i, :len(rb)] = np.frombuffer(rb, dtype=np.uint8)
 
     # Split rules into batches
     rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
@@ -1492,6 +1489,10 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         cracked_hash_map_g = cl.Buffer(context, mf.READ_ONLY, cracked_map_bytes)
         rule_uniqueness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
         rule_effectiveness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
+        # Pre-allocated reusable buffers – avoids per-iteration allocations inside the hot loop
+        indices_np    = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+        indices_g     = cl.Buffer(context, mf.READ_ONLY, counters_size)
+        rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
         if cracked_hashes_np.size > 0:
             cracked_temp_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_hashes_np)
     except cl.MemoryError:
@@ -1542,46 +1543,42 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
                 break
 
             end_idx = min(start_idx + MAX_RULES_IN_BATCH, total_rules)
-            batch_rules = encoded_rules[start_idx:end_idx]
-            num_rules = len(batch_rules)
+            num_rules = end_idx - start_idx
             if num_rules == 0:
                 continue
 
-            # Prepare rules buffer
-            rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-            for i, rule_arr in enumerate(batch_rules):
-                rules_batch_np[i] = rule_arr
+            # Fill rules buffer via 2D slice – no Python for-loop, no per-iteration np.zeros
+            rules_batch_np[:num_rules]  = encoded_rules_2d[start_idx:end_idx]
+            rules_batch_np[num_rules:] = 0   # zero-pad remaining slots
 
             cl.enqueue_copy(queue, rules_g, rules_batch_np).wait()
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_g, np.uint32(0), 0, counters_size)
+            cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size)
             cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size)
 
-            global_size = (num_words * num_rules,)
-            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            # Upload indices via pre-allocated buffer (no new cl.Buffer each iteration)
+            indices_np[:num_rules] = np.arange(num_rules, dtype=np.uint32)
+            cl.enqueue_copy(queue, indices_g, indices_np).wait()
 
+            global_size_aligned = (int(math.ceil(num_words * num_rules / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
             kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
                          base_words_g, rules_g,
-                         cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                   hostbuf=np.arange(num_rules, dtype=np.uint32)),
+                         indices_g,
                          global_hash_map_g, cracked_hash_map_g,
                          rule_uniqueness_g, rule_effectiveness_g,
                          np.uint32(num_words), np.uint32(num_rules),
                          np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
 
-            cl.enqueue_copy(queue, mapped_uniqueness, rule_uniqueness_g).wait()
+            cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
             cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
 
-            # Update rule scores
-            batch_unique = 0
-            batch_cracked = 0
+            # Vectorised batch totals; per-rule dict update still requires a loop
+            u_arr = mapped_uniqueness[:num_rules].astype(np.int64)
+            e_arr = mapped_effectiveness[:num_rules].astype(np.int64)
             for i in range(num_rules):
-                rule = rules_list[start_idx + i]
-                u = int(mapped_uniqueness[i])
-                e = int(mapped_effectiveness[i])
-                rule['uniqueness_score'] += u
-                rule['effectiveness_score'] += e
-                batch_unique += u
-                batch_cracked += e
+                rules_list[start_idx + i]['uniqueness_score']   += int(u_arr[i])
+                rules_list[start_idx + i]['effectiveness_score'] += int(e_arr[i])
+            batch_unique  = int(np.sum(u_arr))
+            batch_cracked = int(np.sum(e_arr))
 
             total_unique_found += batch_unique
             total_cracked_found += batch_cracked
@@ -1623,7 +1620,16 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
 # --- MULTI‑PASS MAB WITH EARLY ELIMINATION (v4.0) ---
 # ====================================================================
 class MultiPassMAB:
-    """Multi-Armed Bandit with early elimination for large rule sets"""
+    """Multi-Armed Bandit with early elimination for large rule sets.
+
+    Optimised v5.1 – all hot paths are vectorised with NumPy:
+      • select_rules  : single np.random.beta call over the full candidate array
+      • update        : numpy advanced indexing instead of Python for-loop
+      • _eliminate    : boolean-mask operations, no Python per-rule loops
+      • get_statistics: np.sum instead of generator expressions
+      • active_rules  : cached numpy array rebuilt only on change (_active_dirty flag)
+    """
+
     def __init__(self, rules_list, exploration_factor=2.0, final_trials=50,
                  screening_trials=5, zero_success_elimination=True,
                  batch_size_words=150000):
@@ -1640,10 +1646,10 @@ class MultiPassMAB:
         self.zero_success_elimination = zero_success_elimination
         self.batch_size_words = batch_size_words
         self.elimination_thresholds = {
-            'phase1': {'min_trials': 5, 'min_success_rate': 0.0000001, 'eliminate_zero': True},
-            'phase2': {'min_trials': 20, 'min_success_rate': 0.000001, 'eliminate_zero': True},
-            'phase3': {'min_trials': 50, 'min_success_rate': 0.00001, 'eliminate_zero': True},
-            'phase4': {'min_trials': 100, 'min_success_rate': 0.0001, 'eliminate_zero': True},
+            'phase1': {'min_trials': 5,   'min_success_rate': 0.0000001},
+            'phase2': {'min_trials': 20,  'min_success_rate': 0.000001},
+            'phase3': {'min_trials': 50,  'min_success_rate': 0.00001},
+            'phase4': {'min_trials': 100, 'min_success_rate': 0.0001},
         }
         self.selection_count = np.zeros(self.num_rules, dtype=np.uint32)
         self.last_selected_iteration = np.zeros(self.num_rules, dtype=np.uint32)
@@ -1664,159 +1670,244 @@ class MultiPassMAB:
         self.tested_rules_count = 0
         self.batch_zero_streaks = np.zeros(self.num_rules, dtype=np.uint32)
 
+        # --- cache for active-rules numpy array ---
+        self._active_array = np.arange(self.num_rules, dtype=np.int32)
+        self._active_dirty = False   # starts clean because all rules are active
+
         print(f"{green('MAB INIT')}: Multi-Pass MAB with Early Elimination - {cyan(f'{self.num_rules:,}')} rules")
         print(f"{blue('MAB CONFIG')}: screening_trials={screening_trials}, final_trials={final_trials}, zero_elim={zero_success_elimination}")
 
+    # ------------------------------------------------------------------
+    # Internal helper: return (and cache) a numpy array of active rule ids
+    # ------------------------------------------------------------------
+    def _get_active_array(self) -> np.ndarray:
+        if self._active_dirty:
+            self._active_array = np.fromiter(self.active_rules, dtype=np.int32,
+                                             count=len(self.active_rules))
+            self._active_dirty = False
+        return self._active_array
+
+    # ------------------------------------------------------------------
+    # Rule selection – fully vectorised Thompson sampling
+    # ------------------------------------------------------------------
     def select_rules(self, batch_size, iteration=0):
         self.current_iteration = iteration
-        # Collect rules that need more screening trials
-        rules_needing_trials = [idx for idx in self.active_rules if self.trials[idx] < self.screening_trials]
-        # Sort by trials ascending, then by selection count descending (using int to avoid overflow)
-        rules_needing_trials.sort(key=lambda x: (int(self.trials[x]), -int(self.selection_count[x])))
+        active_arr = self._get_active_array()
 
-        selected = []
-        if rules_needing_trials:
-            num_to_take = min(batch_size, len(rules_needing_trials))
-            selected = rules_needing_trials[:num_to_take]
+        # ---- phase 1: fill with rules that still need screening ----
+        trials_active = self.trials[active_arr]
+        needs_mask = trials_active < self.screening_trials
+        needs_arr = active_arr[needs_mask]
 
-        remaining = batch_size - len(selected)
-        if remaining > 0 and self.active_rules:
-            available = list(self.active_rules - set(selected))
-            if available:
-                scores = []
-                for idx in available:
-                    trials_needed = max(0, self.final_trials - self.trials[idx])
-                    trials_score = trials_needed / self.final_trials
-                    alpha = self.successes[idx]
-                    beta = self.failures[idx]
-                    thompson_score = np.random.beta(alpha, beta)
-                    zero_penalty = -0.5 if (self.trials[idx] >= self.screening_trials and self.successes[idx] <= 1) else 0.0
-                    combined = trials_score * 10.0 + thompson_score * self.exploration_factor + zero_penalty
-                    scores.append((idx, combined))
-                scores.sort(key=lambda x: x[1], reverse=True)
-                additional = min(remaining, len(scores))
-                selected.extend([idx for idx, _ in scores[:additional]])
+        if len(needs_arr) > 0:
+            # Sort by (trials asc, selection_count desc) using a composite key
+            sort_key = (self.trials[needs_arr].astype(np.int64) << 32
+                        - self.selection_count[needs_arr].astype(np.int64))
+            needs_arr = needs_arr[np.argsort(sort_key, kind='stable')]
+
+        num_from_screening = min(batch_size, len(needs_arr))
+        selected_arr = needs_arr[:num_from_screening].copy()
+
+        # ---- phase 2: Thompson-sampling for remaining slots ----
+        remaining = batch_size - num_from_screening
+        if remaining > 0 and len(active_arr) > num_from_screening:
+            # Exclude already-selected indices
+            selected_set = set(selected_arr.tolist())
+            avail_mask = np.array([idx not in selected_set for idx in active_arr], dtype=bool)
+            available = active_arr[avail_mask]
+
+            if len(available) > 0:
+                alpha = self.successes[available]          # shape (n,)
+                beta_v = self.failures[available]          # shape (n,)
+
+                # Single vectorised call – the key optimisation vs original
+                thompson = np.random.beta(alpha, beta_v)
+
+                trials_needed = np.maximum(0, self.final_trials - self.trials[available]).astype(np.float32)
+                trials_score = trials_needed / max(self.final_trials, 1)
+
+                zero_pen = np.where(
+                    (self.trials[available] >= self.screening_trials) & (self.successes[available] <= 1.0),
+                    np.float32(-0.5), np.float32(0.0)
+                )
+
+                combined = trials_score * 10.0 + thompson * self.exploration_factor + zero_pen
+
+                num_add = min(remaining, len(available))
+                if num_add < len(available):
+                    top_local = np.argpartition(-combined, num_add - 1)[:num_add]
+                    top_local = top_local[np.argsort(-combined[top_local])]
+                else:
+                    top_local = np.argsort(-combined)
+                selected_arr = np.concatenate([selected_arr, available[top_local]])
+
+        selected = selected_arr.tolist()
+
+        # ---- vectorised state update ----
+        if len(selected_arr) > 0:
+            self.trials[selected_arr] += 1
+            self.selection_count[selected_arr] += 1
+            self.last_selected_iteration[selected_arr] = self.current_iteration
 
         self.total_selections += 1
-        for idx in selected:
-            self.trials[idx] += 1
-            self.selection_count[idx] += 1
-            self.last_selected_iteration[idx] = self.current_iteration
-            if idx not in self.tested_rules:
-                self.tested_rules.add(idx)
-                self.tested_rules_count = len(self.tested_rules)
+
+        new_tested = set(selected) - self.tested_rules
+        if new_tested:
+            self.tested_rules.update(new_tested)
+            self.tested_rules_count = len(self.tested_rules)
 
         self.last_selected_batch = selected
         return selected
 
+    # ------------------------------------------------------------------
+    # Bandit update – vectorised numpy advanced indexing
+    # ------------------------------------------------------------------
     def update(self, selected_indices, successes_array, words_tested):
         self.total_updates += 1
-        for idx, succ in zip(selected_indices, successes_array):
-            if idx >= len(self.successes) or idx not in self.active_rules:
-                continue
-            succ = max(0, succ)
-            fail = max(0, words_tested - succ)
-            if succ == 0:
-                self.batch_zero_streaks[idx] += 1
-            else:
-                self.batch_zero_streaks[idx] = 0
-            self.words_processed[idx] += words_tested
-            # Scale down for huge counts
-            if words_tested > 1000000:
-                scale = 1000000.0 / words_tested
-                succ = int(succ * scale)
-                fail = int(fail * scale)
-            self.successes[idx] += succ
-            self.failures[idx] += fail
-            if self.successes[idx] <= 1.0:
-                self.zero_success_count[idx] += 1
+
+        sel = np.asarray(selected_indices, dtype=np.int32)
+        if len(sel) == 0:
+            self._eliminate_low_performers()
+            self.exploration_factor *= 0.9999
+            return
+
+        n = len(sel)
+        succ_raw = np.maximum(0, np.asarray(successes_array[:n], dtype=np.float32))
+        fail_raw = np.maximum(0, words_tested - succ_raw)
+
+        # Filter to active rules only (vectorised membership test via cached array)
+        active_arr = self._get_active_array()
+        active_set_arr = np.zeros(self.num_rules, dtype=bool)
+        active_set_arr[active_arr] = True
+        valid_mask = active_set_arr[sel]
+        valid = sel[valid_mask]
+        succ_v = succ_raw[valid_mask]
+        fail_v = fail_raw[valid_mask]
+
+        if len(valid) == 0:
+            self._eliminate_low_performers()
+            self.exploration_factor *= 0.9999
+            return
+
+        # Scale down for very large batches
+        if words_tested > 1_000_000:
+            scale = np.float32(1_000_000.0 / words_tested)
+            succ_v = succ_v * scale
+            fail_v = fail_v * scale
+
+        # Core updates – all vectorised
+        self.successes[valid] += succ_v
+        self.failures[valid] += fail_v
+        self.words_processed[valid] += words_tested
+
+        # Zero-streak tracking
+        zero_mask = succ_v == 0
+        if np.any(zero_mask):
+            self.batch_zero_streaks[valid[zero_mask]] += 1
+        if np.any(~zero_mask):
+            self.batch_zero_streaks[valid[~zero_mask]] = 0
+
+        # zero_success_count
+        zs_mask = self.successes[valid] <= 1.0
+        if np.any(zs_mask):
+            self.zero_success_count[valid[zs_mask]] += 1
+
         self._eliminate_low_performers()
         self.exploration_factor *= 0.9999
 
+    # ------------------------------------------------------------------
+    # Elimination – fully vectorised boolean-mask approach
+    # ------------------------------------------------------------------
     def _eliminate_low_performers(self):
         if len(self.active_rules) < 100:
             return
-        active = list(self.active_rules)
-        to_eliminate = set()
 
-        # Strategy 1: zero successes after screening trials
+        active_arr = self._get_active_array()
+        n = len(active_arr)
+        to_elim = np.zeros(n, dtype=bool)
+
+        trials_a = self.trials[active_arr]
+        succ_a  = self.successes[active_arr] - 1.0
+        fail_a  = self.failures[active_arr]  - 1.0
+        total_a = succ_a + fail_a
+        # Guard against division by zero
+        rate_a = np.where(total_a > 0, succ_a / np.maximum(total_a, 1e-10), np.float32(0.0))
+
+        # Strategy 1 – zero successes after screening
         if self.zero_success_elimination:
-            for idx in active:
-                if self.trials[idx] >= self.screening_trials and (self.successes[idx] - 1) <= 0:
-                    to_eliminate.add(idx)
-                    self.elimination_stats['zero_success'] += 1
+            s1 = (trials_a >= self.screening_trials) & (succ_a <= 0.0)
+            self.elimination_stats['zero_success'] += int(np.sum(s1 & ~to_elim))
+            to_elim |= s1
 
-        # Strategy 2: phase thresholds
-        for idx in active:
-            if idx in to_eliminate:
-                continue
-            trials_done = self.trials[idx]
-            total_succ = self.successes[idx] - 1
-            total_fail = self.failures[idx] - 1
-            total_tested = total_succ + total_fail
-            if total_tested > 0:
-                rate = total_succ / total_tested
-                for phase, cfg in self.elimination_thresholds.items():
-                    if trials_done >= cfg['min_trials'] and rate < cfg['min_success_rate']:
-                        to_eliminate.add(idx)
-                        self.elimination_stats['low_success_rate'] += 1
-                        break
+        # Strategy 2 – phase-based success-rate thresholds
+        for cfg in self.elimination_thresholds.values():
+            s2 = ((trials_a >= cfg['min_trials'])
+                  & (total_a > 0)
+                  & (rate_a < cfg['min_success_rate'])
+                  & ~to_elim)
+            self.elimination_stats['low_success_rate'] += int(np.sum(s2))
+            to_elim |= s2
 
-        # Strategy 3: far worse than top performers
+        # Strategy 3 – far worse than top-100 average (every 25 updates)
         if len(self.active_rules) > 500 and self.total_updates % 25 == 0:
-            valid = []
-            for idx in active:
-                if idx not in to_eliminate and self.trials[idx] >= self.screening_trials:
-                    total_succ = self.successes[idx] - 1
-                    total_fail = self.failures[idx] - 1
-                    total_tested = total_succ + total_fail
-                    if total_tested > 0:
-                        rate = total_succ / total_tested
-                        valid.append((idx, rate))
-            if len(valid) >= 100:
-                valid.sort(key=lambda x: x[1], reverse=True)
-                top_100_avg = np.mean([r for _, r in valid[:100]])
-                threshold = top_100_avg / 1000
-                for idx, rate in valid:
-                    if rate < threshold and idx not in to_eliminate:
-                        to_eliminate.add(idx)
-                        self.elimination_stats['worse_than_threshold'] += 1
+            sufficient = (~to_elim) & (trials_a >= self.screening_trials) & (total_a > 0)
+            n_suf = int(np.sum(sufficient))
+            if n_suf >= 100:
+                rates_v = rate_a[sufficient]
+                # np.partition is O(n) – much faster than full sort
+                k = min(100, n_suf) - 1
+                top_100_avg = float(np.mean(np.partition(rates_v, -k)[-k:]))
+                threshold = top_100_avg / 1000.0
+                s3 = np.zeros(n, dtype=bool)
+                s3[sufficient] = rates_v < threshold
+                s3 &= ~to_elim
+                self.elimination_stats['worse_than_threshold'] += int(np.sum(s3))
+                to_elim |= s3
 
-        # Strategy 4: consecutive zero batches
+        # Strategy 4 – consecutive zero batches
         if self.zero_success_elimination:
-            for idx in active:
-                if idx not in to_eliminate and self.trials[idx] >= self.screening_trials and self.batch_zero_streaks[idx] >= 3:
-                    to_eliminate.add(idx)
-                    self.elimination_stats['zero_success'] += 1
+            s4 = ((~to_elim)
+                  & (trials_a >= self.screening_trials)
+                  & (self.batch_zero_streaks[active_arr] >= 3))
+            self.elimination_stats['zero_success'] += int(np.sum(s4))
+            to_elim |= s4
 
-        if to_eliminate:
-            max_eliminate = min(5000, len(to_eliminate))
-            elim_list = list(to_eliminate)[:max_eliminate]
-            for idx in elim_list:
-                if idx in self.active_rules:
-                    self.eliminated_rules.add(idx)
-                    self.active_rules.remove(idx)
-                    if idx in self.tested_rules:
-                        self.tested_rules.remove(idx)
-                        self.tested_rules_count = len(self.tested_rules)
-            self.elimination_stats['total_eliminated'] += len(elim_list)
-            if len(elim_list) >= 1000:
-                print(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{len(elim_list):,}')} rules, active now {cyan(f'{len(self.active_rules):,}')}")
+        if not np.any(to_elim):
+            return
+
+        elim_arr = active_arr[to_elim]
+        max_eliminate = min(5000, len(elim_arr))
+        elim_arr = elim_arr[:max_eliminate]
+        elim_set = set(elim_arr.tolist())
+
+        self.eliminated_rules.update(elim_set)
+        self.active_rules -= elim_set
+        self.tested_rules -= elim_set
+        self.tested_rules_count = len(self.tested_rules)
+        self._active_dirty = True   # cache must be rebuilt
+
+        cnt = len(elim_arr)
+        self.elimination_stats['total_eliminated'] += cnt
+        if cnt >= 1000:
+            print(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{cnt:,}')} rules, "
+                  f"active now {cyan(f'{len(self.active_rules):,}')}")
 
     def get_statistics(self):
-        active = list(self.active_rules)
-        if active:
-            avg_trials = np.mean(self.trials[active])
-            avg_words = np.mean(self.words_processed[active])
-            total_succ = self.successes[active] - 1
-            total_fail = self.failures[active] - 1
-            total_tested = total_succ + total_fail
-            mask = total_tested > 0
-            avg_rate = np.mean(total_succ[mask] / total_tested[mask]) if np.any(mask) else 0.0
-            need_screening = sum(1 for i in active if self.trials[i] < self.screening_trials)
-            need_final = sum(1 for i in active if self.trials[i] < self.final_trials)
+        active_arr = self._get_active_array()
+        if len(active_arr) > 0:
+            trials_a = self.trials[active_arr]
+            avg_trials = float(np.mean(trials_a))
+            avg_words  = float(np.mean(self.words_processed[active_arr]))
+            succ_a  = self.successes[active_arr] - 1.0
+            fail_a  = self.failures[active_arr]  - 1.0
+            total_a = succ_a + fail_a
+            mask = total_a > 0
+            avg_rate = float(np.mean(succ_a[mask] / total_a[mask])) if np.any(mask) else 0.0
+            need_screening = int(np.sum(trials_a < self.screening_trials))
+            need_final     = int(np.sum(trials_a < self.final_trials))
         else:
-            avg_trials = avg_words = avg_rate = need_screening = need_final = 0.0
+            avg_trials = avg_words = avg_rate = 0.0
+            need_screening = need_final = 0
         eliminated_pct = (len(self.eliminated_rules) / self.num_rules) * 100 if self.num_rules else 0.0
         return {
             'total_rules': self.num_rules,
@@ -1838,7 +1929,7 @@ class MultiPassMAB:
     def get_top_rules(self, n=100):
         if not self.active_rules:
             return []
-        active = np.array(list(self.active_rules))
+        active = self._get_active_array()
         total_succ = self.successes[active] - 1
         total_fail = self.failures[active] - 1
         total_tested = total_succ + total_fail
@@ -1979,6 +2070,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         cracked_hash_map_g = cl.Buffer(context, mf.READ_ONLY, cracked_map_bytes)
         rule_uniqueness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
         rule_effectiveness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
+        # Pre-allocated indices buffer – reused every iteration to avoid per-iteration cl.Buffer allocation
+        indices_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+        indices_g  = cl.Buffer(context, mf.READ_ONLY, counters_size)
         if cracked_hashes_np.size > 0:
             cracked_temp_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_hashes_np)
     except cl.MemoryError:
@@ -2017,15 +2111,15 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         if phase == "SCREENING":
             # Check if all active rules have reached screening_trials
             if rule_bandit.active_rules:
-                active_arr = np.array(list(rule_bandit.active_rules))
-                min_trials = np.min(rule_bandit.trials[active_arr])
+                active_arr = rule_bandit._get_active_array()
+                min_trials = int(np.min(rule_bandit.trials[active_arr]))
                 if min_trials >= screening_trials:
                     screening_complete = True
                     phase = "DEEP_TESTING"
-                    # Close screening progress bar and create new one for deep testing
                     screening_pbar.close()
-                    # Compute total deep testing iterations
-                    needed = sum(max(0, final_trials - rule_bandit.trials[i]) for i in rule_bandit.active_rules)
+                    # Vectorised: compute remaining trials needed for each survivor
+                    remaining_trials = np.maximum(0, final_trials - rule_bandit.trials[active_arr])
+                    needed = int(np.sum(remaining_trials))
                     if needed == 0:
                         deep_testing_complete = True
                         break
@@ -2056,59 +2150,56 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
             # Select rules to test in this iteration
             selected_indices = rule_bandit.select_rules(batch_size=MAX_RULES_IN_BATCH, iteration=iteration)
             if not selected_indices:
-                # Fallback: select rules with lowest trials
-                active_list = list(rule_bandit.active_rules)
-                if not active_list:
+                # Fallback: select rules with lowest trials (vectorised)
+                fallback_arr = rule_bandit._get_active_array()
+                if len(fallback_arr) == 0:
                     break
-                active_list.sort(key=lambda x: rule_bandit.trials[x])
-                selected_indices = active_list[:MAX_RULES_IN_BATCH]
+                order = np.argsort(rule_bandit.trials[fallback_arr])
+                selected_indices = fallback_arr[order[:MAX_RULES_IN_BATCH]].tolist()
             num_rules = len(selected_indices)
 
-            # Prepare rules buffer
+            # Prepare rules buffer – vectorised row copy into a pre-allocated array
             rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-            for i, idx in enumerate(selected_indices):
-                if i >= MAX_RULES_IN_BATCH:
-                    break
+            sel_slice = selected_indices[:num_rules]
+            for i, idx in enumerate(sel_slice):
                 rules_batch_np[i] = encoded_rules[idx]
 
             cl.enqueue_copy(queue, rules_g, rules_batch_np).wait()
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_g, np.uint32(0), 0, counters_size)
+            cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size)
             cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size)
 
+            # Upload rule indices via pre-allocated buffer (avoids creating a new cl.Buffer every iteration)
+            indices_np[:num_rules] = np.arange(num_rules, dtype=np.uint32)
+            cl.enqueue_copy(queue, indices_g, indices_np).wait()
+
             # Execute kernel
-            global_size = (num_words * num_rules,)
-            global_size_aligned = (int(math.ceil(global_size[0] / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            global_size_aligned = (int(math.ceil(num_words * num_rules / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
             kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
                          base_words_g, rules_g,
-                         cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                   hostbuf=np.arange(num_rules, dtype=np.uint32)),
+                         indices_g,
                          global_hash_map_g, cracked_hash_map_g,
                          rule_uniqueness_g, rule_effectiveness_g,
                          np.uint32(num_words), np.uint32(num_rules),
                          np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
 
             # Read back counts
-            cl.enqueue_copy(queue, mapped_uniqueness, rule_uniqueness_g).wait()
+            cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
             cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
 
             # Update MAB with the number of successes (effectiveness counts)
             rule_bandit.update(selected_indices, mapped_effectiveness[:num_rules], num_words)
 
-            # Update rule scores and totals
-            batch_unique = 0
-            batch_cracked = 0
-            for i, idx in enumerate(selected_indices):
-                if i >= num_rules:
-                    break
-                u = int(mapped_uniqueness[i])
-                e = int(mapped_effectiveness[i])
-                rule_bandit.all_rules[idx]['uniqueness_score'] += u
-                rule_bandit.all_rules[idx]['effectiveness_score'] += e
-                rule_bandit.all_rules[idx]['total_successes'] = rule_bandit.all_rules[idx].get('total_successes', 0) + e
-                rule_bandit.all_rules[idx]['total_trials'] = rule_bandit.all_rules[idx].get('total_trials', 0) + num_words
-                rule_bandit.all_rules[idx]['times_tested'] = rule_bandit.all_rules[idx].get('times_tested', 0) + 1
-                batch_unique += u
-                batch_cracked += e
+            # Vectorised score update – avoids Python loop for batch totals
+            u_arr = mapped_uniqueness[:num_rules].astype(np.int64)
+            e_arr = mapped_effectiveness[:num_rules].astype(np.int64)
+            for i, idx in enumerate(sel_slice):
+                rule_bandit.all_rules[idx]['uniqueness_score']  += int(u_arr[i])
+                rule_bandit.all_rules[idx]['effectiveness_score'] += int(e_arr[i])
+                rule_bandit.all_rules[idx]['total_successes'] = rule_bandit.all_rules[idx].get('total_successes', 0) + int(e_arr[i])
+                rule_bandit.all_rules[idx]['total_trials']    = rule_bandit.all_rules[idx].get('total_trials', 0)    + num_words
+                rule_bandit.all_rules[idx]['times_tested']    = rule_bandit.all_rules[idx].get('times_tested', 0)    + 1
+            batch_unique  = int(np.sum(u_arr))
+            batch_cracked = int(np.sum(e_arr))
 
             total_unique_found += batch_unique
             total_cracked_found += batch_cracked
@@ -2158,9 +2249,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     print(f"{blue('Total Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
     print(f"{blue('Execution Time:')} {cyan(f'{end_time - start_time:.2f} s')}")
     print(f"\n{blue('Early Elimination Summary:')}")
-    print("   " + blue('Original rules:') + " " + cyan("{:,}".format(final_stats['total_rules'])))
-    print("   " + blue('Surviving rules:') + " " + cyan("{:,}".format(final_stats['active_rules'])))
-    print("   " + blue('Eliminated rules:') + " " + cyan("{:,}".format(final_stats['eliminated_rules'])) + " ({:.1f}%)".format(final_stats['eliminated_percentage']))
+    print("   " + blue('Original rules:')  + " " + cyan(f"{final_stats['total_rules']:,}"))
+    print("   " + blue('Surviving rules:') + " " + cyan(f"{final_stats['active_rules']:,}"))
+    print("   " + blue('Eliminated rules:') + " " + cyan(f"{final_stats['eliminated_rules']:,}") + f" ({final_stats['eliminated_percentage']:.1f}%)")
     print(f"\n{blue('Top 10 Surviving Rules:')}")
     for i, r in enumerate(top_rules[:10], 1):
         print(f"   {blue(f'{i:2}.')} {cyan(r['rule_data']):30} success={r['success_probability']:.6f} trials={r['trials']:,}")
