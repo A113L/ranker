@@ -46,6 +46,12 @@ MIN_HASH_MAP_BITS = 28
 MEMORY_REDUCTION_FACTOR = 0.7
 MAX_ALLOCATION_RETRIES = 5
 
+# Maximum OpenCL work-items per kernel dispatch.
+# Keeping this at or below ~32 M prevents OUT_OF_RESOURCES / GPU watchdog
+# (TDR on Windows, DRM timeout on Linux) on large rule × word batches.
+# Lower this value (e.g. 8 * 1024 * 1024) if you still see crashes.
+MAX_DISPATCH_ITEMS = 32 * 1024 * 1024
+
 # Global variables for interrupt handling
 interrupted = False
 current_rules_list = None
@@ -2164,34 +2170,53 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
             for i, idx in enumerate(sel_slice):
                 rules_batch_np[i] = encoded_rules[idx]
 
-            cl.enqueue_copy(queue, rules_g, rules_batch_np).wait()
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size)
-            cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size)
+            # Split the rules batch into sub-dispatches to avoid OUT_OF_RESOURCES.
+            # A single dispatch of (num_words * num_rules) work-items can exceed the
+            # GPU driver's per-submission limit or trigger the watchdog timer (TDR/DRM)
+            # when both dimensions are large (e.g. 150k words × 1024 rules = 153M items).
+            # MAX_DISPATCH_ITEMS is set at the top of this file and can be lowered if needed.
+            rules_per_sub = max(1, min(MAX_RULES_IN_BATCH,
+                                       MAX_DISPATCH_ITEMS // max(num_words, 1)))
 
-            # Upload rule indices via pre-allocated buffer (avoids creating a new cl.Buffer every iteration)
-            indices_np[:num_rules] = np.arange(num_rules, dtype=np.uint32)
-            cl.enqueue_copy(queue, indices_g, indices_np).wait()
+            # Accumulators across sub-batches (indexed by position in sel_slice)
+            u_arr = np.zeros(num_rules, dtype=np.int64)
+            e_arr = np.zeros(num_rules, dtype=np.int64)
 
-            # Execute kernel
-            global_size_aligned = (int(math.ceil(num_words * num_rules / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-            kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
-                         base_words_g, rules_g,
-                         indices_g,
-                         global_hash_map_g, cracked_hash_map_g,
-                         rule_uniqueness_g, rule_effectiveness_g,
-                         np.uint32(num_words), np.uint32(num_rules),
-                         np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
+            for sub_start in range(0, num_rules, rules_per_sub):
+                sub_end = min(sub_start + rules_per_sub, num_rules)
+                sub_num = sub_end - sub_start
 
-            # Read back counts
-            cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
-            cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
+                # Upload this slice of the pre-built rules array
+                sub_rules_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
+                sub_rules_np[:sub_num] = rules_batch_np[sub_start:sub_end]
+                cl.enqueue_copy(queue, rules_g, sub_rules_np).wait()
+
+                # Zero counters for this sub-batch (wait() required before kernel launch)
+                cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size).wait()
+                cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size).wait()
+
+                # Map kernel slot 0..sub_num-1 to rule positions
+                indices_np[:sub_num] = np.arange(sub_num, dtype=np.uint32)
+                cl.enqueue_copy(queue, indices_g, indices_np).wait()
+
+                global_size_aligned = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE))
+                                       * LOCAL_WORK_SIZE,)
+                kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
+                              base_words_g, rules_g,
+                              indices_g,
+                              global_hash_map_g, cracked_hash_map_g,
+                              rule_uniqueness_g, rule_effectiveness_g,
+                              np.uint32(num_words), np.uint32(sub_num),
+                              np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
+
+                cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
+                cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
+
+                u_arr[sub_start:sub_end] = mapped_uniqueness[:sub_num].astype(np.int64)
+                e_arr[sub_start:sub_end] = mapped_effectiveness[:sub_num].astype(np.int64)
 
             # Update MAB with the number of successes (effectiveness counts)
-            rule_bandit.update(selected_indices, mapped_effectiveness[:num_rules], num_words)
-
-            # Vectorised score update – avoids Python loop for batch totals
-            u_arr = mapped_uniqueness[:num_rules].astype(np.int64)
-            e_arr = mapped_effectiveness[:num_rules].astype(np.int64)
+            rule_bandit.update(selected_indices, e_arr[:num_rules].astype(np.uint32), num_words)
             for i, idx in enumerate(sel_slice):
                 rule_bandit.all_rules[idx]['uniqueness_score']  += int(u_arr[i])
                 rule_bandit.all_rules[idx]['effectiveness_score'] += int(e_arr[i])
