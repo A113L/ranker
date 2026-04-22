@@ -385,14 +385,19 @@ def load_cracked_hashes(path, max_len):
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 pos = 0
                 file_size = len(mm)
-                while pos < file_size:
-                    end_pos = mm.find(b'\n', pos)
-                    if end_pos == -1:
-                        end_pos = file_size
-                    line = mm[pos:end_pos].strip()
-                    pos = end_pos + 1
-                    if 1 <= len(line) <= max_len:
-                        cracked_hashes.append(fast_fnv1a_hash_32(line))
+                with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
+                          desc=cyan('Cracked list'), colour='cyan',
+                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                    while pos < file_size:
+                        end_pos = mm.find(b'\n', pos)
+                        if end_pos == -1:
+                            end_pos = file_size
+                        line = mm[pos:end_pos].strip()
+                        advance = (end_pos + 1) - pos
+                        pos = end_pos + 1
+                        pbar.update(advance)
+                        if 1 <= len(line) <= max_len:
+                            cracked_hashes.append(fast_fnv1a_hash_32(line))
     except FileNotFoundError:
         print(f"{yellow('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
