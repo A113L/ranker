@@ -1900,8 +1900,8 @@ class MultiPassMAB:
         cnt = len(elim_arr)
         self.elimination_stats['total_eliminated'] += cnt
         if cnt >= 1000:
-            print(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{cnt:,}')} rules, "
-                  f"active now {cyan(f'{len(self.active_rules):,}')}")
+            tqdm.write(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{cnt:,}')} rules, "
+                       f"active now {cyan(f'{len(self.active_rules):,}')}")
 
     def get_statistics(self):
         active_arr = self._get_active_array()
@@ -2107,7 +2107,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
 
     # --- Progress bars: separate for screening and deep testing ---
-    total_screening_iters = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH))
+    # Each outer MAB iteration processes all word batches, and pbar.update(1) fires once
+    # per word-batch inside the inner loop – so multiply by total_word_batches.
+    total_screening_iters = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH)) * total_word_batches
     screening_pbar = tqdm(total=total_screening_iters, desc="SCREEN Phase", unit="iter",
                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                           position=0)
@@ -2134,7 +2136,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                     if needed == 0:
                         deep_testing_complete = True
                         break
-                    total_deep_iters = int(math.ceil(needed / MAX_RULES_IN_BATCH))
+                    total_deep_iters = int(math.ceil(needed / MAX_RULES_IN_BATCH)) * total_word_batches
                     deep_pbar = tqdm(total=total_deep_iters, desc="DEEP Phase", unit="iter",
                                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                                      position=0)
