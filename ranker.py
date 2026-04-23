@@ -2107,9 +2107,11 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
 
     # --- Progress bars: separate for screening and deep testing ---
-    # Each outer MAB iteration processes all word batches, and pbar.update(1) fires once
-    # per word-batch inside the inner loop – so multiply by total_word_batches.
-    total_screening_iters = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH)) * total_word_batches
+    # pbar.update(1) fires once per word-batch (inner loop).  The outer while-loop
+    # runs in full passes of total_word_batches, so actual updates = ceil(raw/wbs)*wbs.
+    _wbs = max(total_word_batches, 1)
+    _raw_screen = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH))
+    total_screening_iters = int(math.ceil(_raw_screen / _wbs)) * _wbs
     screening_pbar = tqdm(total=total_screening_iters, desc="SCREEN Phase", unit="iter",
                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                           position=0)
@@ -2136,7 +2138,8 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                     if needed == 0:
                         deep_testing_complete = True
                         break
-                    total_deep_iters = int(math.ceil(needed / MAX_RULES_IN_BATCH)) * total_word_batches
+                    _raw_deep = int(math.ceil(needed / MAX_RULES_IN_BATCH))
+                    total_deep_iters = int(math.ceil(_raw_deep / _wbs)) * _wbs
                     deep_pbar = tqdm(total=total_deep_iters, desc="DEEP Phase", unit="iter",
                                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                                      position=0)
