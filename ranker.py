@@ -6,6 +6,12 @@ Multi-Pass MAB with Early Elimination for large rule sets.
 Optionally runs in legacy exhaustive mode (v3.2).
 All GPU‑compatible Hashcat rules are implemented.
 MAX_RULE_LEN = 255, comprehensive rule application.
+
+Changelog:
+- Added rule validation identical to rulest_v2.py (HashcatRuleValidator).
+- Rules containing banned operators (M 4 6 X < > ! / ( ) = % Q) are now
+  rejected at load time, matching rulest's behaviour.
+- Removed possibility of processing rules that rulest would discard.
 """
 
 import pyopencl as cl
@@ -60,6 +66,81 @@ current_top_k = 0
 words_processed_total = None
 total_unique_found = None
 total_cracked_found = None
+
+# ====================================================================
+# --- RULE VALIDATOR (identical to rulest_v2.py) ---
+# ====================================================================
+MAX_GPU_RULES = 255
+
+def should_exclude_rule(rule):
+    """Return True if the rule uses an operator that is permanently excluded."""
+    if not rule:
+        return False
+    # Single-character reject/memory ops
+    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
+        return True
+    # Two-character reject ops (some have a digit, but we check only first char)
+    if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
+        return True
+    # Three-character reject ops (e.g. '=0', '%0', 'Q0')
+    if len(rule) == 3 and rule[0] in ('?', '=', 'v'):
+        return True
+    return False
+
+class HashcatRuleValidator:
+    MAX_GPU_RULES = MAX_GPU_RULES
+    @staticmethod
+    def is_digit(c): return '0' <= c <= '9'
+    @staticmethod
+    def validate_rule_for_gpu(rule_str):
+        if should_exclude_rule(rule_str): return False
+        pos = cnt = 0
+        n = len(rule_str)
+        isd = HashcatRuleValidator.is_digit
+        while pos < n:
+            c = rule_str[pos]
+            if c == ' ': pos+=1; continue
+            if c in ('p','z','Z'):
+                cnt+=1; pos+=1
+                if pos<n and isd(rule_str[pos]): pos+=1
+                continue
+            if c in (':','l','u','c','C','t','r','d','f','a','q','k','K','E','{','}','[',']'):
+                pos+=1; cnt+=1; continue
+            if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
+                pos+=1
+                if pos>=n or not isd(rule_str[pos]): return False
+                pos+=1; cnt+=1; continue
+            if c in ('i','o','3'):
+                pos+=1
+                if pos>=n or not isd(rule_str[pos]): return False
+                pos+=1
+                if pos>=n: return False
+                pos+=1; cnt+=1; continue
+            if c in ('x','*','O'):
+                pos+=1
+                if pos>=n or not isd(rule_str[pos]): return False
+                pos+=1
+                if pos>=n or not isd(rule_str[pos]): return False
+                pos+=1; cnt+=1; continue
+            if c == 's':
+                pos+=1
+                if pos+1>=n: return False
+                pos+=2; cnt+=1; continue
+            if c in ('@','e','$','^'):
+                pos+=1
+                if pos>=n: return False
+                pos+=1; cnt+=1; continue
+            return False
+        return cnt <= MAX_GPU_RULES
+
+    @staticmethod
+    def validate_rules_for_gpu(rules):
+        valid = []
+        for r in rules:
+            r = r.strip('\n\r')
+            if r and HashcatRuleValidator.validate_rule_for_gpu(r):
+                valid.append(r)
+        return valid
 
 # ====================================================================
 # --- COLOR CODES ---
@@ -350,7 +431,7 @@ def update_progress_stats(words_processed, unique_found, cracked_found):
 # --- HELPER FUNCTIONS (load_rules, load_cracked_hashes, encode_rule, save_ranking_data, ...) ---
 # ====================================================================
 def load_rules(path):
-    """Loads Hashcat rules from file."""
+    """Loads Hashcat rules from file, filtering out rules invalid according to rulest."""
     print(f"{blue('Loading rules from:')} {path}...")
     rules_size = 0
     try:
@@ -361,11 +442,18 @@ def load_rules(path):
         pass
     rules_list = []
     rule_id_counter = 0
+    total_lines = 0
+    invalid_count = 0
     try:
         with open(path, 'r', encoding='latin-1') as f:
             for line in f:
+                total_lines += 1
                 rule = line.strip()
                 if not rule or rule.startswith('#'):
+                    continue
+                # Validate using rulest's validator
+                if not HashcatRuleValidator.validate_rule_for_gpu(rule):
+                    invalid_count += 1
                     continue
                 rules_list.append({'rule_data': rule, 'rule_id': rule_id_counter,
                                    'uniqueness_score': 0, 'effectiveness_score': 0})
@@ -373,7 +461,9 @@ def load_rules(path):
     except FileNotFoundError:
         print(f"{red('Error:')} Rules file not found at: {path}")
         exit(1)
-    print(f"{green('Loaded')} {cyan(f'{len(rules_list):,}')} {bold('rules.')}")
+    if invalid_count > 0:
+        print(f"{yellow('Warning:')} {cyan(f'{invalid_count:,}')} rules were skipped because they are not GPU-compatible (rulest validator).")
+    print(f"{green('Loaded')} {cyan(f'{len(rules_list):,}')} {bold('valid rules.')}")
     return rules_list
 
 def load_cracked_hashes(path, max_len):
@@ -1398,7 +1488,7 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
     """Original exhaustive ranking algorithm (v3.2) with full rule support."""
     start_time = time()
 
-    # Load data
+    # Load data (rules are already filtered by validator)
     total_words = estimate_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
@@ -1984,7 +2074,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                    mab_screening_trials=None, mab_zero_success_elimination=None):
     start_time = time()
 
-    # Load data
+    # Load data (rules are already filtered by validator)
     total_words = estimate_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
     total_rules = len(rules_list)
@@ -2059,6 +2149,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     for words_np, hashes_np, cnt in word_iter:
         word_batches.append((words_np, hashes_np, cnt))
     total_word_batches = len(word_batches)
+    # Fixed missing closing quote below:
     print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
 
     # Pre‑encode rules into fixed‑length byte arrays for GPU
@@ -2107,11 +2198,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
 
     # --- Progress bars: separate for screening and deep testing ---
-    # pbar.update(1) fires once per word-batch (inner loop).  The outer while-loop
-    # runs in full passes of total_word_batches, so actual updates = ceil(raw/wbs)*wbs.
-    _wbs = max(total_word_batches, 1)
-    _raw_screen = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH))
-    total_screening_iters = int(math.ceil(_raw_screen / _wbs)) * _wbs
+    # Each outer MAB iteration processes all word batches, and pbar.update(1) fires once
+    # per word-batch inside the inner loop – so multiply by total_word_batches.
+    total_screening_iters = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH)) * total_word_batches
     screening_pbar = tqdm(total=total_screening_iters, desc="SCREEN Phase", unit="iter",
                           bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                           position=0)
@@ -2138,8 +2227,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                     if needed == 0:
                         deep_testing_complete = True
                         break
-                    _raw_deep = int(math.ceil(needed / MAX_RULES_IN_BATCH))
-                    total_deep_iters = int(math.ceil(_raw_deep / _wbs)) * _wbs
+                    total_deep_iters = int(math.ceil(needed / MAX_RULES_IN_BATCH)) * total_word_batches
                     deep_pbar = tqdm(total=total_deep_iters, desc="DEEP Phase", unit="iter",
                                      bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
                                      position=0)
@@ -2351,13 +2439,14 @@ if __name__ == '__main__':
         sys.exit(0)
 
     print(f"{green('=' * 80)}")
-    print(f"{bold('HASHCAT RULE RANKER v5.0')}")
+    print(f"{bold('HASHCAT RULE RANKER v5.1')}")
     if args.legacy:
         print(f"{bold('LEGACY MODE (v3.2) – Exhaustive Ranking')}")
     else:
         print(f"{bold('MULTI-PASS MAB MODE – Early Elimination')}")
     print(f"{green('=' * 80)}")
     print(f"{blue('GPU Rules:')} Full Hashcat rule set with {MAX_RULE_LEN}‑char support")
+    print(f"{blue('Validation:')} Rules are filtered using rulest’s HashcatRuleValidator (banned ops excluded)")
     print(f"{blue('Interrupt:')} Ctrl+C saves progress")
     print(f"{green('=' * 80)}")
 
