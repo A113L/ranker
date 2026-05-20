@@ -7,11 +7,15 @@ Optionally runs in legacy exhaustive mode (v3.2).
 All GPU‑compatible Hashcat rules are implemented.
 MAX_RULE_LEN = 255, comprehensive rule application.
 
-Changelog:
+Changelog v5.0:
 - Added rule validation identical to rulest_v2.py (HashcatRuleValidator).
 - Rules containing banned operators (M 4 6 X < > ! / ( ) = % Q) are now
   rejected at load time, matching rulest's behaviour.
 - Removed possibility of processing rules that rulest would discard.
+
+v5.0‑fix:
+- Progress bars for screening/deep phases now reach 100% even if the phase
+  finishes earlier than the pessimistic estimate.
 """
 
 import pyopencl as cl
@@ -2149,7 +2153,6 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     for words_np, hashes_np, cnt in word_iter:
         word_batches.append((words_np, hashes_np, cnt))
     total_word_batches = len(word_batches)
-    # Fixed missing closing quote below:
     print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
 
     # Pre‑encode rules into fixed‑length byte arrays for GPU
@@ -2219,8 +2222,12 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                 min_trials = int(np.min(rule_bandit.trials[active_arr]))
                 if min_trials >= screening_trials:
                     screening_complete = True
-                    phase = "DEEP_TESTING"
+                    # Fill the screening progress bar to 100% before closing
+                    remaining_updates = screening_pbar.total - screening_pbar.n
+                    if remaining_updates > 0:
+                        screening_pbar.update(remaining_updates)
                     screening_pbar.close()
+                    phase = "DEEP_TESTING"
                     # Vectorised: compute remaining trials needed for each survivor
                     remaining_trials = np.maximum(0, final_trials - rule_bandit.trials[active_arr])
                     needed = int(np.sum(remaining_trials))
@@ -2350,9 +2357,15 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         if deep_testing_complete:
             break
 
+    # Close progress bars and fill remaining if needed
     if deep_pbar is not None:
+        if deep_pbar.n < deep_pbar.total:
+            deep_pbar.update(deep_pbar.total - deep_pbar.n)
         deep_pbar.close()
-    else:
+    elif screening_pbar is not None and not screening_pbar.disable:
+        # If screening phase finished without being closed (should not happen, but safeguard)
+        if screening_pbar.n < screening_pbar.total:
+            screening_pbar.update(screening_pbar.total - screening_pbar.n)
         screening_pbar.close()
 
     if interrupted:
