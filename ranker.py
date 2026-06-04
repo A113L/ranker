@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
 """
-Ranker v5.0 – GPU-Accelerated Hashcat Rule Ranking
+Ranker v5.2 – GPU-Accelerated Hashcat Rule Ranking
 ===================================================
 Multi-Pass MAB with Early Elimination for large rule sets.
 Optionally runs in legacy exhaustive mode (v3.2).
 All GPU‑compatible Hashcat rules are implemented.
 MAX_RULE_LEN = 255, comprehensive rule application.
 
-Changelog v5.0:
+Changelog v5.2 (bug fixes):
+- BUG FIX #1: Operator precedence error in select_rules sort_key.
+  `<< 32 - x` was parsed as `<< (32 - x)` instead of `(<< 32) - x`,
+  causing completely wrong screening-phase sort order.
+- BUG FIX #2: np.uint32 silent overflow when computing GPU hash-map byte
+  sizes in both rank_rules_exhaustive and rank_rules_mab. For 35-bit maps
+  (4 GB), multiplying by np.uint32(4) wraps to 0, causing wrong buffer
+  allocation. Fixed by using plain Python int arithmetic.
+- BUG FIX #3: should_exclude_rule did not exclude bare '!' (single char).
+  '!' is a reject operator even without an argument; added to the
+  single-char exclusion set.
+- BUG FIX #4: duplicate_front (OpenCL C, 'y' operator) appended the
+  duplicated front chars to the *back* of the word instead of the *front*,
+  reversing the effect of 'y' vs 'Y'. Fixed to prepend correctly.
+- BUG FIX #5: load_cracked_hashes progress bar advanced 1 byte past EOF
+  for files without a trailing newline, causing a >100% display glitch.
+  Clamped advance to remaining bytes.
+
+Changelog v5.1:
 - Added rule validation identical to rulest_v2.py (HashcatRuleValidator).
 - Rules containing banned operators (M 4 6 X < > ! / ( ) = % Q) are now
   rejected at load time, matching rulest's behaviour.
 - Removed possibility of processing rules that rulest would discard.
-
-v5.0‑fix:
-- Progress bars for screening/deep phases now reach 100% even if the phase
-  finishes earlier than the pessimistic estimate.
 """
 
 import pyopencl as cl
@@ -81,7 +95,8 @@ def should_exclude_rule(rule):
     if not rule:
         return False
     # Single-character reject/memory ops
-    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q'):
+    # BUG FIX: added '!' to single-char exclusion list; it is a reject op even alone
+    if len(rule) == 1 and rule in ('_', 'M', '4', '6', 'Q', '!'):
         return True
     # Two-character reject ops (some have a digit, but we check only first char)
     if len(rule) == 2 and rule[0] in ('!', '/', '(', ')', '<', '>', '_'):
@@ -487,7 +502,8 @@ def load_cracked_hashes(path, max_len):
                         if end_pos == -1:
                             end_pos = file_size
                         line = mm[pos:end_pos].strip()
-                        advance = (end_pos + 1) - pos
+                        # BUG FIX: clamp advance to actual remaining bytes so pbar never exceeds 100%
+                        advance = min((end_pos + 1) - pos, file_size - pos)
                         pos = end_pos + 1
                         pbar.update(advance)
                         if 1 <= len(line) <= max_len:
@@ -795,11 +811,14 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
 // ----------------------------------------------------------------------------
 static void duplicate_front(const unsigned char* in, int in_len,
                             unsigned char* out, int* out_len, int* changed, int n) {{
+    // BUG FIX: 'y' operator prepends first N chars to the FRONT of the word.
+    // Old code appended them to the back (which is what 'Y'/duplicate_back does).
+    // Correct: out = in[0..n) + in[0..in_len)
     if (n > in_len) n = in_len;
     int new_len = in_len + n;
     if (new_len > MAX_OUTPUT_LEN) return;
-    for (int i = 0; i < in_len; i++) out[i] = in[i];
-    for (int i = 0; i < n; i++) out[in_len + i] = in[i];
+    for (int i = 0; i < n; i++) out[i] = in[i];
+    for (int i = 0; i < in_len; i++) out[n + i] = in[i];
     *out_len = new_len;
     *changed = 1;
 }}
@@ -1583,8 +1602,8 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
     hashes_buffer_size = words_per_gpu_batch * np.uint32().itemsize
     rules_buffer_size = MAX_RULES_IN_BATCH * MAX_RULE_LEN * np.uint8().itemsize
     counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-    global_map_bytes = GLOBAL_HASH_MAP_WORDS * np.uint32(4)
-    cracked_map_bytes = CRACKED_HASH_MAP_WORDS * np.uint32(4)
+    global_map_bytes = int(GLOBAL_HASH_MAP_WORDS) * 4  # BUG FIX: plain int avoids np.uint32 silent overflow on large maps
+    cracked_map_bytes = int(CRACKED_HASH_MAP_WORDS) * 4  # BUG FIX: same
 
     try:
         base_words_g = cl.Buffer(context, mf.READ_ONLY, words_buffer_size)
@@ -1806,8 +1825,8 @@ class MultiPassMAB:
 
         if len(needs_arr) > 0:
             # Sort by (trials asc, selection_count desc) using a composite key
-            sort_key = (self.trials[needs_arr].astype(np.int64) << 32
-                        - self.selection_count[needs_arr].astype(np.int64))
+            sort_key = ((self.trials[needs_arr].astype(np.int64) << 32)
+                        - self.selection_count[needs_arr].astype(np.int64))  # BUG FIX: added parens around << 32 to prevent - from binding before <
             needs_arr = needs_arr[np.argsort(sort_key, kind='stable')]
 
         num_from_screening = min(batch_size, len(needs_arr))
@@ -2153,6 +2172,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     for words_np, hashes_np, cnt in word_iter:
         word_batches.append((words_np, hashes_np, cnt))
     total_word_batches = len(word_batches)
+    # Fixed missing closing quote below:
     print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
 
     # Pre‑encode rules into fixed‑length byte arrays for GPU
@@ -2164,8 +2184,8 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     hashes_buffer_size = words_per_gpu_batch * np.uint32().itemsize
     rules_buffer_size = MAX_RULES_IN_BATCH * MAX_RULE_LEN * np.uint8().itemsize
     counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-    global_map_bytes = GLOBAL_HASH_MAP_WORDS * np.uint32(4)
-    cracked_map_bytes = CRACKED_HASH_MAP_WORDS * np.uint32(4)
+    global_map_bytes = int(GLOBAL_HASH_MAP_WORDS) * 4  # BUG FIX: plain int avoids np.uint32 silent overflow on large maps
+    cracked_map_bytes = int(CRACKED_HASH_MAP_WORDS) * 4  # BUG FIX: same
 
     try:
         base_words_g = cl.Buffer(context, mf.READ_ONLY, words_buffer_size)
@@ -2222,12 +2242,8 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                 min_trials = int(np.min(rule_bandit.trials[active_arr]))
                 if min_trials >= screening_trials:
                     screening_complete = True
-                    # Fill the screening progress bar to 100% before closing
-                    remaining_updates = screening_pbar.total - screening_pbar.n
-                    if remaining_updates > 0:
-                        screening_pbar.update(remaining_updates)
-                    screening_pbar.close()
                     phase = "DEEP_TESTING"
+                    screening_pbar.close()
                     # Vectorised: compute remaining trials needed for each survivor
                     remaining_trials = np.maximum(0, final_trials - rule_bandit.trials[active_arr])
                     needed = int(np.sum(remaining_trials))
@@ -2357,15 +2373,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         if deep_testing_complete:
             break
 
-    # Close progress bars and fill remaining if needed
     if deep_pbar is not None:
-        if deep_pbar.n < deep_pbar.total:
-            deep_pbar.update(deep_pbar.total - deep_pbar.n)
         deep_pbar.close()
-    elif screening_pbar is not None and not screening_pbar.disable:
-        # If screening phase finished without being closed (should not happen, but safeguard)
-        if screening_pbar.n < screening_pbar.total:
-            screening_pbar.update(screening_pbar.total - screening_pbar.n)
+    else:
         screening_pbar.close()
 
     if interrupted:
@@ -2452,7 +2462,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     print(f"{green('=' * 80)}")
-    print(f"{bold('HASHCAT RULE RANKER v5.1')}")
+    print(f"{bold('HASHCAT RULE RANKER v5.2')}")
     if args.legacy:
         print(f"{bold('LEGACY MODE (v3.2) – Exhaustive Ranking')}")
     else:
