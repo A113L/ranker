@@ -1,4 +1,4 @@
-# Hashcat Rule Ranker v5.0
+# Hashcat Rule Ranker
 
 > **GPU-Accelerated Hashcat Rule Ranking using Multi-Armed Bandit (MAB) with Early Elimination**
 
