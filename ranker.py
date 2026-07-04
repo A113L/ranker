@@ -185,28 +185,21 @@ class HashcatRuleValidator:
                 valid.append(r)
         return valid
 
-# ====================================================================
-# --- COLOR CODES ---
-# ====================================================================
-class Colors:
-    RED = '\033[91m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    BLUE = '\033[94m'
-    MAGENTA = '\033[95m'
-    CYAN = '\033[96m'
-    WHITE = '\033[97m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    END = '\033[0m'
+# ----------------------------------------------------------------------
+# Colors & helpers
+# ----------------------------------------------------------------------
+class C:
+    RED = '\033[91m'; GREEN = '\033[92m'; YELLOW = '\033[93m'
+    BLUE = '\033[94m'; CYAN = '\033[96m'; MAGENTA= '\033[95m'
+    BOLD = '\033[1m';  DIM = '\033[2m';   END = '\033[0m'
 
-def red(text): return f"{Colors.RED}{text}{Colors.END}"
-def green(text): return f"{Colors.GREEN}{text}{Colors.END}"
-def yellow(text): return f"{Colors.YELLOW}{text}{Colors.END}"
-def blue(text): return f"{Colors.BLUE}{text}{Colors.END}"
-def cyan(text): return f"{Colors.CYAN}{text}{Colors.END}"
-def bold(text): return f"{Colors.BOLD}{text}{Colors.END}"
-def underline(text): return f"{Colors.UNDERLINE}{text}{Colors.END}"
+def red(t): return f"{C.RED}{t}{C.END}"
+def green(t): return f"{C.GREEN}{t}{C.END}"
+def yellow(t): return f"{C.YELLOW}{t}{C.END}"
+def blue(t): return f"{C.BLUE}{t}{C.END}"
+def cyan(t): return f"{C.CYAN}{t}{C.END}"
+def bold(t): return f"{C.BOLD}{t}{C.END}"
+def dim(t): return f"{C.DIM}{t}{C.END}"
 
 # Suppress warnings
 warnings.filterwarnings("ignore", message="overflow encountered in scalar multiply")
@@ -451,7 +444,7 @@ def save_current_progress():
                 print(f"{blue('Unique Words Generated:')} {cyan(f'{int(total_unique_found):,}')}")
             if total_cracked_found is not None:
                 print(f"{blue('True Cracks Found:')} {cyan(f'{int(total_cracked_found):,}')}")
-            print(f"{green('=' * 60)}{Colors.END}\n")
+            print(f"{green('=' * 60)}{C.END}\n")
         print(f"{green('Progress saved successfully. You can resume later using the intermediate files.')}")
     except Exception as e:
         print(f"{red('Error saving intermediate progress:')} {e}")
