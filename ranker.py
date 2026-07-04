@@ -111,35 +111,59 @@ class HashcatRuleValidator:
     @staticmethod
     def is_digit(c): return '0' <= c <= '9'
     @staticmethod
+    def is_pos(c):
+        # BUG FIX #7: Hashcat position arguments are not decimal-only. Per the
+        # hashcat rule reference, positions >9 are encoded as 'A'-'Z' (A=10 ... Z=35).
+        # This applies to T,D,L,R,+,-,.,,,',y,Y,z,Z and the N/M parts of i,o,x,O,*,3.
+        # The old digit-only check rejected every valid rule targeting position >=10
+        # (e.g. 'TA', ''C', 'x0A'), which was the main source of false GPU-incompatible
+        # rejections.
+        return ('0' <= c <= '9') or ('A' <= c <= 'Z')
+    @staticmethod
     def validate_rule_for_gpu(rule_str):
         if should_exclude_rule(rule_str): return False
         pos = cnt = 0
         n = len(rule_str)
         isd = HashcatRuleValidator.is_digit
+        isp = HashcatRuleValidator.is_pos
         while pos < n:
             c = rule_str[pos]
             if c == ' ': pos+=1; continue
-            if c in ('p','z','Z'):
-                cnt+=1; pos+=1
-                if pos<n and isd(rule_str[pos]): pos+=1
-                continue
+            if c == 'p':
+                # BUG FIX #8: hashcat's rule table marks 'pN' (Duplicate N) with the
+                # same '*' annotation as T/D/z/Z/etc, meaning N is a MANDATORY,
+                # position-encoded argument (0-9A-Z), not an optional decimal digit.
+                # The old code let bare 'p' pass and only consumed a following digit,
+                # so arguments like 'pV' (duplicate 31 times) left 'V' unconsumed and
+                # broke parsing of the rest of the rule.
+                pos+=1
+                if pos>=n or not isp(rule_str[pos]): return False
+                pos+=1; cnt+=1; continue
+            if c in ('z','Z'):
+                # BUG FIX #7: zN/ZN take a mandatory position-encoded argument
+                # (0-9A-Z), not an optional decimal digit. Previously an argument
+                # like 'zA' left the 'A' unconsumed, causing the whole rule to be
+                # rejected on the next loop iteration.
+                pos+=1
+                if pos>=n or not isp(rule_str[pos]): return False
+                pos+=1; cnt+=1; continue
             if c in (':','l','u','c','C','t','r','d','f','a','q','k','K','E','{','}','[',']'):
                 pos+=1; cnt+=1; continue
             if c in ('T','D','L','R','+','-','.',',',"'",'y','Y'):
                 pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
+                if pos>=n or not isp(rule_str[pos]): return False
                 pos+=1; cnt+=1; continue
             if c in ('i','o','3'):
                 pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
+                if pos>=n or not isp(rule_str[pos]): return False
                 pos+=1
                 if pos>=n: return False
                 pos+=1; cnt+=1; continue
             if c in ('x','*','O'):
                 pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
+                if pos>=n or not isp(rule_str[pos]): return False
                 pos+=1
-                if pos>=n or not isd(rule_str[pos]): return False
+                if pos>=n or not isp(rule_str[pos]): return False
                 pos+=1; cnt+=1; continue
             if c == 's':
                 pos+=1
