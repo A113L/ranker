@@ -2219,6 +2219,15 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     total_cracked_found = 0
     mapped_uniqueness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
     mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
+    # BUG FIX #6: pre-allocate rule-batch host buffers once and reuse them every
+    # iteration. Previously these were re-allocated with np.zeros(...) inside the
+    # hot loop (once per word batch, and again per sub-dispatch), which on large
+    # rule sets runs for thousands to millions of iterations. That caused constant
+    # allocation/free churn, unnecessary heap fragmentation, and rising memory
+    # usage over long runs. Matches the pattern already used for indices_g and
+    # for rules_batch_np in rank_rules_exhaustive.
+    rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
+    sub_rules_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
 
     # --- Progress bars: separate for screening and deep testing ---
     # Each outer MAB iteration processes all word batches, and pbar.update(1) fires once
@@ -2285,11 +2294,11 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                 selected_indices = fallback_arr[order[:MAX_RULES_IN_BATCH]].tolist()
             num_rules = len(selected_indices)
 
-            # Prepare rules buffer – vectorised row copy into a pre-allocated array
-            rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
+            # Prepare rules buffer – vectorised row copy into the pre-allocated array
+            # (reused every iteration; BUG FIX #6, see allocation above the main loop)
+            rules_batch_np[:num_rules] = [encoded_rules[idx] for idx in selected_indices[:num_rules]]
+            rules_batch_np[num_rules:] = 0
             sel_slice = selected_indices[:num_rules]
-            for i, idx in enumerate(sel_slice):
-                rules_batch_np[i] = encoded_rules[idx]
 
             # Split the rules batch into sub-dispatches to avoid OUT_OF_RESOURCES.
             # A single dispatch of (num_words * num_rules) work-items can exceed the
@@ -2307,9 +2316,10 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
                 sub_end = min(sub_start + rules_per_sub, num_rules)
                 sub_num = sub_end - sub_start
 
-                # Upload this slice of the pre-built rules array
-                sub_rules_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
+                # Upload this slice of the pre-built rules array using the
+                # pre-allocated sub_rules_np (reused every sub-dispatch; BUG FIX #6)
                 sub_rules_np[:sub_num] = rules_batch_np[sub_start:sub_end]
+                sub_rules_np[sub_num:] = 0
                 cl.enqueue_copy(queue, rules_g, sub_rules_np).wait()
 
                 # Zero counters for this sub-batch (wait() required before kernel launch)
