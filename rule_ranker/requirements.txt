@@ -1,0 +1,11 @@
+# Core deps, needed by all three tools
+numpy>=1.21
+tqdm>=4.60
+
+# Needed by `rank` (rule_ranker.ranker) and `postprocess` (rule_ranker.ranker_postprocess)
+# for the GPU coverage/hashing kernels. Required only if you use those subcommands.
+pyopencl>=2021.2
+
+# Needed by `handler` (rule_ranker.ranker_handler) when processing Hashcat session
+# restore files. Required only if you use the handler subcommand.
+msgpack>=1.0
