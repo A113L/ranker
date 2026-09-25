@@ -88,9 +88,14 @@ from tqdm import tqdm
 # ============================================================
 # --- CONSTANTS (kept identical to ranker_v5.2 for correctness) ---
 # ============================================================
-MAX_WORD_LEN = 256
-MAX_OUTPUT_LEN = 512
-MAX_RULE_LEN = 255
+# Defaults -- overridable via --max-word-len/--max-rule-len/--max-output-len.
+# The old 256/512/255 values were far larger than any real wordlist/rule
+# needs and cost a lot of private-memory-per-thread on the GPU (register
+# spilling -> private arrays land in global/VRAM instead of registers).
+# Smaller, realistic values cut that private footprint roughly 8x.
+MAX_WORD_LEN = 32
+MAX_OUTPUT_LEN = 64
+MAX_RULE_LEN = 32
 LOCAL_WORK_SIZE = 256
 DEFAULT_WORDS_PER_GPU_BATCH = 150000
 MAX_DISPATCH_ITEMS = 32 * 1024 * 1024
@@ -186,9 +191,14 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
 def load_cracked_universe(path, max_len):
     """Load cracked passwords -> sorted unique FNV-1a hash array.
     This sorted array IS the coverage universe: bit i in every rule's
-    bitmap corresponds to cracked_hashes_sorted[i]."""
+    bitmap corresponds to cracked_hashes_sorted[i].
+
+    Returns (arr, n_skipped) -- n_skipped counts non-empty lines longer
+    than max_len that were dropped entirely (not truncated), so callers
+    can warn if that's shrinking the coverage universe unexpectedly."""
     log(f"{blue('Loading cracked list:')} {path}")
     hashes = []
+    n_skipped = 0
     with open(path, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             pos = 0
@@ -199,11 +209,140 @@ def load_cracked_universe(path, max_len):
                     end_pos = fsize
                 line = mm[pos:end_pos].strip()
                 pos = end_pos + 1
-                if 1 <= len(line) <= max_len:
+                if len(line) == 0:
+                    continue
+                if len(line) <= max_len:
                     hashes.append(fast_fnv1a_hash_32(line))
+                else:
+                    n_skipped += 1
     arr = np.unique(np.array(hashes, dtype=np.uint32))
     log(f"{green('Cracked universe size (unique hashes):')} {cyan(f'{len(arr):,}')}")
-    return arr
+    return arr, n_skipped
+
+
+def _char_to_pos(c):
+    """Mirrors the GPU kernel's char_to_pos(): '0'-'9' -> 0-9,
+    'A'-'Z'/'a'-'z' -> 10-35, else invalid (-1)."""
+    if '0' <= c <= '9':
+        return ord(c) - ord('0')
+    if 'A' <= c <= 'Z':
+        return ord(c) - ord('A') + 10
+    if 'a' <= c <= 'z':
+        return ord(c) - ord('a') + 10
+    return -1
+
+
+def _tokenize_rule(rule_str):
+    """Mirrors the GPU kernel's cmd_len classification in
+    apply_hashcat_rule(). Yields (cmd_char, cmd_len, arg1_or_None,
+    arg2_or_None) tuples; stops early on a truncated trailing command,
+    same as the kernel (`if (pos + cmd_len > rule_len) break;`)."""
+    pos = 0
+    n = len(rule_str)
+    two_char = set("TDLR+-.,'^$@!/()yYzZp{}[]_e")
+    while pos < n:
+        c = rule_str[pos]
+        if c in ('s', 'x', 'O', 'i', 'o', '*', '3', '%', '='):
+            cmd_len = 3
+        elif pos + 1 < n and c in two_char:
+            cmd_len = 2
+        else:
+            cmd_len = 1
+        if pos + cmd_len > n:
+            break
+        args = rule_str[pos + 1:pos + cmd_len]
+        yield c, cmd_len, args
+        pos += cmd_len
+
+
+def estimate_output_len(rule_str, input_len):
+    """Pure-Python mirror of the GPU kernel's length transformations
+    (not byte content) for one rule applied to a word of length
+    `input_len`. Data-dependent rejects (!, /, (, ), _, %, =, and s/x/O
+    with a specific char) are assumed to NOT trigger -- i.e. this is a
+    conservative upper bound on output length, not an exact simulation,
+    since we don't know the actual wordlist content here. Used only to
+    size --max-output-len, never for correctness of the GPU pass
+    itself."""
+    L = input_len
+    for c, cmd_len, args in _tokenize_rule(rule_str):
+        if cmd_len == 1:
+            if c in ('d', 'f', 'q'):
+                L = L * 2
+            elif c in ('[', ']'):
+                if L > 1:
+                    L = L - 1
+            # l,u,c,C,t,r,k,K,:,E,{,},default -> unchanged
+        elif cmd_len == 2:
+            arg = args[0]
+            n = _char_to_pos(arg)
+            if c == 'D':
+                if 0 <= n < L:
+                    L = L - 1
+            elif c == 'L':
+                if 0 <= n < L:
+                    L = L - n
+            elif c == 'R':
+                if 0 <= n < L:
+                    L = n + 1
+            elif c == "'":
+                if 0 <= n < L:
+                    L = n
+            elif c in ('^', '$'):
+                L = L + 1
+            elif c == 'y':
+                if n >= 0:
+                    L = L + min(n, L)
+            elif c == 'Y':
+                if n >= 0:
+                    L = L + min(n, L)
+            elif c == 'z':
+                if n > 0:
+                    L = L + n
+            elif c == 'Z':
+                if n > 0:
+                    L = L + n
+            elif c == 'p':
+                if n >= 0:
+                    L = L * (n + 1)
+            elif c == '[':
+                if 0 <= n < L:
+                    L = L - n
+            elif c == ']':
+                if 0 <= n < L:
+                    L = L - n
+            # T,+,-,.,,,@,!,/,(,),{,},_,e,default -> unchanged (or
+            # reject, assumed not to trigger -- see docstring)
+        elif cmd_len == 3:
+            a1, a2 = args[0], args[1]
+            n1, n2 = _char_to_pos(a1), _char_to_pos(a2)
+            if c == 'x':
+                if n1 >= 0 and n2 > 0 and n1 < L:
+                    end = min(n1 + n2, L)
+                    L = end - n1
+            elif c == 'O':
+                if n1 >= 0 and n2 > 0 and n1 < L:
+                    end = min(n1 + n2, L)
+                    L = L - (end - n1)
+            elif c == 'i':
+                if n1 >= 0:
+                    L = L + 1
+            # s,o,*,3,%,=,default -> unchanged
+    return max(L, 0)
+
+
+def estimate_worst_case_output_len(rules, max_word_len):
+    """Runs estimate_output_len() for every candidate rule against a
+    word of length max_word_len, and returns (worst_len, worst_rule).
+    Conservative upper bound -- see estimate_output_len()'s docstring."""
+    worst_len = max_word_len
+    worst_rule = None
+    for r in rules:
+        L = estimate_output_len(r, max_word_len)
+        if L > worst_len:
+            worst_len = L
+            worst_rule = r
+    return worst_len, worst_rule
 
 
 def load_candidate_rules(args):
@@ -261,6 +400,155 @@ def popcount_rows(bitmap_2d):
 
 def popcount_row(bitmap_row):
     return int(_popcount32(bitmap_row).sum(dtype=np.int64))
+
+
+# ============================================================
+# --- Hybrid dense/sparse row storage ---------------------------------
+#
+# Real ranking runs (see the Marginal_Gain column from `rank`/`handler`
+# output) follow a steep power-law: a small head of rules crack a huge
+# fraction of the cracked universe, and the long tail of low-ranked
+# candidates -- typically most of a 20k-150k candidate pool -- each
+# crack only a tiny sliver of it. Storing every row as a full dense
+# bitmap means the tail wastes almost all of its bytes on zero words.
+#
+# Each row is stored in whichever representation is smaller, decided
+# purely from its own popcount (already computed for initial_gains, so
+# this costs nothing extra):
+#   - dense  (kind 0): the row's W=bitmap_words_per_rule uint32 words,
+#     verbatim, exactly as before.
+#   - sparse (kind 1): the sorted uint32 bit-indices of the set bits,
+#     i.e. popcount x 4 bytes.
+# Sparse wins exactly when popcount < W (byte-for-byte break-even:
+# popcount*4 < W*4), so no tuning knob is needed -- worst case for any
+# row is min(dense, sparse), i.e. this can never be bigger than the
+# old format and is usually far smaller whenever coverage is uneven.
+#
+# Rows are variable-length, so instead of one fixed-stride memmap the
+# on-disk layout is:
+#   <bitmap_path>            -- row payloads, concatenated, no padding
+#   <bitmap_path>.index.npz  -- 'offsets' (n_rules+1 int64 byte offsets
+#                                into the data file), 'kinds' (n_rules
+#                                uint8), 'W' (bitmap_words_per_rule)
+# The index is O(n_rules), ~9 bytes/rule (150k rules ~= 1.3 MB) -- same
+# size class as initial_gains, always fine to hold in RAM / duplicate
+# into worker processes, unlike the matrix itself.
+# ============================================================
+def _bits_to_indices(row_u32):
+    """(W,) uint32 dense row -> sorted uint32 array of set-bit indices."""
+    bits = np.unpackbits(row_u32.view(np.uint8), bitorder='little')
+    return np.nonzero(bits)[0].astype(np.uint32)
+
+
+def _indices_to_dense(idx_arr, bitmap_words_per_rule):
+    """Inverse of _bits_to_indices."""
+    bits = np.zeros(bitmap_words_per_rule * 32, dtype=np.uint8)
+    if len(idx_arr):
+        bits[idx_arr] = 1
+    return np.packbits(bits, bitorder='little').view(np.uint32).copy()
+
+
+def _pack_row(dense_row, popcount, bitmap_words_per_rule):
+    """Picks whichever of dense/sparse is smaller for THIS row, from
+    its popcount alone. Returns (kind, payload_bytes)."""
+    if popcount < bitmap_words_per_rule:
+        return 1, _bits_to_indices(dense_row).tobytes()
+    return 0, dense_row.tobytes()
+
+
+def _unpack_row(kind, raw_bytes, bitmap_words_per_rule):
+    if kind == 0:
+        return np.frombuffer(raw_bytes, dtype=np.uint32).copy()
+    idx = np.frombuffer(raw_bytes, dtype=np.uint32)
+    return _indices_to_dense(idx, bitmap_words_per_rule)
+
+
+class HybridRowWriter:
+    """Write side: append one rule-batch's dense rows at a time,
+    packing each row to its smaller representation, tracking a running
+    byte offset. Never holds more than one batch of dense rows (the
+    caller's host_bitmap) plus the small O(n_rules) offsets/kinds
+    arrays in RAM."""
+
+    def __init__(self, data_path, n_rules, bitmap_words_per_rule):
+        self.data_path = data_path
+        self.W = bitmap_words_per_rule
+        self.offsets = np.zeros(n_rules + 1, dtype=np.int64)
+        self.kinds = np.zeros(n_rules, dtype=np.uint8)
+        self._f = open(data_path, 'wb')
+        self._pos = 0
+
+    def write_batch(self, start, host_bitmap, popcounts):
+        """host_bitmap: (n, W) uint32 dense rows for rules[start:start+n].
+        popcounts: (n,) int-like, already computed for initial_gains."""
+        for i in range(host_bitmap.shape[0]):
+            kind, payload = _pack_row(host_bitmap[i], int(popcounts[i]), self.W)
+            self._f.write(payload)
+            self._pos += len(payload)
+            self.kinds[start + i] = kind
+            self.offsets[start + i + 1] = self._pos
+
+    def close(self):
+        self._f.close()
+
+    def bytes_written(self):
+        return self._pos
+
+    def to_store(self):
+        store = HybridRowStore(self.data_path, self.offsets, self.kinds, self.W)
+        store.save_index()
+        return store
+
+
+class HybridRowStore:
+    """Read side: mmap'd view over the hybrid dense/sparse coverage
+    file. store[idx] -> dense (W,) uint32 ndarray (materializing sparse
+    rows on the fly), and .shape -- a drop-in substitute for the old
+    fixed-stride memmap at every bitmaps[idx] call site."""
+
+    def __init__(self, data_path, offsets, kinds, bitmap_words_per_rule):
+        self.data_path = data_path
+        self.offsets = offsets
+        self.kinds = kinds
+        self.W = bitmap_words_per_rule
+        self.shape = (len(kinds), bitmap_words_per_rule)
+        self._f = open(data_path, 'rb')
+        self._mm = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def __getitem__(self, idx):
+        start, end = int(self.offsets[idx]), int(self.offsets[idx + 1])
+        raw = self._mm[start:end]
+        return _unpack_row(int(self.kinds[idx]), raw, self.W)
+
+    def flush(self):
+        pass  # read-only, nothing to flush
+
+    def close(self):
+        try:
+            self._mm.close()
+        except Exception:
+            pass
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def index_path(data_path):
+        return data_path + '.index.npz'
+
+    def save_index(self):
+        np.savez(self.index_path(self.data_path),
+                  offsets=self.offsets, kinds=self.kinds,
+                  W=np.array([self.W], dtype=np.int64))
+
+    @classmethod
+    def load(cls, data_path):
+        npz = np.load(cls.index_path(data_path))
+        return cls(data_path, npz['offsets'], npz['kinds'], int(npz['W'][0]))
+
+    def __del__(self):
+        self.close()
 
 
 # ============================================================
@@ -500,8 +788,16 @@ void celf_coverage_kernel(
     unsigned int total = num_words * num_rules_in_batch;
     if (global_id >= total) return;
 
-    unsigned int word_idx = global_id / num_rules_in_batch;
-    unsigned int rule_idx = global_id % num_rules_in_batch;
+    // rule_idx varies slowest, word_idx fastest: consecutive global_ids
+    // (i.e. threads within the same warp/wavefront) share the SAME rule
+    // and only differ in word_idx. apply_single_command() is one huge
+    // switch() on the rule's command chars, so same rule = same branch
+    // taken by the whole warp = no intra-warp divergence from rule
+    // choice. The old word_idx/rule_idx = id/N, id%N split put a
+    // DIFFERENT rule on every lane of a warp, which serialized the warp
+    // through up to 32 different switch-paths at once.
+    unsigned int rule_idx = global_id / num_words;
+    unsigned int word_idx = global_id % num_words;
 
     unsigned char word[MAX_WORD_LEN];
     unsigned int word_len = 0;
@@ -568,7 +864,8 @@ def select_device(device_id=None):
 # ============================================================
 def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
                              rule_batch_size, words_per_gpu_batch,
-                             bitmap_path, device_id=None, in_ram=False):
+                             bitmap_path, device_id=None, in_ram=False,
+                             hybrid=True):
     """Builds the (n_rules, bitmap_words_per_rule) uint32 coverage
     matrix either as a disk-backed np.memmap at `bitmap_path` (default)
     or, if in_ram=True, as a plain in-RAM np.zeros(...) ndarray.
@@ -601,10 +898,11 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
             f"{cyan(f'{bitmap_row_bytes/1024:.1f} KB')}/rule = {cyan(f'{est_gb:.2f} GB')} {bold('total')} "
             f"-- {dim('allocated directly in RAM, no memmap/disk file')}.")
         bitmaps = np.zeros((n_rules, bitmap_words_per_rule), dtype=np.uint32)
-    else:
+    elif not hybrid:
         log(f"{blue('Coverage bitmap matrix:')} {cyan(f'{n_rules:,}')} {bold('candidates x')} "
             f"{cyan(f'{bitmap_row_bytes/1024:.1f} KB')}/rule = {cyan(f'{est_gb:.2f} GB')} {bold('total')} "
-            f"-- {dim(f'streamed to disk at {bitmap_path}, not held in RAM')}.")
+            f"-- {dim(f'streamed to disk at {bitmap_path}, not held in RAM')} "
+            f"{yellow('(--no-hybrid: dense, fixed-stride)')}.")
         log(f"{blue('Peak extra RAM for this pass is ~one rule-batch:')} "
             f"{cyan(f'{rule_batch_size} x {bitmap_row_bytes/1024:.1f} KB')} "
             f"= {cyan(f'{rule_batch_size * bitmap_row_bytes / (1024**2):.1f} MB')}, "
@@ -613,6 +911,17 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
         # write below fills in one row-slice of it.
         bitmaps = np.memmap(bitmap_path, dtype=np.uint32, mode='w+',
                              shape=(n_rules, bitmap_words_per_rule))
+    else:
+        log(f"{blue('Coverage bitmap matrix (worst case):')} {cyan(f'{n_rules:,}')} {bold('candidates x')} "
+            f"{cyan(f'{bitmap_row_bytes/1024:.1f} KB')}/rule = {cyan(f'{est_gb:.2f} GB')} {bold('total')} "
+            f"-- {dim(f'hybrid dense/sparse rows streamed to {bitmap_path}')} "
+            f"{green('(actual size will be <= this, usually far less)')}.")
+        log(f"{blue('Peak extra RAM for this pass is ~one rule-batch:')} "
+            f"{cyan(f'{rule_batch_size} x {bitmap_row_bytes/1024:.1f} KB')} "
+            f"= {cyan(f'{rule_batch_size * bitmap_row_bytes / (1024**2):.1f} MB')}, "
+            f"{dim('regardless of how large the worst-case matrix above is')}.")
+        writer = HybridRowWriter(bitmap_path, n_rules, bitmap_words_per_rule)
+        bitmaps = None  # built at the end of the streaming loop below
 
     initial_gains = np.zeros(n_rules, dtype=np.int64)
 
@@ -691,20 +1000,38 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
             sub_read_g = bitmap_g.get_sub_region(0, num_rules_here * bitmap_row_bytes)
             cl.enqueue_copy(queue, host_bitmap, sub_read_g).wait()
 
-        # Write this batch's rows into the matrix (memmap -> streamed to
-        # disk; ndarray -> plain in-RAM slice assignment either way) and
-        # immediately compute its popcounts (SWAR, no 16x blow-up, and
-        # only over this small batch -- never the full matrix at once).
-        bitmaps[start:end] = host_bitmap
-        initial_gains[start:end] = popcount_rows(host_bitmap)
+        # Compute this batch's popcounts first (SWAR, no 16x blow-up,
+        # only over this small batch -- never the full matrix at once),
+        # then write the rows into the matrix:
+        #  - in_ram:        plain in-RAM slice assignment, dense, as before
+        #  - hybrid (disk):  each row packed to whichever of dense/sparse
+        #                     is smaller, appended to the data file
+        #  - --no-hybrid:   dense, fixed-stride memmap slice, as before
+        batch_popcounts = popcount_rows(host_bitmap)
+        initial_gains[start:end] = batch_popcounts
+        if bitmaps is not None:
+            bitmaps[start:end] = host_bitmap
+        else:
+            writer.write_batch(start, host_bitmap, batch_popcounts)
         del host_bitmap
 
         pbar.set_postfix({"rss_mb": f"{get_rss_mb():.0f}"})
         pbar.update(1)
     pbar.close()
-    if hasattr(bitmaps, 'flush'):
-        bitmaps.flush()
 
+    if bitmaps is not None:
+        if hasattr(bitmaps, 'flush'):
+            bitmaps.flush()
+        return bitmaps, bitmap_words_per_rule, initial_gains
+
+    writer.close()
+    actual_bytes = writer.bytes_written()
+    actual_gb = actual_bytes / (1024 ** 3)
+    saved_pct = 100.0 * (1 - actual_bytes / max(est_bytes, 1))
+    log(f"{green('Hybrid coverage file written:')} {cyan(f'{actual_gb:.2f} GB')} "
+        f"{dim(f'vs {est_gb:.2f} GB worst-case dense')} -- "
+        f"{green(f'{saved_pct:.1f}% smaller')}")
+    bitmaps = writer.to_store()
     return bitmaps, bitmap_words_per_rule, initial_gains
 
 
@@ -838,19 +1165,41 @@ def celf_select(rules, bitmaps, initial_gains=None, budget=None):
 # ============================================================
 _wk_fd = None
 _wk_row_bytes = None
+_wk_offsets = None
+_wk_kinds = None
+_wk_W = None
 
 
-def _celf_pool_init(bitmap_path, row_bytes):
+def _celf_pool_init(bitmap_path, row_bytes, offsets=None, kinds=None, W=None):
     """Pool initializer: runs once per worker PROCESS. Opens its own
     read-only file descriptor on the coverage-bitmap file -- NOT a
     memmap, so that row reads go through plain os.pread() (see module
-    docstring above for why that matters for real thread concurrency)."""
-    global _wk_fd, _wk_row_bytes
+    docstring above for why that matters for real thread concurrency).
+
+    Two on-disk formats, both use the same os.pread()-based worker
+    path, just with a different byte range per row:
+      - legacy dense fixed-stride (--no-hybrid): offsets/kinds/W are
+        None, row i is always at [i*row_bytes, (i+1)*row_bytes).
+      - hybrid dense/sparse (default): offsets/kinds/W are the small
+        O(n_rules) arrays from HybridRowStore, duplicated into every
+        worker process (a few MB, negligible) so each row's byte
+        range and representation can be looked up locally with no
+        cross-process calls.
+    """
+    global _wk_fd, _wk_row_bytes, _wk_offsets, _wk_kinds, _wk_W
     _wk_row_bytes = row_bytes
+    _wk_offsets = offsets
+    _wk_kinds = kinds
+    _wk_W = W
     _wk_fd = os.open(bitmap_path, os.O_RDONLY)
 
 
 def _celf_pool_read_row(idx):
+    if _wk_offsets is not None:
+        start = int(_wk_offsets[idx])
+        end = int(_wk_offsets[idx + 1])
+        raw = os.pread(_wk_fd, end - start, start)
+        return _unpack_row(int(_wk_kinds[idx]), raw, _wk_W)
     raw = os.pread(_wk_fd, _wk_row_bytes, idx * _wk_row_bytes)
     return np.frombuffer(raw, dtype=np.uint32)
 
@@ -924,7 +1273,8 @@ def celf_select_parallel(rules, bitmaps, bitmap_path, initial_gains,
 
     n_rules = bitmaps.shape[0]
     W = bitmaps.shape[1]
-    row_bytes = W * 4
+    row_bytes = W * 4  # only meaningful for the legacy dense fixed-stride format
+    is_hybrid = isinstance(bitmaps, HybridRowStore)
     covered = np.zeros(W, dtype=np.uint32)
 
     n_workers = n_workers or max(1, os.cpu_count() or 1)
@@ -955,8 +1305,12 @@ def celf_select_parallel(rules, bitmaps, bitmap_path, initial_gains,
     # the whole run) and never touches GPU state, which is also what
     # makes it portable to platforms without fork (Windows).
     ctx = mp.get_context('spawn')
+    if is_hybrid:
+        initargs = (bitmap_path, row_bytes, bitmaps.offsets, bitmaps.kinds, bitmaps.W)
+    else:
+        initargs = (bitmap_path, row_bytes)
     pool = ctx.Pool(processes=n_workers, initializer=_celf_pool_init,
-                     initargs=(bitmap_path, row_bytes))
+                     initargs=initargs)
 
     pbar = tqdm(total=limit, desc=cyan("CELF greedy select [parallel]"), unit="rule", colour="cyan")
     try:
@@ -1075,6 +1429,7 @@ def save_output_multi(selected, output_path, budgets):
 # --- Main ---
 # ============================================================
 def main(argv=None):
+    global MAX_WORD_LEN, MAX_RULE_LEN, MAX_OUTPUT_LEN
     ap = argparse.ArgumentParser(description="CELF greedy max-coverage post-stage for ranker_v5.2")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument('-r', '--ranking-csv', help="ranker_v5.2 output CSV (legacy or MAB mode)")
@@ -1098,6 +1453,43 @@ def main(argv=None):
                           "at once). Ignored as a RAM bound in --in-ram mode, where "
                           "the whole matrix is resident regardless.")
     ap.add_argument('-W', '--words-batch-size', type=int, default=DEFAULT_WORDS_PER_GPU_BATCH)
+    ap.add_argument('--max-word-len', type=int, default=MAX_WORD_LEN,
+                     help=f"Words/cracked entries longer than this are SKIPPED "
+                          f"entirely (not truncated). Also sizes the GPU kernel's "
+                          f"per-thread word buffer -- smaller means less private "
+                          f"memory per thread and less register spilling on weak "
+                          f"GPUs, but check your wordlist's max line length first "
+                          f"(default {MAX_WORD_LEN}).")
+    ap.add_argument('--max-rule-len', type=int, default=MAX_RULE_LEN,
+                     help=f"Max characters per hashcat rule considered "
+                          f"(default {MAX_RULE_LEN}). Longer rules are silently "
+                          f"truncated when encoded for the GPU (rare in practice "
+                          f"-- real hashcat rules are almost always well under "
+                          f"this).")
+    ap.add_argument('--max-output-len', type=int, default=MAX_OUTPUT_LEN,
+                     help=f"Max length of a rule's output word the GPU kernel "
+                          f"will produce (default {MAX_OUTPUT_LEN}). If a rule "
+                          f"would produce something longer, that command is "
+                          f"skipped for that word (same as today, just a lower "
+                          f"ceiling). Must be >= --max-word-len. Ignored if "
+                          f"--auto-max-output-len is set.")
+    ap.add_argument('--auto-max-output-len', action='store_true',
+                     help="Before the GPU pass, run a fast CPU-only static "
+                          "estimate over every candidate rule (length "
+                          "transformations only, e.g. d/f/q/p/z/Z/y/Y/^/$ -- "
+                          "not actual word content) against --max-word-len, "
+                          "and set --max-output-len to the worst case found "
+                          "(+ small margin) instead of using the fixed "
+                          "default/flag value. Conservative upper bound: "
+                          "assumes data-dependent rule rejects (!,/,(,),_,%%,=) "
+                          "never trigger, so it can be larger than strictly "
+                          "necessary but never smaller.")
+    ap.add_argument('--print-output-len-estimate', action='store_true',
+                     help="Run the same static estimate as "
+                          "--auto-max-output-len, print the recommended "
+                          "--max-output-len and the rule responsible for the "
+                          "worst case, then exit without touching the GPU. "
+                          "Useful to sanity-check before a long run.")
     ap.add_argument('-d', '--device', type=int, default=None)
     ap.add_argument('--bitmap-path', type=str, default=None,
                      help="Where to stream the coverage-bitmap matrix on disk "
@@ -1109,6 +1501,16 @@ def main(argv=None):
     ap.add_argument('--keep-bitmap', action='store_true',
                      help="Don't delete the on-disk bitmap file after a successful "
                           "run. Ignored if --in-ram is set (no file is ever created).")
+    ap.add_argument('--no-hybrid', action='store_true',
+                     help="Use the old dense, fixed-stride on-disk bitmap format "
+                          "instead of the default hybrid dense/sparse format. The "
+                          "hybrid format picks whichever representation is smaller "
+                          "per-row (from its already-computed popcount) so it is "
+                          "never larger than this legacy format and is usually much "
+                          "smaller when most candidate rules have sparse coverage "
+                          "(the common case: a steep drop-off in Marginal_Gain from "
+                          "`rank`/`handler` output is a good sign hybrid will help a "
+                          "lot). Ignored if --in-ram is set.")
     ap.add_argument('--in-ram', action='store_true',
                      help="Build the coverage bitmap matrix as a plain in-RAM "
                           "ndarray instead of a disk-backed memmap. Faster overall "
@@ -1143,9 +1545,45 @@ def main(argv=None):
                           "as individual reads finish at different times.")
     args = ap.parse_args(argv)
 
+    MAX_WORD_LEN = args.max_word_len
+    MAX_RULE_LEN = args.max_rule_len
+    MAX_OUTPUT_LEN = args.max_output_len
+    if MAX_OUTPUT_LEN < MAX_WORD_LEN and not args.auto_max_output_len:
+        log(red(f"--max-output-len ({MAX_OUTPUT_LEN}) must be >= --max-word-len "
+                f"({MAX_WORD_LEN}) -- rules that only extend words would be "
+                f"silently no-op'd otherwise. Aborting. "
+                f"(Or pass --auto-max-output-len to size it automatically.)"))
+        sys.exit(1)
+    log(f"{blue('Buffer limits:')} max-word-len={cyan(MAX_WORD_LEN)} "
+        f"max-rule-len={cyan(MAX_RULE_LEN)} max-output-len={cyan(MAX_OUTPUT_LEN)} "
+        f"{dim('(entries/rules exceeding these are skipped/truncated -- see --help)')}")
+
     t0 = time.time()
     rules = load_candidate_rules(args)
-    cracked_hashes = load_cracked_universe(args.cracked, MAX_WORD_LEN)
+
+    if args.print_output_len_estimate or args.auto_max_output_len:
+        worst_len, worst_rule = estimate_worst_case_output_len(rules, MAX_WORD_LEN)
+        margin = max(8, worst_len // 16)  # small safety margin, rounded up below
+        suggested = worst_len + margin
+        log(f"{blue('Static output-length estimate:')} worst case "
+            f"{cyan(str(worst_len))} chars for --max-word-len={cyan(MAX_WORD_LEN)} "
+            f"{dim(f'(rule: {worst_rule!r})' if worst_rule else '(no rule grows the word)')} "
+            f"-- {bold('suggested --max-output-len')} {cyan(str(suggested))} "
+            f"{dim('(worst case + margin; conservative, see --help)')}")
+        if args.print_output_len_estimate:
+            sys.exit(0)
+        if MAX_OUTPUT_LEN != suggested:
+            log(f"{yellow('--auto-max-output-len:')} overriding --max-output-len "
+                f"{cyan(str(MAX_OUTPUT_LEN))} -> {cyan(str(suggested))}")
+        MAX_OUTPUT_LEN = suggested
+        if MAX_OUTPUT_LEN < MAX_WORD_LEN:
+            MAX_OUTPUT_LEN = MAX_WORD_LEN
+
+    cracked_hashes, n_skipped = load_cracked_universe(args.cracked, MAX_WORD_LEN)
+    if n_skipped:
+        log(f"{yellow('Skipped')} {cyan(f'{n_skipped:,}')} {yellow('cracked entries longer than')} "
+            f"{cyan(MAX_WORD_LEN)} {yellow('chars (not counted in coverage universe).')} "
+            f"{dim('Raise --max-word-len if this matters for your data.')}")
     if len(cracked_hashes) == 0:
         log(red("Cracked list is empty -- nothing to optimize for. Aborting."))
         sys.exit(1)
@@ -1159,6 +1597,7 @@ def main(argv=None):
         bitmap_path=bitmap_path,
         device_id=args.device,
         in_ram=args.in_ram,
+        hybrid=not args.no_hybrid,
     )
 
     try:
@@ -1182,18 +1621,28 @@ def main(argv=None):
         else:
             save_output(selected, args.output)
     finally:
-        # Release the reference before deleting the backing file
-        # (required on some platforms, e.g. Windows, for memmaps) and
-        # clean up unless the user wants to keep it (e.g. to re-run
-        # celf_select with a different --budget without redoing the GPU
-        # pass). None of this applies in --in-ram mode: there's no file.
+        # Release the reference before deleting the backing file(s)
+        # (required on some platforms, e.g. Windows, for memmaps/mmaps)
+        # and clean up unless the user wants to keep them (e.g. to
+        # re-run celf_select with a different --budget without redoing
+        # the GPU pass). None of this applies in --in-ram mode: there's
+        # no file. The hybrid format has a second small sidecar index
+        # file (<bitmap_path>.index.npz) alongside the data file.
+        if hasattr(bitmaps, 'close'):
+            bitmaps.close()
         del bitmaps
         if not args.in_ram:
-            if not args.keep_bitmap and os.path.exists(bitmap_path):
-                os.remove(bitmap_path)
-                log(f"{dim('Removed temporary bitmap file:')} {bitmap_path}")
-            elif args.keep_bitmap:
-                log(f"{blue('Kept bitmap file at:')} {bitmap_path}")
+            paths_to_clean = [bitmap_path]
+            index_path = HybridRowStore.index_path(bitmap_path)
+            if os.path.exists(index_path):
+                paths_to_clean.append(index_path)
+            if not args.keep_bitmap:
+                for p in paths_to_clean:
+                    if os.path.exists(p):
+                        os.remove(p)
+                log(f"{dim('Removed temporary bitmap file(s):')} {', '.join(paths_to_clean)}")
+            else:
+                log(f"{blue('Kept bitmap file(s) at:')} {', '.join(paths_to_clean)}")
 
     print(f"\n{green('=' * 60)}")
     print(bold("CELF Post-Processing Complete"))
