@@ -64,9 +64,6 @@ python3 -m rule_ranker.ranker_handler ...
 python3 -m rule_ranker.ranker_postprocess ...
 ```
 
-If installed with `pip install -e .`, a `run-ranker` console script is
-also available and behaves identically to `python3 run_ranker.py`.
-
 ## Typical pipeline
 
 ```bash
