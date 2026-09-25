@@ -83,16 +83,60 @@ class TestLoadCrackedUniverse:
     def test_dedupes_and_sorts_hashes(self, tmp_path):
         cracked_path = tmp_path / "cracked.txt"
         cracked_path.write_text("password1\npassword2\npassword1\n", encoding="utf-8")
-        arr = rp.load_cracked_universe(str(cracked_path), max_len=256)
+        arr, n_skipped = rp.load_cracked_universe(str(cracked_path), max_len=256)
         assert len(arr) == 2  # duplicate collapsed
         assert list(arr) == sorted(arr.tolist())  # sorted ascending
         assert arr.dtype == np.uint32
+        assert n_skipped == 0
 
     def test_respects_max_len(self, tmp_path):
         cracked_path = tmp_path / "cracked.txt"
         cracked_path.write_text("short\n" + ("x" * 300) + "\n", encoding="utf-8")
-        arr = rp.load_cracked_universe(str(cracked_path), max_len=256)
+        arr, n_skipped = rp.load_cracked_universe(str(cracked_path), max_len=256)
         assert len(arr) == 1  # the 300-char line is dropped
+        assert n_skipped == 1  # ...and counted as skipped, not silently lost
+
+
+class TestEstimateOutputLen:
+    """CPU-only static length estimator used by --auto-max-output-len /
+    --print-output-len-estimate, mirroring the GPU kernel's length
+    transformations (not byte content)."""
+
+    @pytest.mark.parametrize("rule,in_len,expected", [
+        (":", 10, 10),
+        ("l", 10, 10),
+        ("d", 10, 20),
+        ("f", 10, 20),
+        ("q", 10, 20),
+        ("dd", 10, 40),
+        ("p2", 10, 30),   # duplicate_word: new_len = in_len * (n+1)
+        ("z5", 10, 15),
+        ("Z3", 10, 13),
+        ("y2", 10, 12),
+        ("Y3", 10, 13),
+        ("^a", 10, 11),
+        ("$a$b", 10, 12),
+        ("i0a", 10, 11),
+        ("D0", 10, 9),
+        ("[", 10, 9),
+        ("[", 1, 1),      # guarded: in_len>1 required, no-op at len 1
+        ("x02", 10, 2),
+        ("O02", 10, 8),
+    ])
+    def test_matches_expected_length(self, rule, in_len, expected):
+        assert rp.estimate_output_len(rule, in_len) == expected
+
+    def test_worst_case_picks_largest_and_identifies_rule(self):
+        rules = [":", "l", "d", "p3"]
+        worst_len, worst_rule = rp.estimate_worst_case_output_len(rules, max_word_len=8)
+        assert worst_len == 8 * 4  # p3 -> in_len * (3+1)
+        assert worst_rule == "p3"
+
+    def test_worst_case_falls_back_to_input_len_when_nothing_grows(self):
+        rules = [":", "l", "u", "D0"]
+        worst_len, worst_rule = rp.estimate_worst_case_output_len(rules, max_word_len=8)
+        assert worst_len == 8
+        assert worst_rule is None
 
 
 class TestCelfSelect:
