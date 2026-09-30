@@ -12,6 +12,7 @@ mapping, so exact coverage/selection outcomes can be asserted without
 any device present. See conftest.py for why `import pyopencl` still
 needs to succeed even though no real OpenCL is exercised here.
 """
+import math
 import os
 import sys
 
@@ -153,3 +154,96 @@ class TestGreedyRoundLogic:
         # so upper_bound sort (stable, descending on equal values)
         # keeps it first.
         assert selected[0][0] == "first"
+
+
+class TestBuildOpenAddressingTableVectorized:
+    """_build_open_addressing_table() is the vectorized (NumPy,
+    wave-based) replacement for the original per-key Python `for h in
+    ...: while occupied[...]: ...` loop that built the GPU hash table.
+    Pure NumPy, no OpenCL involved, so it's directly testable without a
+    GPU. These tests check it against a reference implementation of
+    that original loop for exact behavioral equivalence (same table
+    contents are reachable via the same linear-probe lookup rule,
+    same occupied-bit convention), not just "doesn't crash"."""
+
+    @staticmethod
+    def _reference_loop_build(cracked, table_size, mask):
+        hash_table = np.zeros(table_size, dtype=np.uint32)
+        occupied = np.zeros((table_size + 31) // 32, dtype=np.uint32)
+        for h in np.asarray(cracked, dtype=np.uint32):
+            slot = (int(h) * 2654435761) & mask
+            while occupied[slot >> 5] & (1 << (slot & 31)):
+                slot = (slot + 1) & mask
+            hash_table[slot] = h
+            occupied[slot >> 5] |= np.uint32(1 << (slot & 31))
+        return hash_table, occupied
+
+    @staticmethod
+    def _lookup(hash_table, occupied, mask, key):
+        """Mirrors the GPU kernel's lookup_cracked_slot() probe rule."""
+        slot = (int(key) * 2654435761) & mask
+        for _ in range(len(hash_table)):
+            word, bit = slot >> 5, slot & 31
+            if occupied[word] & (1 << bit):
+                if hash_table[slot] == key:
+                    return slot
+            else:
+                return -1
+            slot = (slot + 1) & mask
+        return -1
+
+    def _table_size_for(self, n):
+        table_size = 1
+        target = max(2, int(math.ceil(n * 2.0)))
+        while table_size < target:
+            table_size <<= 1
+        return table_size
+
+    def test_matches_reference_occupied_bitcount(self):
+        rng = np.random.default_rng(42)
+        cracked = np.unique(rng.integers(0, 2**32, size=5000, dtype=np.uint64).astype(np.uint32))
+        table_size = self._table_size_for(len(cracked))
+        mask = table_size - 1
+
+        ref_table, ref_occ = self._reference_loop_build(cracked, table_size, mask)
+        vec_table, vec_occ = crg._build_open_addressing_table(cracked, table_size, mask)
+
+        assert vec_occ.dtype == np.uint32
+        assert vec_occ.shape == ref_occ.shape
+        vec_bits_set = np.unpackbits(vec_occ.view(np.uint8), bitorder='little').sum()
+        ref_bits_set = np.unpackbits(ref_occ.view(np.uint8), bitorder='little').sum()
+        assert vec_bits_set == ref_bits_set == len(cracked)
+
+    def test_every_key_findable_via_gpu_probe_rule(self):
+        rng = np.random.default_rng(7)
+        cracked = np.unique(rng.integers(0, 2**32, size=20000, dtype=np.uint64).astype(np.uint32))
+        table_size = self._table_size_for(len(cracked))
+        mask = table_size - 1
+
+        vec_table, vec_occ = crg._build_open_addressing_table(cracked, table_size, mask)
+        for key in cracked[:2000]:
+            assert self._lookup(vec_table, vec_occ, mask, int(key)) != -1
+
+    def test_no_key_collisions_in_stored_table(self):
+        rng = np.random.default_rng(99)
+        cracked = np.unique(rng.integers(0, 2**32, size=3000, dtype=np.uint64).astype(np.uint32))
+        table_size = self._table_size_for(len(cracked))
+        mask = table_size - 1
+
+        vec_table, vec_occ = crg._build_open_addressing_table(cracked, table_size, mask)
+        occ_bits = np.unpackbits(vec_occ.view(np.uint8), bitorder='little')[:table_size]
+        occupied_keys = vec_table[occ_bits.astype(bool)]
+        assert len(occupied_keys) == len(cracked)
+        assert set(occupied_keys.tolist()) == set(cracked.tolist())
+
+    def test_small_and_edge_sizes(self):
+        for n in (0, 1, 2, 5):
+            cracked = np.arange(n, dtype=np.uint32) * 2654435761
+            cracked = np.unique(cracked)
+            table_size = self._table_size_for(max(len(cracked), 1))
+            mask = table_size - 1
+            vec_table, vec_occ = crg._build_open_addressing_table(cracked, table_size, mask)
+            bits_set = np.unpackbits(vec_occ.view(np.uint8), bitorder='little').sum()
+            assert bits_set == len(cracked)
+            for key in cracked:
+                assert self._lookup(vec_table, vec_occ, mask, int(key)) != -1
