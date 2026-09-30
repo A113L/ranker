@@ -256,6 +256,28 @@ class TestSaveOutput:
         csv_text = csv_path.read_text(encoding="utf-8")
         assert "Rank" in csv_text and "Marginal_Gain" in csv_text
 
+    def test_honors_non_rule_extension_exactly(self, tmp_path):
+        # Regression test: save_output() used to silently rewrite any
+        # extension other than '.rule' to '.rule', so "-o rules.txt"
+        # was actually written to "rules.rule" and the path the user
+        # asked for never existed. It must now write to exactly the
+        # path given.
+        out_path = tmp_path / "selected.txt"
+        selected = [("l", 100), ("u", 80)]
+        rp.save_output(selected, str(out_path))
+
+        assert out_path.exists()
+        wrong_path = tmp_path / "selected.rule"
+        assert not wrong_path.exists()
+        csv_path = tmp_path / "selected_celf.csv"
+        assert csv_path.exists()
+
+    def test_appends_rule_extension_only_when_none_given(self, tmp_path):
+        out_path = tmp_path / "selected"
+        selected = [("l", 100)]
+        rp.save_output(selected, str(out_path))
+        assert (tmp_path / "selected.rule").exists()
+
 
 class TestSaveOutputMulti:
     def test_creates_one_file_pair_per_budget(self, tmp_path):
@@ -280,6 +302,21 @@ class TestSaveOutputMulti:
         assert top100.exists()
         rules = [ln for ln in top100.read_text(encoding="utf-8").splitlines() if ln != ":"]
         assert rules == ["a", "b"]
+
+    def test_also_writes_exact_output_path(self, tmp_path):
+        # Regression test: passing --budgets used to mean the literal
+        # -o/--output path was never written, only the _topN files --
+        # the other half of the "-o doesn't save to the given path"
+        # bug. The exact path must always end up on disk too.
+        out_path = tmp_path / "selected.rule"
+        selected = [("a", 10), ("b", 8), ("c", 5), ("d", 1)]
+        rp.save_output_multi(selected, str(out_path), [2, 4])
+
+        assert out_path.exists()
+        all_rules = [
+            ln for ln in out_path.read_text(encoding="utf-8").splitlines() if ln != ":"
+        ]
+        assert all_rules == ["a", "b", "c", "d"]
 
 
 class TestPostprocessCLI:
@@ -321,3 +358,44 @@ class TestPostprocessCLI:
                 "-o", str(out_path),
             ])
         assert excinfo.value.code == 1
+
+    def test_strategy_accepts_sparse_choice(self):
+        # Just exercises argparse's `choices=` validation for the new
+        # --strategy flag -- reaching the empty-cracked-list abort
+        # (exit code 1) means "sparse" parsed fine and dispatch got as
+        # far as the shared cracked-list-loading step before diverging
+        # into the sparse-specific branch, not that argparse itself
+        # rejected the value (which would be exit code 2).
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            rules_path = os.path.join(td, "rules.rule")
+            with open(rules_path, "w", encoding="utf-8") as f:
+                f.write(":\nl\n")
+            wordlist_path = os.path.join(td, "words.txt")
+            with open(wordlist_path, "w", encoding="utf-8") as f:
+                f.write("password\n")
+            cracked_path = os.path.join(td, "cracked.txt")
+            with open(cracked_path, "w", encoding="utf-8") as f:
+                f.write("x" * 300 + "\n")
+            out_path = os.path.join(td, "out.rule")
+
+            with pytest.raises(SystemExit) as excinfo:
+                rp.main([
+                    "-f", rules_path, "-w", wordlist_path, "-k", cracked_path,
+                    "-o", out_path, "--strategy", "sparse",
+                ])
+            assert excinfo.value.code == 1  # empty cracked list, not a bad --strategy value
+
+    def test_strategy_rejects_unknown_choice(self):
+        with pytest.raises(SystemExit) as excinfo:
+            rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule",
+                     "--strategy", "not-a-real-strategy"])
+        assert excinfo.value.code == 2  # argparse's own choices= rejection
+
+    def test_recompute_gpu_bare_flag_no_longer_recognized(self):
+        # --recompute-gpu was removed; only --strategy recompute-gpu works
+        # now. The bare flag should be rejected as an unknown argument.
+        with pytest.raises(SystemExit) as excinfo:
+            rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule",
+                     "--recompute-gpu"])
+        assert excinfo.value.code == 2
