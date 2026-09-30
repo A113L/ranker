@@ -163,26 +163,37 @@ python ranker_postprocess.py --ranking-csv ranker_output.csv \
 
 ### Arguments
 
-| Argument | Default | Description |
-|---|---|---|
-| `-r`, `--ranking-csv` | — | `ranker.py` output CSV to source candidates from (mutually exclusive with `--rules-file`) |
-| `-f`, `--rules-file` | — | Plain `.rule` file of already-ranked/optimized rules to use instead of a ranking CSV |
-| `-w`, `--wordlist` | required | Base wordlist |
-| `-k`, `--cracked` | required | Known-cracked passwords list |
-| `-o`, `--output` | required | Output `.rule` path |
-| `-c`, `--candidates` | `20000` | How many top-scored rules to feed into CELF (not the final selection size — see `--budget`) |
-| `-b`, `--budget` | none (run to saturation) | Max rules in the final selection; ignored if `--budgets` is given |
-| `-B`, `--budgets` | — | Comma-separated budget cutoffs exported as separate files from one CELF run, e.g. `64,250,5000` |
-| `-R`, `--rule-batch-size` | `1024` | Candidate rules evaluated per GPU dispatch batch; also bounds peak host RAM in memmap mode |
-| `-W`, `--words-batch-size` | `150000` | Words per GPU batch for the coverage pass |
-| `-d`, `--device` | — | OpenCL device ID |
-| `--bitmap-path` | `<output_base>.bitmap.dat` | Where to stream the on-disk coverage-bitmap matrix; ignored if `--in-ram` is set |
-| `--keep-bitmap` | — | Flag — don't delete the on-disk bitmap file after a successful run |
-| `--in-ram` | — | Flag — build the coverage matrix fully in RAM instead of a disk-backed memmap |
-| `--no-parallel-celf` | — | Flag — disable multi-core parallel CELF select and use the single-threaded version |
-| `--celf-workers` | `os.cpu_count()` | Worker processes for parallel CELF select |
-| `--celf-io-threads` | `4` | Concurrent `os.pread()` calls per worker in parallel CELF select (raise on fast NVMe) |
-| `--celf-batch-multiplier` | `8` | How many candidates parallel CELF revalidates per round, as a multiple of `workers × io_threads` |
+| Argument                    | Default                  | Description                                                                                                                                                                             |
+| --------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| -r, --ranking-csv           | —                        | ranker output CSV to source candidates from (mutually exclusive with --rules-file)                                                                                                      |
+| -f, --rules-file            | —                        | Plain .rule file of already-ranked/optimized rules (mutually exclusive with --ranking-csv)                                                                                              |
+| -w, --wordlist              | required                 | Base wordlist                                                                                                                                                                           |
+| -k, --cracked               | required                 | Known-cracked passwords list                                                                                                                                                            |
+| -o, --output                | required                 | Output .rule path                                                                                                                                                                       |
+| -c, --candidates            | 20000                    | How many top-scored rules to feed into CELF (not the final selection size — see --budget)                                                                                               |
+| -b, --budget                | none (run to saturation) | Max rules in the final selection; ignored if --budgets is given                                                                                                                         |
+| -B, --budgets               | —                        | Comma-separated budget cutoffs exported as separate files from one CELF run, e.g. 64,250,5000                                                                                           |
+| -R, --rule-batch-size       | 1024                     | Candidate rules evaluated per GPU dispatch batch; also bounds peak host RAM in memmap mode                                                                                              |
+| -W, --words-batch-size      | 150000                   | Words per GPU batch for the coverage pass                                                                                                                                               |
+| --max-word-len              | 32                       | Words/cracked entries longer than this are skipped (not truncated); also sizes the GPU kernel’s per-thread word buffer                                                                  |
+| --max-rule-len              | 32                       | Max characters per hashcat rule considered                                                                                                                                              |
+| --max-output-len            | 64                       | Max length of a rule’s output word the GPU kernel will produce                                                                                                                          |
+| --auto-max-output-len       | off                      | Before the GPU pass, run a fast CPU-only static estimate over every candidate rule and raise --max-output-len if needed                                                                 |
+| --print-output-len-estimate | off                      | Run the same static estimate, print the recommended --max-output-len (and the rule responsible for the worst case), then exit without touching the GPU                                  |
+| -d, --device                | —                        | OpenCL device ID                                                                                                                                                                        |
+| --bitmap-path               | <output_base>.bitmap.dat | Where to stream the on-disk coverage-bitmap matrix; ignored if --in-ram is set                                                                                                          |
+| --keep-bitmap               | off                      | Don’t delete the on-disk bitmap file after a successful run                                                                                                                             |
+| --no-hybrid                 | off                      | Use the old dense, fixed-stride on-disk bitmap format instead of the default hybrid dense/sparse format                                                                                 |
+| --in-ram                    | off                      | Build the coverage matrix fully in RAM instead of a disk-backed memmap                                                                                                                  |
+| --no-parallel-celf          | off                      | Disable multi-core parallel CELF select and use the single-threaded version                                                                                                             |
+| --celf-workers              | os.cpu_count()           | Worker processes for parallel CELF select                                                                                                                                               |
+| --celf-io-threads           | 4                        | Concurrent os.pread() calls per worker in parallel CELF select (raise on fast NVMe)                                                                                                     |
+| --celf-batch-multiplier     | 8                        | How many candidates parallel CELF revalidates per round, as a multiple of workers × io_threads                                                                                          |
+| --strategy                  | bitmap                   | Coverage + selection strategy: bitmap (default dense/hybrid matrix), recompute-gpu (no matrix; re-score survivors on GPU each CELF round), or sparse (sparse coverage store + CPU CELF) |
+| --sparse-disk-threshold     | 100000                   | --strategy sparse only: switch coverage store from in-memory dict to SQLite above this many candidates                                                                                  |
+| --sparse-store-path         | —                        | --strategy sparse only: persist the SQLite coverage store at this path instead of a temp file                                                                                           |
+| --gpu-celf                  | off                      | --strategy sparse only: run the CELF greedy-select loop on the GPU instead of CPU                                                                                                       |
+| --gpu-celf-batch            | (module default)         | --strategy sparse --gpu-celf only: max stale heap entries revalidated per GPU dispatch                                                                                                  |
 
 By default (disk-backed bitmap, i.e. no `--in-ram`), CELF's greedy-select phase runs across all CPU cores via multiprocessing, with each worker issuing several concurrent `os.pread()` calls against the on-disk bitmap file to keep read queue depth up — this is what keeps rules/s high during lazy re-validation on fast storage. Use `--no-parallel-celf` to fall back to the plain single-threaded selector.
 
