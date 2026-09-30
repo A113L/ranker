@@ -98,26 +98,6 @@ minimal stub for `pyopencl` so the GPU-dependent modules can still be
 OpenCL/GPU stack. If `pyopencl` is genuinely installed, the stub is
 skipped and the real module is used.
 
-## Package layout
-
-```
-rule_ranker_pkg/
-├── run_ranker.py              # top-level dispatcher CLI
-├── rule_ranker/
-│   ├── __init__.py
-│   ├── ranker.py               # (was ranker.py)
-│   ├── ranker_handler.py       # (was ranker_handler.py)
-│   └── ranker_postprocess.py   # (was ranker_postprocess.py)
-├── tests/
-│   ├── conftest.py
-│   ├── test_ranker_validator.py
-│   ├── test_handler_parsing.py
-│   ├── test_postprocess_utils.py
-│   └── test_run_ranker_dispatcher.py
-├── requirements.txt
-├── setup.py
-└── README.md
-```
 ## Comparison of Bitmap, Recompute-GPU, and Sparse Strategies for Coverage Matrix and CELF
 
 | Aspect | `bitmap` | `recompute-gpu` | `sparse` |
