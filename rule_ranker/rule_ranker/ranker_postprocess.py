@@ -1345,6 +1345,20 @@ def celf_select_parallel(rules, bitmaps, bitmap_path, initial_gains,
             if not batch_idx:
                 continue
 
+            # Sort this round's batch by on-disk byte offset (not heap
+            # order) before handing it to the workers. Doesn't change
+            # which rows get revalidated or the result -- results are
+            # matched back up by idx, not position -- but it means the
+            # io_threads within each worker chunk pread() offsets that
+            # are close together / monotonically increasing instead of
+            # scattered in gain order, which is friendlier to the
+            # device's read-ahead and NCQ reordering. Cheap: batch_size
+            # is at most a few hundred entries.
+            if is_hybrid:
+                batch_idx.sort(key=lambda i2: bitmaps.offsets[i2])
+            else:
+                batch_idx.sort()  # legacy fixed-stride: offset == idx * row_bytes
+
             revalidations += len(batch_idx)
             covered_bytes = covered.tobytes()
             tasks = [(chunk, covered_bytes, io_threads)
@@ -1374,8 +1388,18 @@ def celf_select_parallel(rules, bitmaps, bitmap_path, initial_gains,
 # --- Output ---
 # ============================================================
 def save_output(selected, output_path):
-    base = os.path.splitext(output_path)[0]
-    rule_path = output_path if output_path.endswith('.rule') else base + '.rule'
+    """Write the selected rules to EXACTLY output_path, as given by the
+    caller -- this used to silently rewrite any extension other than
+    '.rule' (e.g. -o rules.txt was actually written to rules.rule, not
+    rules.txt), which is the '-o doesn't save to the given path' bug.
+    The only case that still adjusts the path is a path with NO
+    extension at all (e.g. -o rules), which gets '.rule' appended
+    since there's nothing in that case to honor instead."""
+    if os.path.splitext(output_path)[1]:
+        rule_path = output_path
+    else:
+        rule_path = output_path + '.rule'
+    base = os.path.splitext(rule_path)[0]
     csv_path = base + '_celf.csv'
 
     with open(rule_path, 'w', newline='\n', encoding='utf-8') as f:
@@ -1409,9 +1433,15 @@ def parse_budgets(budgets_str):
 
 def save_output_multi(selected, output_path, budgets):
     """Save one .rule/.csv pair per budget cutoff, e.g. --budgets 64,250,5000
-    produces <base>_top64.rule, <base>_top250.rule, <base>_top5000.rule.
-    Just slicing prefixes of one CELF run (CELF's selection order is a
-    nested sequence of near-optimal solutions), no re-running CELF.
+    produces <base>_top64.rule, <base>_top250.rule, <base>_top5000.rule,
+    PLUS the exact --output path itself (the full/largest-budget
+    selection) -- a prior version only ever wrote the _topN files and
+    never the literal path passed to -o/--output, which was the other
+    half of the '-o doesn't save to the given path' bug: passing
+    --budgets alongside -o meant the file the user actually asked for
+    with -o was never created at all. Just slicing prefixes of one
+    CELF run (CELF's selection order is a nested sequence of
+    near-optimal solutions), no re-running CELF.
     """
     base = os.path.splitext(output_path)[0]
     ext = os.path.splitext(output_path)[1] or '.rule'
@@ -1423,6 +1453,9 @@ def save_output_multi(selected, output_path, budgets):
         subset = selected[:n]
         path = f"{base}_top{n}{ext}"
         save_output(subset, path)
+    # Always honor -o/--output exactly, in addition to the per-budget
+    # files above -- see docstring.
+    save_output(selected, output_path)
 
 
 # ============================================================
@@ -1543,7 +1576,73 @@ def main(argv=None):
                           "workers x io_threads x this-many candidates per "
                           "round (default 8), to keep all workers fed even "
                           "as individual reads finish at different times.")
+    ap.add_argument('--strategy', choices=['bitmap', 'recompute-gpu', 'sparse'],
+                     default=None,
+                     help="Coverage-evaluation + greedy-selection strategy:\n"
+                          "  bitmap (default) -- build a dense/hybrid "
+                          "(n_candidates x cracked_universe) coverage matrix "
+                          "once (see --bitmap-path/--in-ram/--no-hybrid), "
+                          "then CELF-select against it. Peak memory scales "
+                          "with n_candidates x cracked_universe.\n"
+                          "  recompute-gpu -- never materializes a coverage "
+                          "matrix (celf_recompute_gpu.py): each CELF round "
+                          "re-scores surviving candidates on the GPU against "
+                          "the current shrinking not-yet-covered set instead "
+                          "of reading a precomputed row. Peak memory is "
+                          "O(n_candidates) + O(cracked_universe bits), at "
+                          "the cost of repeated GPU compute across rounds. "
+                          "Best when --budget is much smaller than "
+                          "--candidates (most candidates get pruned before "
+                          "ever reaching a GPU rescore); if --budget is "
+                          "close to (or unset, i.e. defaults to) "
+                          "--candidates, this strategy typically does MORE "
+                          "total GPU work than 'bitmap', not less.\n"
+                          "  sparse -- one-time GPU pass stores each "
+                          "candidate's coverage as a SPARSE list of the "
+                          "cracked-universe indices it actually hits "
+                          "(sparse_coverage.py), in a dict (or SQLite above "
+                          "--sparse-disk-threshold candidates) instead of a "
+                          "dense matrix row. CELF greedy selection then runs "
+                          "ENTIRELY ON THE CPU against that sparse store -- "
+                          "no GPU dispatch during selection rounds at all, "
+                          "so unlike 'recompute-gpu' its cost doesn't depend "
+                          "on how many CELF rounds/revalidations are needed. "
+                          "Real hashcat-rule coverage is usually sparse "
+                          "enough that this also uses much less memory than "
+                          "'bitmap'. Good default choice when you're unsure "
+                          "which to pick and 'bitmap' isn't working well.\n"
+                          "'recompute-gpu' and 'sparse' both make "
+                          "--bitmap-path, --keep-bitmap, --no-hybrid, "
+                          "--in-ram, --no-parallel-celf, --celf-workers, "
+                          "--celf-io-threads and --celf-batch-multiplier "
+                          "irrelevant (no bitmap/matrix stage runs).")
+    ap.add_argument('--sparse-disk-threshold', type=int, default=None,
+                     help="--strategy sparse only: switch its coverage "
+                          "store from an in-memory dict to a SQLite-backed "
+                          "one above this many candidates (default: "
+                          "100,000 -- see sparse_coverage.SPARSE_DISK_THRESHOLD; "
+                          "not imported here so plain --help keeps working "
+                          "in environments without pyopencl installed).")
+    ap.add_argument('--sparse-store-path', type=str, default=None,
+                     help="--strategy sparse only: persist its SQLite "
+                          "coverage store at this path instead of a temp "
+                          "file deleted afterward (only relevant once "
+                          "--candidates exceeds --sparse-disk-threshold).")
+    ap.add_argument('--gpu-celf', action='store_true',
+                     help="--strategy sparse only: run the CELF greedy-"
+                          "select loop on the GPU (packed covered-bitset "
+                          "+ gain-recompute kernel) instead of CPU/host "
+                          "RAM. Coverage computation is GPU either way; "
+                          "this only changes the selection rounds.")
+    ap.add_argument('--gpu-celf-batch', type=int, default=None,
+                     help="--strategy sparse --gpu-celf only: max stale "
+                          "heap entries revalidated per GPU dispatch "
+                          "(default: sparse_coverage.DEFAULT_GPU_CELF_BATCH, "
+                          "not imported here so plain --help keeps working "
+                          "without pyopencl installed).")
     args = ap.parse_args(argv)
+
+    strategy = args.strategy or 'bitmap'
 
     MAX_WORD_LEN = args.max_word_len
     MAX_RULE_LEN = args.max_rule_len
@@ -1587,6 +1686,92 @@ def main(argv=None):
     if len(cracked_hashes) == 0:
         log(red("Cracked list is empty -- nothing to optimize for. Aborting."))
         sys.exit(1)
+
+    if strategy == 'recompute-gpu':
+        # Memory-light path: no coverage matrix is ever allocated, in
+        # RAM or on disk, so the whole bitmap-stage machinery below
+        # (bitmap_path, --in-ram, hybrid row store, parallel-CELF
+        # worker pool, etc.) is simply skipped.
+        from .celf_recompute_gpu import celf_select_recompute_gpu
+        log(f"{blue('--strategy recompute-gpu:')} using memory-light GPU recompute+lazy-greedy "
+            f"strategy -- {dim('no coverage bitmap matrix will be allocated')}")
+
+        budgets = parse_budgets(args.budgets) if args.budgets else []
+        run_budget = max(budgets) if budgets else args.budget
+
+        selected = celf_select_recompute_gpu(
+            rules, args.wordlist, cracked_hashes,
+            rule_batch_size=args.rule_batch_size,
+            words_per_gpu_batch=args.words_batch_size,
+            device_id=args.device,
+            budget=run_budget,
+        )
+
+        if budgets:
+            save_output_multi(selected, args.output, budgets)
+        else:
+            save_output(selected, args.output)
+
+        print(f"\n{green('=' * 60)}")
+        print(bold("CELF Post-Processing Complete (recompute-gpu)"))
+        print(f"{green('=' * 60)}")
+        log(f"{blue('Total time:')} {cyan(f'{time.time() - t0:.1f}s')}")
+        return
+
+    if strategy == 'sparse':
+        # Sparse-coverage path: one-time GPU pass stores each rule's
+        # coverage as a sparse list of cracked-universe indices (dict,
+        # or SQLite above --sparse-disk-threshold candidates), then
+        # CELF greedy selection runs entirely on the CPU against that
+        # store -- no GPU dispatch during selection rounds, so unlike
+        # recompute-gpu its cost doesn't grow with how many CELF
+        # rounds/revalidations are needed. See sparse_coverage.py.
+        from .sparse_coverage import (
+            compute_sparse_coverage_gpu, celf_select_sparse, celf_select_sparse_gpu,
+            SPARSE_DISK_THRESHOLD, DEFAULT_GPU_CELF_BATCH,
+        )
+        _sparse_dim_note = dim(
+            'no coverage bitmap matrix will be allocated, '
+            + ('covered set + gain recompute resident on GPU'
+               if args.gpu_celf else
+               'no GPU dispatch during greedy-selection rounds')
+        )
+        log(f"{blue('--strategy sparse:')} using sparse coverage store + "
+            f"{'GPU' if args.gpu_celf else 'pure-CPU'} CELF -- {_sparse_dim_note}")
+
+        disk_threshold = args.sparse_disk_threshold or SPARSE_DISK_THRESHOLD
+        store, _initial_counts = compute_sparse_coverage_gpu(
+            rules, args.wordlist, cracked_hashes,
+            rule_batch_size=args.rule_batch_size,
+            words_per_gpu_batch=args.words_batch_size,
+            device_id=args.device,
+            disk_threshold=disk_threshold,
+            store_path=args.sparse_store_path,
+        )
+        try:
+            budgets = parse_budgets(args.budgets) if args.budgets else []
+            run_budget = max(budgets) if budgets else args.budget
+
+            if args.gpu_celf:
+                selected = celf_select_sparse_gpu(
+                    rules, store, len(cracked_hashes), device_id=args.device,
+                    budget=run_budget,
+                    batch_size=args.gpu_celf_batch or DEFAULT_GPU_CELF_BATCH)
+            else:
+                selected = celf_select_sparse(rules, store, len(cracked_hashes), budget=run_budget)
+
+            if budgets:
+                save_output_multi(selected, args.output, budgets)
+            else:
+                save_output(selected, args.output)
+        finally:
+            store.close()
+
+        print(f"\n{green('=' * 60)}")
+        print(bold("CELF Post-Processing Complete (sparse)"))
+        print(f"{green('=' * 60)}")
+        log(f"{blue('Total time:')} {cyan(f'{time.time() - t0:.1f}s')}")
+        return
 
     bitmap_path = args.bitmap_path or (os.path.splitext(args.output)[0] + '.bitmap.dat')
 
