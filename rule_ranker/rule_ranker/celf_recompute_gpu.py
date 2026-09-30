@@ -37,7 +37,10 @@ can't possibly beat it and is skipped without a GPU launch.
 This module implements that recompute + lazy-upper-bound strategy in
 rule_ranker, reusing this package's own GPU rule-application kernel
 (the same apply_hashcat_rule() transform celf_postprocess.py's
-coverage kernel uses, so results match). The only state kept between
+coverage kernel uses, so results match). Hash membership uses a GPU
+open-addressing table rather than a per-hit binary search through the
+sorted cracked array, substantially reducing random global-memory reads.
+The only state kept between
 rounds is:
   - `active` : a single (W,) uint32 bitmap of cracked hashes NOT YET
     covered (W = ceil(cracked_universe/32) words -- e.g. ~1.2 MB for a
@@ -310,20 +313,36 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
     for (int i=0;i<in_len;i++) output[i]=in_buf[i];
     *changed = final_changed;
 }
-int binary_search_cracked(__global const unsigned int* sorted_hashes, unsigned int n, unsigned int key) {
-    int lo = 0, hi = (int)n - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) >> 1;
-        unsigned int v = sorted_hashes[mid];
-        if (v == key) return mid;
-        if (v < key) lo = mid + 1; else hi = mid - 1;
+// Open-addressed hash table lookup.  The old implementation used a
+// binary search over the sorted cracked-hash array (O(log2(N)) random
+// global-memory reads for every word/rule pair).  On GPUs that random
+// memory traffic becomes the dominant cost once rule transforms are cheap.
+// The table is deliberately kept at <=50% load, so a lookup normally needs
+// only 1-2 probes.  `occupied` is separate because every uint32 hash value is
+// valid, including 0 and UINT_MAX.
+int lookup_cracked_slot(__global const unsigned int* hash_table,
+                        __global const unsigned int* occupied,
+                        unsigned int table_mask, unsigned int key) {
+    unsigned int slot = key * 2654435761U;
+    slot &= table_mask;
+    unsigned int word = slot >> 5;
+    unsigned int bit = slot & 31U;
+    for (unsigned int probe = 0; probe <= table_mask; probe++) {
+        if (occupied[word] & (1U << bit)) {
+            if (hash_table[slot] == key) return (int)slot;
+        } else {
+            return -1;
+        }
+        slot = (slot + 1U) & table_mask;
+        word = slot >> 5;
+        bit = slot & 31U;
     }
     return -1;
 }
 """
 
 
-def get_recompute_kernel_source(num_cracked):
+def get_recompute_kernel_source(num_cracked, hash_table_size):
     """Two kernels sharing the same rule-transform/hash/binary-search
     plumbing as celf_postprocess.get_celf_kernel_source(), but neither
     one ever writes a per-rule bitmap ROW:
@@ -344,6 +363,8 @@ def get_recompute_kernel_source(num_cracked):
 #define MAX_OUTPUT_LEN {MAX_OUTPUT_LEN}
 #define MAX_RULE_LEN {MAX_RULE_LEN}
 #define NUM_CRACKED {num_cracked}
+#define HASH_TABLE_SIZE {hash_table_size}
+#define HASH_TABLE_MASK {hash_table_size - 1}
 
 {_COMMON_KERNEL_BODY}
 
@@ -355,12 +376,14 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void score_against_active_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* cracked_hashes_sorted,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
     __global const unsigned int* active,
     __global int* gains,
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
-    const unsigned int max_word_len)
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
 {{
     unsigned int global_id = get_global_id(0);
     unsigned int total = num_words * num_rules_in_batch;
@@ -392,11 +415,11 @@ void score_against_active_kernel(
     if (changed <= 0 || out_len <= 0) return;
 
     unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
-    int idx = binary_search_cracked(cracked_hashes_sorted, NUM_CRACKED, h);
-    if (idx < 0) return;
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
 
-    unsigned int word_pos = (unsigned int)idx >> 5;
-    unsigned int bit_pos = (unsigned int)idx & 31;
+    unsigned int word_pos = (unsigned int)slot >> 5;
+    unsigned int bit_pos = (unsigned int)slot & 31U;
     if ((active[word_pos] & (1U << bit_pos)) == 0) return;  // already covered
 
     atomic_add(&gains[rule_idx], 1);
@@ -410,12 +433,14 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void apply_and_clear_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rule_in,
-    __global const unsigned int* cracked_hashes_sorted,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
     __global unsigned int* active,
     __global int* cleared_count,
     const unsigned int num_words,
     const unsigned int rule_len,
-    const unsigned int max_word_len)
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
 {{
     unsigned int word_idx = get_global_id(0);
     if (word_idx >= num_words) return;
@@ -437,11 +462,11 @@ void apply_and_clear_kernel(
     if (changed <= 0 || out_len <= 0) return;
 
     unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
-    int idx = binary_search_cracked(cracked_hashes_sorted, NUM_CRACKED, h);
-    if (idx < 0) return;
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
 
-    unsigned int word_pos = (unsigned int)idx >> 5;
-    unsigned int bit_pos = (unsigned int)idx & 31;
+    unsigned int word_pos = (unsigned int)slot >> 5;
+    unsigned int bit_pos = (unsigned int)slot & 31U;
     unsigned int mask = (1U << bit_pos);
     unsigned int old = atomic_and(&active[word_pos], ~mask);
     if (old & mask) atomic_add(cleared_count, 1);
@@ -501,7 +526,7 @@ class _ResidentWordlistMixin:
     # Conservative on purpose -- falling back to the host-resident path
     # is still a large win over per-call disk streaming, so there's no
     # need to cut this close.
-    _GPU_RESIDENT_WORDLIST_FRACTION = 0.6
+    _GPU_RESIDENT_WORDLIST_FRACTION = 0.78
 
     def _resident_chunk_words(self, total_words):
         """How many words to pack into each resident chunk when
@@ -646,7 +671,17 @@ class _GpuScorer(_ResidentWordlistMixin):
                  wordlist_path=None):
         self.n_rules = encoded_rules.shape[0]
         self.num_cracked = num_cracked
-        self.W = max(1, (num_cracked + 31) // 32)
+        # The GPU uses an open-addressed hash table instead of binary-searching
+        # the sorted cracked array for every word/rule pair. Keep <=50% load so
+        # lookups are short and predictable. The active bitmap is indexed by
+        # hash-table slot; only occupied slots are initialized to 1.
+        table_size = 1
+        target_size = max(2, int(math.ceil(num_cracked * 2.0)))
+        while table_size < target_size:
+            table_size <<= 1
+        self.hash_table_size = table_size
+        self.hash_table_mask = table_size - 1
+        self.W = max(1, (table_size + 31) // 32)
         self.rule_batch_size = rule_batch_size
         self.words_per_gpu_batch = words_per_gpu_batch
         self.encoded = encoded_rules
@@ -654,23 +689,30 @@ class _GpuScorer(_ResidentWordlistMixin):
         platform, device = select_device(device_id)
         self.context = cl.Context([device])
         self.queue = cl.CommandQueue(self.context)
-        src = get_recompute_kernel_source(num_cracked)
+        src = get_recompute_kernel_source(num_cracked, self.hash_table_size)
         prg = cl.Program(self.context, src).build()
         self.score_kernel = prg.score_against_active_kernel
         self.clear_kernel = prg.apply_and_clear_kernel
 
         mf = cl.mem_flags
-        self.cracked_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                    hostbuf=cracked_hashes_sorted)
-        # active bitmap: all-ones (everything uncovered) to start.
-        active_init = np.full(self.W, 0xFFFFFFFF, dtype=np.uint32)
-        # Mask off any padding bits past num_cracked in the last word
-        # so they never look "coverable" (harmless either way since
-        # binary_search_cracked only ever returns valid indices < N,
-        # but keeps popcount(active) an exact remaining-count).
-        rem = num_cracked % 32
-        if rem != 0:
-            active_init[-1] = (np.uint32(1) << np.uint32(rem)) - np.uint32(1)
+        # Build a compact GPU open-addressing table.  `occupied` is a bitset
+        # rather than a sentinel value so all 2^32 FNV hashes remain valid.
+        hash_table = np.zeros(self.hash_table_size, dtype=np.uint32)
+        occupied = np.zeros((self.hash_table_size + 31) // 32, dtype=np.uint32)
+        for h in np.asarray(cracked_hashes_sorted, dtype=np.uint32):
+            slot = (int(h) * 2654435761) & self.hash_table_mask
+            while occupied[slot >> 5] & (1 << (slot & 31)):
+                slot = (slot + 1) & self.hash_table_mask
+            hash_table[slot] = h
+            occupied[slot >> 5] |= np.uint32(1 << (slot & 31))
+        self.hash_table_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                      hostbuf=hash_table)
+        self.hash_table_occupied_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                               hostbuf=occupied)
+        # active bitmap is indexed by hash-table slot.  Empty table slots stay
+        # zero, occupied slots start active. This preserves exact remaining
+        # counts without needing a sorted-index lookup on the GPU.
+        active_init = occupied.copy()
         self.active_g = cl.Buffer(self.context, mf.READ_WRITE | mf.COPY_HOST_PTR,
                                    hostbuf=active_init)
 
@@ -737,10 +779,11 @@ class _GpuScorer(_ResidentWordlistMixin):
                         sub_start * np.int32().itemsize, sub_num * np.int32().itemsize)
                     global_size = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
                     self.score_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
-                                       words_g, sub_rules_g, self.cracked_g,
-                                       self.active_g, sub_gains_g,
-                                       np.uint32(num_words), np.uint32(sub_num),
-                                       np.uint32(MAX_WORD_LEN))
+                                       words_g, sub_rules_g, self.hash_table_g,
+                                       self.hash_table_occupied_g, self.active_g,
+                                       sub_gains_g, np.uint32(num_words),
+                                       np.uint32(sub_num), np.uint32(MAX_WORD_LEN),
+                                       np.uint32(self.hash_table_mask))
 
             host_gains = np.zeros(self.rule_batch_size, dtype=np.int32)
             cl.enqueue_copy(self.queue, host_gains, self.gains_g).wait()
@@ -763,10 +806,11 @@ class _GpuScorer(_ResidentWordlistMixin):
         for words_g, num_words in self._iter_word_chunks(wordlist_path):
             global_size = (int(math.ceil(num_words / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
             self.clear_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
-                               words_g, self.single_rule_g, self.cracked_g,
-                               self.active_g, self.cleared_count_g,
-                               np.uint32(num_words), np.uint32(len(rb)),
-                               np.uint32(MAX_WORD_LEN))
+                               words_g, self.single_rule_g, self.hash_table_g,
+                               self.hash_table_occupied_g, self.active_g,
+                               self.cleared_count_g, np.uint32(num_words),
+                               np.uint32(len(rb)), np.uint32(MAX_WORD_LEN),
+                               np.uint32(self.hash_table_mask))
 
         host_count = np.zeros(1, dtype=np.int32)
         cl.enqueue_copy(self.queue, host_count, self.cleared_count_g).wait()
@@ -867,32 +911,10 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
 
     limit = budget if budget else n_active
 
-    # --- Advisory: this strategy trades a ONE-TIME O(n_candidates x
-    # wordlist) pass (the bitmap/matrix strategy's cost) for
-    # O(rounds x avg-rescored-per-round x wordlist) spread across the
-    # whole run. Early rounds -- before best_gain has climbed high
-    # enough for the upper_bound break to prune aggressively -- can
-    # each need rescoring a large fraction of `n_active`, and there are
-    # up to `limit` such rounds. When `limit` is close to `n_active`
-    # (a budget near or at the full candidate pool -- i.e. "keep
-    # basically everything", where greedy diversity buys little over
-    # a plain ranking), that arithmetic can make total GPU work here
-    # many times larger than the bitmap strategy's one-time pass, not
-    # smaller -- the opposite of what this strategy is for. This is a
-    # heuristic warning, not a hard block: it can't know your actual
-    # wordlist size or GPU throughput, only relative pool/budget size.
-    if limit >= max(1, int(0.3 * n_active)):
-        log(f"{yellow('Warning:')} --recompute-gpu with budget "
-            f"{cyan(f'{limit:,}')} against {cyan(f'{n_active:,}')} live "
-            f"candidates ({cyan(f'{100.0 * limit / max(1, n_active):.0f}%')} "
-            f"of the pool) is likely to do MORE total GPU work here than "
-            f"the default bitmap/matrix strategy's one-time pass would, "
-            f"not less -- this strategy wins specifically when the final "
-            f"selection is a SMALL fraction of the candidate pool (most "
-            f"candidates get pruned by the upper-bound check before ever "
-            f"reaching a GPU rescore). If this run is unexpectedly slow, "
-            f"consider dropping --recompute-gpu (use the default bitmap "
-            f"strategy instead) or reducing --budget/--candidates.")
+    # No heuristic warning here: the recompute path is intentionally a
+    # selectable memory-light strategy. Runtime depends strongly on GPU,
+    # wordlist residency, candidate distribution and budget; printing a
+    # fixed pool/budget warning was noisy and did not predict actual runtime.
 
     selected = []
     round_num = 0
