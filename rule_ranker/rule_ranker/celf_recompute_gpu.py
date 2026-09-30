@@ -757,16 +757,32 @@ class _GpuScorer(_ResidentWordlistMixin):
         compute -- is what dominates a single-rule lazy-heap
         revalidation, since there's very little actual kernel work to
         hide it behind."""
+        # NOTE: transfers/zeroing below are sized to the ACTUAL chunk
+        # length `n`, not the allocated rule_batch_size. Most
+        # score_batch() calls during lazy-heap revalidation only need
+        # to rescore a small handful of candidates (that's the whole
+        # point of the upper-bound pruning above this call) even
+        # though rules_g/gains_g are sized for the worst case
+        # (rule_batch_size, for the upper-bound pass in pass 1). An
+        # earlier version always copied/zeroed/read back the full
+        # rule_batch_size-sized region regardless of n, which meant a
+        # 1-2 rule revalidation still paid for a 1024-row H2D copy, a
+        # 1024-entry buffer fill, and a 1024-entry D2H readback -- pure
+        # overhead on the hot path this strategy is supposed to keep
+        # cheap. Bounding every transfer to n removes that overhead
+        # entirely without changing kernel launch sizing, which was
+        # already correctly bounded by n/sub_num.
         out = np.zeros(len(rule_indices), dtype=np.int64)
         for cs in range(0, len(rule_indices), self.rule_batch_size):
             ce = min(cs + self.rule_batch_size, len(rule_indices))
             idx_chunk = rule_indices[cs:ce]
             n = len(idx_chunk)
-            rules_batch_np = np.zeros((self.rule_batch_size, MAX_RULE_LEN), dtype=np.uint8)
-            rules_batch_np[:n] = self.encoded[idx_chunk]
-            cl.enqueue_copy(self.queue, self.rules_g, rules_batch_np)
-            cl.enqueue_fill_buffer(self.queue, self.gains_g, np.int32(0), 0,
-                                    self.rule_batch_size * np.int32().itemsize)
+            rules_batch_np = np.ascontiguousarray(self.encoded[idx_chunk])
+            rules_region_g = self.rules_g.get_sub_region(0, n * MAX_RULE_LEN)
+            gains_region_g = self.gains_g.get_sub_region(0, n * np.int32().itemsize)
+            cl.enqueue_copy(self.queue, rules_region_g, rules_batch_np)
+            cl.enqueue_fill_buffer(self.queue, gains_region_g, np.int32(0), 0,
+                                    n * np.int32().itemsize)
 
             for words_g, num_words in self._iter_word_chunks(wordlist_path):
                 rules_per_sub = max(1, min(n, MAX_DISPATCH_ITEMS // max(num_words, 1)))
@@ -785,9 +801,9 @@ class _GpuScorer(_ResidentWordlistMixin):
                                        np.uint32(sub_num), np.uint32(MAX_WORD_LEN),
                                        np.uint32(self.hash_table_mask))
 
-            host_gains = np.zeros(self.rule_batch_size, dtype=np.int32)
-            cl.enqueue_copy(self.queue, host_gains, self.gains_g).wait()
-            out[cs:ce] = host_gains[:n]
+            host_gains = np.zeros(n, dtype=np.int32)
+            cl.enqueue_copy(self.queue, host_gains, gains_region_g).wait()
+            out[cs:ce] = host_gains
         return out
 
     def apply_winner_and_clear(self, rule_str, wordlist_path):
