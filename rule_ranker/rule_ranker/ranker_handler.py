@@ -276,11 +276,11 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
         top_indices.sort(key=lambda x: all_combined_scores[x], reverse=True)
         
         top_rules = []
-        for idx in top_indices:
+        for rank, idx in enumerate(top_indices, 1):
             top_rules.append({
                 'original_rule': all_original_rules[idx],
                 'cleaned_rule': all_cleaned_rules[idx],
-                'rank': idx + 1,  # Approximate rank
+                'rank': rank,  # Actual rank by combined_score, not array position
                 'combined_score': all_combined_scores[idx],
                 'effectiveness_score': all_effectiveness_scores[idx],
                 'uniqueness_score': all_uniqueness_scores[idx],
@@ -533,30 +533,20 @@ def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, 
         
         print(f"{blue('Save')} {bold('Saving')} {cyan(fmt_num(len(rules_to_save)))} {bold('rules with scores to:')} {cyan(output_file)}")
         
-        with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
-            # Write in chunks for speed
-            buffer_size = 10000
-            buffer = []
-            
-            # Write header
-            buffer.append("# Clean Hashcat Rules with Scores\n")
-            buffer.append("# Format: Combined_Score:Effectiveness_Score:Uniqueness_Score:Rule\n")
-            buffer.append("# Includes colon rule (empty rule) as first line\n")
-            buffer.append("0:0:0::\n")  # Colon rule with zero scores
+        with open(output_file, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data'])
             
             with tqdm(total=len(rules_to_save), desc=f"{green('Write')} Writing rules with scores", unit=" rules") as pbar:
-                for rule in rules_to_save:
-                    buffer.append(f"{rule['combined_score']}:{rule['effectiveness_score']}:{rule['uniqueness_score']}:{rule['cleaned_rule']}\n")
-                    
-                    if len(buffer) >= buffer_size:
-                        f.write(''.join(buffer))
-                        buffer = []
-                    
+                for i, rule in enumerate(rules_to_save, 1):
+                    writer.writerow([
+                        rule.get('rank', i),
+                        rule['combined_score'],
+                        rule['effectiveness_score'],
+                        rule['uniqueness_score'],
+                        rule['cleaned_rule'],
+                    ])
                     pbar.update(1)
-                
-                # Write remaining buffer
-                if buffer:
-                    f.write(''.join(buffer))
         
         print(f"{green('OK')} {bold('Rules with scores saved to:')} {cyan(output_file)}")
         return True
@@ -656,8 +646,8 @@ Examples:
     )
     parser.add_argument(
         '-o', '--output',
-        default='rule_analysis_summary.txt',
-        help='Output file for analysis summary (default: rule_analysis_summary.txt)'
+        default=None,
+        help='Output file for analysis summary (default: rule_analysis_summary.txt, unless --rules-only)'
     )
     parser.add_argument(
         '-r', '--rules-output',
@@ -707,6 +697,25 @@ Examples:
     )
     
     args = parser.parse_args(argv)
+    
+    # --- Resolve output filenames -------------------------------------
+    # -o has a conventional default, but that default must not be written
+    # when --rules-only is set UNLESS the user explicitly passed -o
+    # themselves (explicit beats the --rules-only suppression).
+    output_explicit = args.output is not None
+    if args.output is None:
+        args.output = 'rule_analysis_summary.txt'
+    write_summary = output_explicit or not args.rules_only
+    
+    # Base name used to auto-name outputs, derived from the first input file.
+    input_stem = Path(args.input[0]).stem if args.input else 'rule_analysis'
+    
+    # --rules-only signals clear intent to get a rules file; if -r wasn't
+    # given there would otherwise be nowhere to write it (and -t would
+    # silently appear to do nothing). Auto-name it in that case.
+    if args.rules_only and not args.rules_output:
+        args.rules_output = f"{input_stem}_clean.rule"
+        print(f"{yellow('Info')} {bold('--rules-only set with no -r/--rules-output; using:')} {cyan(args.rules_output)}")
     
     print(f"{green('=' * 70)}")
     print(f"{bold('FAST RULE SCORING ANALYSIS TOOL')}")
@@ -768,7 +777,7 @@ Examples:
     analysis_results['analysis_time'] = analysis_time
     
     # Save outputs
-    if args.output and not args.rules_only:
+    if write_summary:
         save_start = time.time()
         save_summary_fast(analysis_results, args.output, args.top)
         save_time = time.time() - save_start
@@ -814,7 +823,7 @@ Examples:
     
     print(f"\n{green('OK')} {bold('Analysis complete!')}")
     print(f"{yellow('Output')} {bold('Output files created:')}")
-    if args.output and not args.rules_only:
+    if write_summary:
         print(f"  • Analysis summary: {cyan(args.output)}")
     if args.rules_output:
         print(f"  • Clean Hashcat rules: {cyan(args.rules_output)}")
