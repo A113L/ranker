@@ -261,7 +261,7 @@ python run_ranker.py handler -i ranking.csv -r hashcat_rules.rule -t 10000 --rul
 | `--chunk-size` | `10000` | Chunk size used while streaming/parsing each input file |
 | `--no-progress` | off | Disable progress bars |
 | `--rules-only` | off | Only write the clean `.rule` file; skip the text analysis summary |
-
+| `--no-stats` | off | Skip statistics: no per-rule occurrence/score tracking and no analysis summary file (-o) |
 ---
 
 ## Output Files
