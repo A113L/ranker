@@ -46,7 +46,7 @@ class _FakeScorer:
             out[i] = len(self.coverage.get(rule_str, set()) & self.active)
         return out
 
-    def apply_winner_and_clear(self, rule_str, wordlist_path):
+    def apply_winner_and_clear(self, rule_idx, rule_str, wordlist_path):
         newly = self.coverage.get(rule_str, set()) & self.active
         self.active -= newly
         return len(newly)

@@ -143,3 +143,30 @@ class TestHandlerCLI:
         assert rules_out.exists()
         rules_text = rules_out.read_text(encoding="utf-8")
         assert "u" in rules_text.splitlines()
+
+    def test_no_stats_cli_skips_summary_but_writes_rules(self, tmp_path):
+        csv_path = tmp_path / "ranking.csv"
+        _write_legacy_csv(csv_path, [(1, 900, 500, 400, "u"), (2, 100, 60, 40, "l")])
+        summary_out = tmp_path / "summary.txt"
+        rules_out = tmp_path / "clean.rule"
+        rh.main(["-i", str(csv_path), "-o", str(summary_out), "-r", str(rules_out),
+                 "--no-stats", "--no-progress"])
+        assert not summary_out.exists()
+        assert "u" in rules_out.read_text(encoding="utf-8").splitlines()
+
+
+class TestNoStats:
+    def test_collect_stats_false_skips_tracking_keeps_top_rules(self, tmp_path):
+        csv1 = tmp_path / "a.csv"
+        csv2 = tmp_path / "b.csv"
+        _write_legacy_csv(csv1, [(1, 100, 60, 40, "l")])
+        _write_legacy_csv(csv2, [(1, 900, 500, 400, "l")])
+        d1 = rh.parse_ranking_file_fast(str(csv1), show_progress=False)
+        d2 = rh.parse_ranking_file_fast(str(csv2), show_progress=False)
+        r = rh.analyze_rules_fast([d1, d2], show_progress=False, collect_stats=False)
+        assert r["unique_rules"] is None
+        assert r["common_rules"] == {}
+        assert r["total_rules"] == 2
+        assert r["top_rules"][0]["combined_score"] == 900
+        r2 = rh.analyze_rules_fast([d1, d2], show_progress=False)
+        assert len(r2["common_rules"]) == 1
