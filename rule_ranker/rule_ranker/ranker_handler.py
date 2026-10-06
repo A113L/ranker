@@ -174,8 +174,15 @@ def parse_ranking_file_fast(filepath: str, chunk_size: int = 10000, show_progres
         print(f"{red('ERROR')} {bold('Error reading file')} {filepath}: {e}")
         return []
 
-def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] = None, show_progress: bool = True) -> Dict:
-    """Fast analysis with optimized data structures and progress bar"""
+def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] = None, show_progress: bool = True,
+                       collect_stats: bool = True) -> Dict:
+    """Fast analysis with optimized data structures and progress bar.
+
+    collect_stats=False skips the per-rule occurrence/score tracking
+    (unique-rule count, cross-file common rules), which is the main RAM
+    consumer on large inputs. Top rules and score totals/averages are
+    still computed.
+    """
     start_time = time.time()
     
     # Use lists for storage (faster than appending to list of dicts)
@@ -219,8 +226,9 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
             all_source_files.append(rule['source_file'])
             
             # Track occurrences
-            rule_file_occurrences[cleaned_rule].add(rule['source_file'])
-            rule_scores[cleaned_rule].append(rule['combined_score'])
+            if collect_stats:
+                rule_file_occurrences[cleaned_rule].add(rule['source_file'])
+                rule_scores[cleaned_rule].append(rule['combined_score'])
             
             if show_progress:
                 pbar.update(1)
@@ -237,7 +245,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     avg_effectiveness = total_effectiveness_score / total_rules if total_rules > 0 else 0
     avg_uniqueness = total_uniqueness_score / total_rules if total_rules > 0 else 0
     
-    unique_rules = len(rule_file_occurrences)
+    unique_rules = len(rule_file_occurrences) if collect_stats else None
     
     # Find rules in multiple files
     common_rules = {rule: files for rule, files in rule_file_occurrences.items() 
@@ -309,11 +317,11 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
             })
     
     # Prepare occurrence data for output
-    if show_progress:
+    if show_progress and collect_stats:
         print(f"{blue('->')} {bold('Preparing statistics...')}")
     
     detailed_occurrences = {}
-    for rule, files in rule_file_occurrences.items():
+    for rule, files in rule_file_occurrences.items():  # empty when collect_stats=False
         if len(files) > 1:
             avg_score = sum(rule_scores[rule]) / len(rule_scores[rule])
             detailed_occurrences[rule] = {
@@ -322,6 +330,9 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
                 'avg_score': avg_score
             }
     
+    rule_file_occurrences.clear()
+    rule_scores.clear()
+
     elapsed = time.time() - start_time
     print(f"{green('Fast')} {bold('Analysis completed in:')} {cyan(f'{elapsed:.2f}s')} "
           f"{bold(f'({total_rules/max(elapsed, 0.001):.0f} rules/sec)')}")
@@ -337,7 +348,8 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
         'avg_uniqueness_score': avg_uniqueness,
         'top_rules': top_rules,
         'common_rules': detailed_occurrences,
-        'processing_time': elapsed
+        'processing_time': elapsed,
+        'stats_collected': collect_stats
     }
 
 def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[int] = None) -> bool:
@@ -361,8 +373,9 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             buffer.append("OVERALL STATISTICS:\n")
             buffer.append("-" * 40 + "\n")
             buffer.append(f"Total Rules Processed: {analysis_results['total_rules']:,}\n")
-            buffer.append(f"Unique Rules Found: {analysis_results['unique_rules']:,}\n")
-            buffer.append(f"Rules in Multiple Files: {len(analysis_results['common_rules']):,}\n")
+            if analysis_results.get('stats_collected', True):
+                buffer.append(f"Unique Rules Found: {analysis_results['unique_rules']:,}\n")
+                buffer.append(f"Rules in Multiple Files: {len(analysis_results['common_rules']):,}\n")
             buffer.append(f"Processing Time: {analysis_results['processing_time']:.2f} seconds\n\n")
             
             flush_buffer()
@@ -566,7 +579,7 @@ def print_summary_to_console_fast(analysis_results: Dict, top_n: int = 20) -> No
     
     # Statistics
     total_rules_fmt = f"{stats['total_rules']:,}"
-    unique_rules_fmt = f"{stats['unique_rules']:,}"
+    unique_rules_fmt = f"{stats['unique_rules']:,}" if stats['unique_rules'] is not None else 'n/a'
     common_rules_fmt = f"{len(stats['common_rules']):,}"
     total_combined_fmt = f"{stats['total_combined_score']:,}"
     total_effectiveness_fmt = f"{stats['total_effectiveness_score']:,}"
@@ -578,8 +591,9 @@ def print_summary_to_console_fast(analysis_results: Dict, top_n: int = 20) -> No
     
     print(f"{blue('->')} {bold('Overall Statistics:')}")
     print(f"  {bold('Total Rules:')} {cyan(total_rules_fmt)}")
-    print(f"  {bold('Unique Rules:')} {cyan(unique_rules_fmt)}")
-    print(f"  {bold('Rules in Multiple Files:')} {cyan(common_rules_fmt)}")
+    if stats.get('stats_collected', True):
+        print(f"  {bold('Unique Rules:')} {cyan(unique_rules_fmt)}")
+        print(f"  {bold('Rules in Multiple Files:')} {cyan(common_rules_fmt)}")
     print(f"  {bold('Processing Time:')} {cyan(processing_time_fmt)}s")
     
     # Scores
@@ -696,6 +710,14 @@ Examples:
         help='Only save clean rules, no analysis summary'
     )
     
+    parser.add_argument(
+        '--no-stats',
+        action='store_true',
+        help='Skip statistics: no per-rule occurrence/score tracking and no '
+             'analysis summary file (-o). Greatly reduces RAM use on large '
+             'files. Rule outputs (-r, -s) are unaffected.'
+    )
+    
     args = parser.parse_args(argv)
     
     # --- Resolve output filenames -------------------------------------
@@ -706,6 +728,10 @@ Examples:
     if args.output is None:
         args.output = 'rule_analysis_summary.txt'
     write_summary = output_explicit or not args.rules_only
+    if args.no_stats:
+        if output_explicit:
+            print(f"{yellow('Info')} {bold('--no-stats set; ignoring -o and not writing the analysis summary.')}")
+        write_summary = False
     
     # Base name used to auto-name outputs, derived from the first input file.
     input_stem = Path(args.input[0]).stem if args.input else 'rule_analysis'
@@ -768,7 +794,8 @@ Examples:
     # Analyze the data
     print(f"\n{blue('->')} {bold('Analyzing rule data...')}")
     analysis_start = time.time()
-    analysis_results = analyze_rules_fast(all_rules_data, args.top, not args.no_progress)
+    analysis_results = analyze_rules_fast(all_rules_data, args.top, not args.no_progress,
+                                          collect_stats=not args.no_stats)
     analysis_time = time.time() - analysis_start
     
     # Add timing info

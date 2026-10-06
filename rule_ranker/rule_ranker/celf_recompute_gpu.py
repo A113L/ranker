@@ -491,6 +491,85 @@ void apply_and_clear_kernel(
     unsigned int old = atomic_and(&active[word_pos], ~mask);
     if (old & mask) atomic_add(cleared_count, 1);
 }}
+
+// Single-rule variant of score_against_active_kernel that, in addition
+// to counting, RECORDS each hit's hash-table slot into `hit_slots`
+// (does NOT clear `active` -- the candidate is still just being
+// compared against the round's current best). If this candidate goes
+// on to win its round, the caller can reuse this already-known slot
+// list (clear_recorded_slots_kernel below) instead of re-deriving
+// positions with a second full-wordlist pass (apply_and_clear_kernel).
+// hit_slots must be sized for at least num_words entries (a word
+// contributes at most one hit).
+__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
+void score_single_and_record_kernel(
+    __global const unsigned char* base_words_in,
+    __global const unsigned char* rule_in,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
+    __global const unsigned int* active,
+    __global unsigned int* hit_slots,
+    __global int* hit_count,
+    const unsigned int num_words,
+    const unsigned int rule_len,
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
+{{
+    unsigned int word_idx = get_global_id(0);
+    if (word_idx >= num_words) return;
+
+    unsigned char word[MAX_WORD_LEN];
+    unsigned int word_len = 0;
+    for (unsigned int i = 0; i < max_word_len; i++) {{
+        unsigned char c = base_words_in[word_idx * max_word_len + i];
+        if (c == 0) break;
+        word[i] = c; word_len++;
+    }}
+
+    unsigned char rule_str[MAX_RULE_LEN];
+    for (unsigned int i = 0; i < rule_len; i++) rule_str[i] = rule_in[i];
+
+    unsigned char result_temp[MAX_OUTPUT_LEN];
+    int out_len = 0, changed = 0;
+    apply_hashcat_rule(word, word_len, rule_str, (int)rule_len, result_temp, &out_len, &changed);
+    if (changed <= 0 || out_len <= 0) return;
+
+    unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
+
+    unsigned int word_pos = (unsigned int)slot >> 5;
+    unsigned int bit_pos = (unsigned int)slot & 31U;
+    if ((active[word_pos] & (1U << bit_pos)) == 0) return;  // already covered
+
+    int pos = atomic_add(hit_count, 1);
+    hit_slots[pos] = (unsigned int)slot;
+}}
+
+// Clears a small, EXPLICIT list of previously-recorded hash-table
+// slots from `active` -- the fast path for applying a round's winner
+// when score_single_and_record_kernel already captured its exact hit
+// positions earlier in the same round. Launched over just `n_hits`
+// work-items (the candidate's gain) instead of the whole wordlist.
+// Two recorded hits can still name the same slot (two different words
+// both landing on the same cracked target), so this keeps the same
+// atomic_and + old-bit check per entry that apply_and_clear_kernel
+// uses, to get an exact cleared_count.
+__kernel void clear_recorded_slots_kernel(
+    __global unsigned int* active,
+    __global const unsigned int* hit_slots,
+    __global int* cleared_count,
+    const unsigned int n_hits)
+{{
+    unsigned int i = get_global_id(0);
+    if (i >= n_hits) return;
+    unsigned int slot = hit_slots[i];
+    unsigned int word_pos = slot >> 5;
+    unsigned int bit_pos = slot & 31U;
+    unsigned int mask = (1U << bit_pos);
+    unsigned int old = atomic_and(&active[word_pos], ~mask);
+    if (old & mask) atomic_add(cleared_count, 1);
+}}
 """
 
 
@@ -774,9 +853,19 @@ class _GpuScorer(_ResidentWordlistMixin):
 
     def __init__(self, encoded_rules, num_cracked, cracked_hashes_sorted,
                  rule_batch_size, words_per_gpu_batch, device_id=None,
-                 wordlist_path=None):
+                 wordlist_path=None, rule_lens=None):
         self.n_rules = encoded_rules.shape[0]
         self.num_cracked = num_cracked
+        # Exact per-rule byte length (encoded_rules is a zero-padded
+        # uint8 matrix, so this can't be recovered from a trailing-zero
+        # scan alone if a rule's bytes happen to be shorter than
+        # another's prefix). Used by the single-rule record/clear fast
+        # path (_score_single_recording / apply_winner_and_clear)
+        # instead of re-deriving it from the padded row each call.
+        if rule_lens is None:
+            rule_lens = (encoded_rules != 0).argmin(axis=1)
+            rule_lens[encoded_rules[:, -1] != 0] = encoded_rules.shape[1]
+        self.rule_lens = np.asarray(rule_lens, dtype=np.uint32)
         # The GPU uses an open-addressed hash table instead of binary-searching
         # the sorted cracked array for every word/rule pair. Keep <=50% load so
         # lookups are short and predictable. The active bitmap is indexed by
@@ -799,6 +888,8 @@ class _GpuScorer(_ResidentWordlistMixin):
         prg = cl.Program(self.context, src).build()
         self.score_kernel = prg.score_against_active_kernel
         self.clear_kernel = prg.apply_and_clear_kernel
+        self.record_kernel = prg.score_single_and_record_kernel
+        self.clear_recorded_kernel = prg.clear_recorded_slots_kernel
 
         mf = cl.mem_flags
         # Build a compact GPU open-addressing table.  `occupied` is a bitset
@@ -841,6 +932,30 @@ class _GpuScorer(_ResidentWordlistMixin):
         if wordlist_path is not None:
             self._preload_wordlist(wordlist_path)
 
+        # Buffers for the single-rule record/clear fast path (see
+        # score_single_and_record_kernel / clear_recorded_slots_kernel
+        # above): sized to the largest word chunk this scorer will
+        # ever dispatch, since a chunk of N words can record at most N
+        # hits. Allocated after preload so the real (possibly
+        # enlarged-for-residency) chunk size is known; falls back to
+        # words_per_gpu_batch for the disk-streaming path.
+        if self._word_chunks_gpu is not None:
+            max_chunk_words = max((n for _, n in self._word_chunks_gpu), default=words_per_gpu_batch)
+        elif self._word_chunks_host is not None:
+            max_chunk_words = max((n for _, n in self._word_chunks_host), default=words_per_gpu_batch)
+        else:
+            max_chunk_words = words_per_gpu_batch
+        self.hit_slots_g = cl.Buffer(self.context, mf.READ_WRITE,
+                                      max(1, max_chunk_words) * np.uint32().itemsize)
+        self.hit_count_g = cl.Buffer(self.context, mf.READ_WRITE, np.int32().itemsize)
+        # (rule_idx, slots ndarray) for the most recent SINGLE-rule
+        # score_batch() call, if any -- consumed by apply_winner_and_clear()
+        # when that same rule turns out to be the round's winner, and
+        # invalidated (set to None) by any multi-rule score_batch() call or
+        # once consumed/at the start of a round, since it's only valid
+        # against the `active` set it was computed against.
+        self._last_single_hits = None
+
     def remaining_active_count(self):
         host = np.empty(self.W, dtype=np.uint32)
         cl.enqueue_copy(self.queue, host, self.active_g).wait()
@@ -878,6 +993,25 @@ class _GpuScorer(_ResidentWordlistMixin):
         # cheap. Bounding every transfer to n removes that overhead
         # entirely without changing kernel launch sizing, which was
         # already correctly bounded by n/sub_num.
+        #
+        # FAST PATH: a single-candidate rescore is the overwhelmingly
+        # common case during greedy-round revalidation (see this
+        # module's docstring -- most rounds need 0 or 1 dispatches,
+        # and once a round does need one it's usually just the current
+        # best candidate getting re-checked). For that case, use
+        # score_single_and_record_kernel instead of score_kernel: same
+        # cost (one pass over the resident wordlist), but it also
+        # records every hit's exact hash-table slot. If this candidate
+        # goes on to win its round, apply_winner_and_clear() below can
+        # reuse that recorded list directly -- clearing just `gain`
+        # slots -- instead of re-scanning the whole wordlist a second
+        # time purely to rediscover positions already known here.
+        if len(rule_indices) == 1:
+            ridx = int(rule_indices[0])
+            gain, slots = self._score_single_recording(ridx, wordlist_path)
+            self._last_single_hits = (ridx, slots)
+            return np.array([gain], dtype=np.int64)
+        self._last_single_hits = None  # multi-rule batch: no single recorded candidate anymore
         out = np.zeros(len(rule_indices), dtype=np.int64)
         for cs in range(0, len(rule_indices), self.rule_batch_size):
             ce = min(cs + self.rule_batch_size, len(rule_indices))
@@ -912,12 +1046,86 @@ class _GpuScorer(_ResidentWordlistMixin):
             out[cs:ce] = host_gains
         return out
 
-    def apply_winner_and_clear(self, rule_str, wordlist_path):
+    def _score_single_recording(self, rule_idx, wordlist_path):
+        """Scores ONE rule (by row index into self.encoded) against the
+        current active set using score_single_and_record_kernel, and
+        returns (gain, slots) where `slots` is the (gain,) uint32 array
+        of every hash-table slot it hit -- the information
+        score_against_active_kernel's plain counting mode discards.
+        Costs the same one wordlist pass score_kernel would have for a
+        single rule; the recording is "free" (same kernel launch,
+        extra output buffer) rather than an extra pass."""
+        rule_len = int(self.rule_lens[rule_idx])
+        cl.enqueue_copy(self.queue, self.single_rule_g,
+                         np.ascontiguousarray(self.encoded[rule_idx]))
+        total_gain = 0
+        slot_parts = []
+        for words_g, num_words in self._iter_word_chunks(wordlist_path):
+            hit_slots_region_g = self.hit_slots_g.get_sub_region(
+                0, max(1, num_words) * np.uint32().itemsize)
+            cl.enqueue_fill_buffer(self.queue, self.hit_count_g, np.int32(0), 0,
+                                    np.int32().itemsize)
+            global_size = (int(math.ceil(num_words / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            self.record_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
+                                words_g, self.single_rule_g, self.hash_table_g,
+                                self.hash_table_occupied_g, self.active_g,
+                                hit_slots_region_g, self.hit_count_g,
+                                np.uint32(num_words), np.uint32(rule_len),
+                                np.uint32(MAX_WORD_LEN), np.uint32(self.hash_table_mask))
+            host_count = np.zeros(1, dtype=np.int32)
+            cl.enqueue_copy(self.queue, host_count, self.hit_count_g).wait()
+            cnt = int(host_count[0])
+            if cnt:
+                host_slots = np.zeros(cnt, dtype=np.uint32)
+                cl.enqueue_copy(self.queue, host_slots,
+                                 self.hit_slots_g.get_sub_region(
+                                     0, cnt * np.uint32().itemsize)).wait()
+                slot_parts.append(host_slots)
+            total_gain += cnt
+        slots = np.concatenate(slot_parts) if slot_parts else np.zeros(0, dtype=np.uint32)
+        return total_gain, slots
+
+    def apply_winner_and_clear(self, rule_idx, rule_str, wordlist_path):
         """Runs the winning rule once against the wordlist, clearing
         every cracked hash it (still) covers out of `active`. Returns
-        the true number of bits actually cleared this round. Same
-        no-intermediate-.wait() reasoning as score_batch() above --
-        only the final host_count readback blocks."""
+        the true number of bits actually cleared this round.
+
+        FAST PATH: if `rule_idx` is the rule _score_single_recording()
+        most recently scored (i.e. score_batch() was last called with
+        just this one candidate -- the common case, see score_batch's
+        docstring), its exact hit-slot list is already known, captured
+        against this same, still-unchanged `active` set (nothing else
+        can have modified `active` between that scoring call and this
+        one -- rounds only mutate it here, once, for the chosen
+        winner). Clearing those recorded slots directly with
+        clear_recorded_slots_kernel costs one tiny launch over `gain`
+        items instead of a full extra wordlist pass.
+
+        Falls back to the original full-wordlist apply_and_clear_kernel
+        pass whenever that cache doesn't apply: round 1 (winner is
+        read directly off the upper-bound pass, never individually
+        rescored), or a round whose winner came from a multi-rule
+        rescore batch (no per-rule recording happens there)."""
+        if self._last_single_hits is not None and self._last_single_hits[0] == rule_idx:
+            _, slots = self._last_single_hits
+            self._last_single_hits = None
+            n_hits = len(slots)
+            if n_hits == 0:
+                return 0
+            slots_g = cl.Buffer(self.context,
+                                 cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
+                                 hostbuf=np.ascontiguousarray(slots, dtype=np.uint32))
+            cl.enqueue_fill_buffer(self.queue, self.cleared_count_g, np.int32(0), 0,
+                                    np.int32().itemsize)
+            global_size = (int(math.ceil(n_hits / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            self.clear_recorded_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
+                                        self.active_g, slots_g, self.cleared_count_g,
+                                        np.uint32(n_hits))
+            host_count = np.zeros(1, dtype=np.int32)
+            cl.enqueue_copy(self.queue, host_count, self.cleared_count_g).wait()
+            return int(host_count[0])
+
+        self._last_single_hits = None
         rb = rule_str.encode('latin-1', errors='ignore')[:MAX_RULE_LEN]
         rule_np = np.zeros(MAX_RULE_LEN, dtype=np.uint8)
         rule_np[:len(rb)] = np.frombuffer(rb, dtype=np.uint8)
@@ -955,13 +1163,15 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
         f"-- {green('no coverage matrix allocated (RAM or disk)')}")
 
     encoded = np.zeros((n_rules, MAX_RULE_LEN), dtype=np.uint8)
+    rule_lens = np.zeros(n_rules, dtype=np.uint32)
     for i, r in enumerate(rules):
         rb = r.encode('latin-1', errors='ignore')[:MAX_RULE_LEN]
         encoded[i, :len(rb)] = np.frombuffer(rb, dtype=np.uint8)
+        rule_lens[i] = len(rb)
 
     scorer = _GpuScorer(encoded, len(cracked_hashes_sorted), cracked_hashes_sorted,
                          rule_batch_size, words_per_gpu_batch, device_id,
-                         wordlist_path=wordlist_path)
+                         wordlist_path=wordlist_path, rule_lens=rule_lens)
 
     # --- Pass 1: static upper bound for every candidate, against the
     # full (all-active) target set. Same GPU work as
@@ -1082,7 +1292,7 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
         if best_idx < 0 or best_gain <= 0:
             break
 
-        true_cleared = scorer.apply_winner_and_clear(rules[best_idx], wordlist_path)
+        true_cleared = scorer.apply_winner_and_clear(best_idx, rules[best_idx], wordlist_path)
         selected.append((rules[best_idx], true_cleared))
         excluded[best_idx] = True
         n_active -= 1
