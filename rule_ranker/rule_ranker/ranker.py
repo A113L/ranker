@@ -36,6 +36,7 @@ import pyopencl as cl
 import numpy as np
 import argparse
 import csv
+import json
 import heapq
 from tqdm import tqdm
 import math
@@ -338,6 +339,80 @@ def fast_fnv1a_hash_32(data):
         hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
     return hash_val
 
+
+# ----------------------------------------------------------------------
+# Persistent cracked-hash cache (v4)
+# ----------------------------------------------------------------------
+FNV_CACHE_VERSION = 1
+
+
+def _fnv_cache_paths(source_path, max_len):
+    base = f"{source_path}.fnv1a32.max{int(max_len)}"
+    return base + ".npy", base + ".json"
+
+
+def _load_fnv_cache(source_path, max_len):
+    """Return (hashes, skipped) from a validated cache, or None."""
+    try:
+        source_stat = os.stat(source_path)
+        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if (
+            meta.get("version") != FNV_CACHE_VERSION
+            or meta.get("source_size") != source_stat.st_size
+            or meta.get("source_mtime_ns") != source_stat.st_mtime_ns
+            or meta.get("max_len") != int(max_len)
+        ):
+            return None
+        cached = np.load(cache_path, allow_pickle=False)
+        if cached.ndim != 1 or cached.dtype != np.dtype(np.uint32):
+            return None
+        if cached.size > 1 and not np.all(cached[1:] > cached[:-1]):
+            return None
+        skipped = int(meta.get("n_skipped", 0))
+        return np.asarray(cached), skipped
+    except (OSError, EOFError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _save_fnv_cache(source_path, max_len, hashes, n_skipped):
+    """Atomically write cache data; cache failures never stop ranking."""
+    tmp_npy = None
+    tmp_meta = None
+    try:
+        source_stat = os.stat(source_path)
+        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
+        cache_dir = os.path.dirname(cache_path) or "."
+        os.makedirs(cache_dir, exist_ok=True)
+        pid = os.getpid()
+        tmp_npy = f"{cache_path}.tmp.{pid}"
+        tmp_meta = f"{meta_path}.tmp.{pid}"
+        arr = np.asarray(hashes, dtype=np.uint32)
+        with open(tmp_npy, "wb") as f:
+            np.save(f, arr, allow_pickle=False)
+        os.replace(tmp_npy, cache_path)
+        meta = {
+            "version": FNV_CACHE_VERSION,
+            "source_size": int(source_stat.st_size),
+            "source_mtime_ns": int(source_stat.st_mtime_ns),
+            "max_len": int(max_len),
+            "n_hashes": int(arr.size),
+            "n_skipped": int(n_skipped),
+        }
+        with open(tmp_meta, "w", encoding="utf-8") as f:
+            json.dump(meta, f, separators=(",", ":"))
+        os.replace(tmp_meta, meta_path)
+        return True
+    except (OSError, ValueError, TypeError):
+        for p in (tmp_npy, tmp_meta):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        return False
+
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     """Memory‑mapped iterator over words, returning batches of words and hashes"""
     print(f"{green('Using optimized memory-mapped loader...')}")
@@ -512,16 +587,22 @@ def load_rules(path):
     return rules_list
 
 def load_cracked_hashes(path, max_len):
-    """Loads cracked passwords and returns their FNV‑1a hashes.
+    """Load cracked passwords and return their unique FNV-1a hashes.
 
-    Uses a compact uint32 accumulator instead of a Python int list.  This
-    keeps the exact hash values/order while avoiding one Python object per
-    cracked entry, which matters for multi-million-entry cracked lists.
+    Uses a persistent sidecar cache after the first pass. Cache validity is
+    tied to source size, nanosecond mtime and max_len.
     """
     from array import array
 
     print(f"{blue('Loading cracked list for effectiveness check from:')} {path}...")
+    cached = _load_fnv_cache(path, max_len)
+    if cached is not None:
+        hashes, _n_skipped = cached
+        print(f"{green('Loaded')} {cyan(f'{len(hashes):,}')} {bold('unique cracked password hashes from FNV cache.')}")
+        return hashes
+
     cracked_hashes = array('I')
+    n_skipped = 0
     try:
         with open(path, 'rb') as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -535,22 +616,26 @@ def load_cracked_hashes(path, max_len):
                         if end_pos == -1:
                             end_pos = file_size
                         line = mm[pos:end_pos].strip()
-                        # BUG FIX: clamp advance to actual remaining bytes so pbar never exceeds 100%
                         advance = min((end_pos + 1) - pos, file_size - pos)
                         pos = end_pos + 1
                         pbar.update(advance)
                         if 1 <= len(line) <= max_len:
                             cracked_hashes.append(fast_fnv1a_hash_32(line))
+                        elif len(line) > max_len:
+                            n_skipped += 1
     except FileNotFoundError:
         print(f"{yellow('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
+
     if cracked_hashes.itemsize == np.dtype(np.uint32).itemsize:
         raw_hashes = np.frombuffer(cracked_hashes, dtype=np.uint32)
-    else:  # defensive fallback for unusual platforms where C unsigned int is not 32-bit
+    else:
         raw_hashes = np.asarray(cracked_hashes, dtype=np.uint32)
     unique_hashes = np.unique(raw_hashes)
+    _save_fnv_cache(path, max_len, unique_hashes, n_skipped)
     print(f"{green('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password hashes.')}")
     return unique_hashes
+
 
 def encode_rule(rule_str, rule_id):
     """
