@@ -13,31 +13,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from rule_ranker import ranker_postprocess as rp
 
 
-class TestPopcount:
-    def test_popcount_row_zero(self):
-        row = np.zeros(4, dtype=np.uint32)
-        assert rp.popcount_row(row) == 0
-
-    def test_popcount_row_all_ones(self):
-        row = np.full(2, 0xFFFFFFFF, dtype=np.uint32)
-        assert rp.popcount_row(row) == 64
-
-    def test_popcount_row_known_pattern(self):
-        # 0b1011 = 3 bits set
-        row = np.array([0b1011], dtype=np.uint32)
-        assert rp.popcount_row(row) == 3
-
-    def test_popcount_rows_matches_popcount_row(self):
-        mat = np.array([
-            [0b1011, 0],
-            [0xFFFFFFFF, 0xFFFFFFFF],
-            [0, 0],
-        ], dtype=np.uint32)
-        rows = rp.popcount_rows(mat)
-        expected = [rp.popcount_row(mat[i]) for i in range(mat.shape[0])]
-        assert list(rows) == expected
-
-
 class TestFnv1a:
     def test_deterministic(self):
         h1 = rp.fast_fnv1a_hash_32(b"password123")
@@ -137,106 +112,6 @@ class TestEstimateOutputLen:
         worst_len, worst_rule = rp.estimate_worst_case_output_len(rules, max_word_len=8)
         assert worst_len == 8
         assert worst_rule is None
-
-
-class TestCelfSelect:
-    """Exercises the CPU lazy-greedy CELF loop directly against small,
-    hand-built coverage bitmaps -- no GPU/OpenCL involved."""
-
-    def _bitmap_from_bools(self, rows_of_bools):
-        """rows_of_bools: list[list[bool]] -> (n, W) uint32 array."""
-        n = len(rows_of_bools)
-        n_bits = len(rows_of_bools[0])
-        W = max(1, (n_bits + 31) // 32)
-        mat = np.zeros((n, W), dtype=np.uint32)
-        for i, bits in enumerate(rows_of_bools):
-            for b, val in enumerate(bits):
-                if val:
-                    mat[i, b >> 5] |= np.uint32(1 << (b & 31))
-        return mat
-
-    def test_picks_best_covering_rule_first(self):
-        # rule 0 covers bits {0,1,2}; rule 1 covers only {0}
-        rules = ["rule_a", "rule_b"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 1, 0],
-            [1, 0, 0, 0],
-        ])
-        selected = rp.celf_select(rules, bitmap, budget=1)
-        assert len(selected) == 1
-        assert selected[0][0] == "rule_a"
-        assert selected[0][1] == 3  # gain = popcount of its row
-
-    def test_greedy_covers_universe_with_disjoint_rules(self):
-        # rule 0 covers {0,1}; rule 1 covers {2,3} -- together full coverage
-        rules = ["rule_a", "rule_b"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 0, 0],
-            [0, 0, 1, 1],
-        ])
-        selected = rp.celf_select(rules, bitmap, budget=None)
-        assert {r for r, _ in selected} == {"rule_a", "rule_b"}
-        total_gain = sum(g for _, g in selected)
-        assert total_gain == 4
-
-    def test_lazy_revalidation_picks_second_best_after_overlap(self):
-        # rule_a covers {0,1,2}; rule_b covers {2,3}; after picking
-        # rule_a (gain 3), rule_b's TRUE marginal gain is only 1 (bit 3),
-        # not its stale initial gain of 2 -- CELF's lazy re-validation
-        # must catch this rather than trusting the stale heap value.
-        rules = ["rule_a", "rule_b"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 1, 0],
-            [0, 0, 1, 1],
-        ])
-        selected = rp.celf_select(rules, bitmap, budget=None)
-        assert selected[0][0] == "rule_a"
-        assert selected[0][1] == 3
-        assert selected[1][0] == "rule_b"
-        assert selected[1][1] == 1  # re-validated marginal gain, not stale 2
-
-    def test_zero_gain_rules_excluded(self):
-        rules = ["rule_a", "rule_none"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 0, 0],
-            [0, 0, 0, 0],
-        ])
-        selected = rp.celf_select(rules, bitmap, budget=None)
-        assert len(selected) == 1
-        assert selected[0][0] == "rule_a"
-
-    def test_budget_caps_selection_size(self):
-        rules = ["a", "b", "c"]
-        bitmap = self._bitmap_from_bools([
-            [1, 0, 0],
-            [0, 1, 0],
-            [0, 0, 1],
-        ])
-        selected = rp.celf_select(rules, bitmap, budget=2)
-        assert len(selected) == 2
-
-    def test_accepts_precomputed_initial_gains(self):
-        rules = ["a", "b"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 0],
-            [0, 0, 1],
-        ])
-        gains = rp.popcount_rows(bitmap)
-        selected = rp.celf_select(rules, bitmap, initial_gains=gains, budget=None)
-        assert len(selected) == 2
-
-    def test_works_on_memmap_backed_array(self, tmp_path):
-        rules = ["a", "b"]
-        bitmap = self._bitmap_from_bools([
-            [1, 1, 0, 0],
-            [0, 0, 1, 1],
-        ])
-        mm_path = tmp_path / "cov.dat"
-        mm = np.memmap(str(mm_path), dtype=np.uint32, mode="w+", shape=bitmap.shape)
-        mm[:] = bitmap
-        mm.flush()
-        selected = rp.celf_select(rules, mm, budget=None)
-        assert {r for r, _ in selected} == {"a", "b"}
 
 
 class TestSaveOutput:
@@ -359,32 +234,28 @@ class TestPostprocessCLI:
             ])
         assert excinfo.value.code == 1
 
-    def test_strategy_accepts_sparse_choice(self):
-        # Just exercises argparse's `choices=` validation for the new
-        # --strategy flag -- reaching the empty-cracked-list abort
-        # (exit code 1) means "sparse" parsed fine and dispatch got as
-        # far as the shared cracked-list-loading step before diverging
-        # into the sparse-specific branch, not that argparse itself
-        # rejected the value (which would be exit code 2).
-        import tempfile
-        with tempfile.TemporaryDirectory() as td:
-            rules_path = os.path.join(td, "rules.rule")
-            with open(rules_path, "w", encoding="utf-8") as f:
-                f.write(":\nl\n")
-            wordlist_path = os.path.join(td, "words.txt")
-            with open(wordlist_path, "w", encoding="utf-8") as f:
-                f.write("password\n")
-            cracked_path = os.path.join(td, "cracked.txt")
-            with open(cracked_path, "w", encoding="utf-8") as f:
-                f.write("x" * 300 + "\n")
-            out_path = os.path.join(td, "out.rule")
+    def test_strategy_accepts_only_recompute_gpu(self, tmp_path):
+        rules_path = tmp_path / "rules.rule"
+        rules_path.write_text(":\nl\n", encoding="utf-8")
+        wordlist_path = tmp_path / "words.txt"
+        wordlist_path.write_text("password\n", encoding="utf-8")
+        cracked_path = tmp_path / "cracked.txt"
+        cracked_path.write_text("x" * 300 + "\n", encoding="utf-8")
+        out_path = tmp_path / "out.rule"
 
+        with pytest.raises(SystemExit) as excinfo:
+            rp.main([
+                "-f", str(rules_path), "-w", str(wordlist_path), "-k", str(cracked_path),
+                "-o", str(out_path), "--strategy", "recompute-gpu",
+            ])
+        assert excinfo.value.code == 1  # parsed successfully, then empty universe aborts before GPU import
+
+    def test_removed_strategy_choices_are_rejected(self):
+        for removed in ("bitmap", "sparse"):
             with pytest.raises(SystemExit) as excinfo:
-                rp.main([
-                    "-f", rules_path, "-w", wordlist_path, "-k", cracked_path,
-                    "-o", out_path, "--strategy", "sparse",
-                ])
-            assert excinfo.value.code == 1  # empty cracked list, not a bad --strategy value
+                rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule",
+                         "--strategy", removed])
+            assert excinfo.value.code == 2
 
     def test_strategy_rejects_unknown_choice(self):
         with pytest.raises(SystemExit) as excinfo:
@@ -392,9 +263,32 @@ class TestPostprocessCLI:
                      "--strategy", "not-a-real-strategy"])
         assert excinfo.value.code == 2  # argparse's own choices= rejection
 
-    def test_recompute_gpu_bare_flag_no_longer_recognized(self):
-        # --recompute-gpu was removed; only --strategy recompute-gpu works
-        # now. The bare flag should be rejected as an unknown argument.
+    @pytest.mark.parametrize("argv", [
+        ["--bitmap-path", "x"],
+        ["--keep-bitmap"],
+        ["--no-hybrid"],
+        ["--in-ram"],
+        ["--no-parallel-celf"],
+        ["--celf-workers", "2"],
+        ["--celf-io-threads", "2"],
+        ["--celf-batch-multiplier", "2"],
+        ["--sparse-disk-threshold", "2"],
+        ["--sparse-store-path", "x"],
+        ["--sparse-combined-budget-mb", "1"],
+        ["--gpu-celf"],
+        ["--gpu-celf-batch", "2"],
+        ["--gpu-celf-hit-budget", "10"],
+        ["--gpu-celf-vram-fraction", "0.7"],
+        ["--gpu-celf-mode", "auto"],
+    ])
+    def test_removed_coverage_flags_are_rejected(self, argv):
+        with pytest.raises(SystemExit) as excinfo:
+            rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule", *argv])
+        assert excinfo.value.code == 2
+
+    def test_recompute_gpu_bare_flag_is_not_a_separate_option(self):
+        # The only strategy selector is --strategy recompute-gpu; there is
+        # intentionally no separate --recompute-gpu flag.
         with pytest.raises(SystemExit) as excinfo:
             rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule",
                      "--recompute-gpu"])

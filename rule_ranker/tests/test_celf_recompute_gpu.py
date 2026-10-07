@@ -4,9 +4,7 @@ budget cutoff) in isolation from real OpenCL/GPU kernels.
 
 celf_select_recompute_gpu() constructs a real _GpuScorer internally,
 which needs an actual GPU. To test the selection algorithm itself
-(the part that was rewritten to fix the "terribly slow" over-fetching
-bug -- see the block comment above celf_select_recompute_gpu() in
-celf_recompute_gpu.py), this monkeypatches _GpuScorer with a small
+(the lazy upper-bound logic), this monkeypatches _GpuScorer with a small
 pure-Python/NumPy fake backed by an explicit rule -> covered-hash-ids
 mapping, so exact coverage/selection outcomes can be asserted without
 any device present. See conftest.py for why `import pyopencl` still
