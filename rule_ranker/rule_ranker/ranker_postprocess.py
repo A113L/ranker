@@ -1796,7 +1796,7 @@ def main(argv=None):
             if args.sparse_combined_budget_mb is not None
             else DEFAULT_SPARSE_COMBINED_BUDGET_BYTES
         )
-        store, _initial_counts = compute_sparse_coverage_gpu(
+        store, _initial_counts, universe_size = compute_sparse_coverage_gpu(
             rules, args.wordlist, cracked_hashes,
             rule_batch_size=args.rule_batch_size,
             words_per_gpu_batch=args.words_batch_size,
@@ -1814,9 +1814,11 @@ def main(argv=None):
                     rules, store, len(cracked_hashes), device_id=args.device,
                     budget=run_budget,
                     batch_size=args.gpu_celf_batch or DEFAULT_GPU_CELF_BATCH,
-                    hit_budget=args.gpu_celf_hit_budget or DEFAULT_GPU_CELF_HIT_BUDGET)
+                    hit_budget=args.gpu_celf_hit_budget or DEFAULT_GPU_CELF_HIT_BUDGET,
+                    universe_size=universe_size)
             else:
-                selected = celf_select_sparse(rules, store, len(cracked_hashes), budget=run_budget)
+                selected = celf_select_sparse(rules, store, len(cracked_hashes),
+                                               budget=run_budget, universe_size=universe_size)
 
             if budgets:
                 save_output_multi(selected, args.output, budgets)

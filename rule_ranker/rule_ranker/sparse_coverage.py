@@ -59,6 +59,7 @@ import math
 import os
 import sqlite3
 import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 
@@ -75,7 +76,9 @@ from .ranker_postprocess import (
 )
 # (select_device already imported above -- used by both the coverage
 # backend and, now, _SparseCelfGpuBackend for --gpu-celf.)
-from .celf_recompute_gpu import _ResidentWordlistMixin, _COMMON_KERNEL_BODY
+from .celf_recompute_gpu import (
+    _ResidentWordlistMixin, _COMMON_KERNEL_BODY, _build_open_addressing_table,
+)
 
 # Default batch size for --gpu-celf's stale-entry revalidation dispatch
 # (see celf_select_sparse_gpu / _SparseCelfGpuBackend below).
@@ -244,11 +247,23 @@ class SQLiteSparseCoverageStore(Mapping):
 # ============================================================
 # --- GPU kernels: count pass + batched sparse-extract pass ---
 # ============================================================
-def get_sparse_kernel_source(num_cracked):
+def get_sparse_kernel_source(num_cracked, hash_table_size):
     """Two kernels, built on the exact same rule-transform/hash/
-    binary-search device code as celf_recompute_gpu.get_recompute_
+    hash-table-probe device code as celf_recompute_gpu.get_recompute_
     kernel_source() (imported via _COMMON_KERNEL_BODY, not re-derived
-    here, so scoring semantics can never drift between strategies):
+    here, so scoring semantics can never drift between strategies).
+
+    This used to look up each transformed word's hash via
+    binary_search_cracked() (O(log2(num_cracked)) dependent random
+    global-memory reads per word/rule pair -- dominant cost at GPU
+    scale once rule transforms themselves are cheap). It now uses the
+    same open-addressing lookup_cracked_slot() probe
+    celf_recompute_gpu.py's kernels use (<=50% load factor, ~1-2
+    probes/lookup). The index each hit resolves to is therefore a
+    HASH-TABLE SLOT (0..hash_table_size-1), not a compact
+    0..num_cracked-1 cracked-array index -- callers must size any
+    bitset/array keyed by these indices to hash_table_size, not
+    num_cracked (see _SparseGpuBackend and compute_sparse_coverage_gpu).
 
     sparse_count_kernel   -- one (word, rule) pair per thread, exact
         hit COUNT per rule against the full cracked universe (static
@@ -263,15 +278,15 @@ def get_sparse_kernel_source(num_cracked):
         rule's exact count from the pass above (so a tightly-sized,
         contiguous packed output buffer can be allocated first) and
         each rule's prefix-sum offset into that buffer, writes the
-        actual matched cracked-array INDEX for every hit via
-        atomic_inc on a per-rule write-position counter. One dispatch
-        per rule-batch covers every rule in that batch in a single
-        pass over the wordlist, the same batching shape as the count
-        kernel and as celf_coverage_kernel in ranker_postprocess.py --
-        this is a genuinely two-pass computation (count, then extract)
-        but both passes are O(n_candidates x wordlist), the SAME one-
-        time order as the bitmap strategy's single pass, not something
-        that repeats per CELF round the way --recompute-gpu's rescoring
+        actual matched hash-table SLOT for every hit via atomic_inc on
+        a per-rule write-position counter. One dispatch per rule-batch
+        covers every rule in that batch in a single pass over the
+        wordlist, the same batching shape as the count kernel and as
+        celf_coverage_kernel in ranker_postprocess.py -- this is a
+        genuinely two-pass computation (count, then extract) but both
+        passes are O(n_candidates x wordlist), the SAME one-time order
+        as the bitmap strategy's single pass, not something that
+        repeats per CELF round the way --recompute-gpu's rescoring
         does.
     """
     return f"""
@@ -279,6 +294,8 @@ def get_sparse_kernel_source(num_cracked):
 #define MAX_OUTPUT_LEN {MAX_OUTPUT_LEN}
 #define MAX_RULE_LEN {MAX_RULE_LEN}
 #define NUM_CRACKED {num_cracked}
+#define HASH_TABLE_SIZE {hash_table_size}
+#define HASH_TABLE_MASK {hash_table_size - 1}
 
 {_COMMON_KERNEL_BODY}
 
@@ -286,11 +303,13 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void sparse_count_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* cracked_hashes_sorted,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
     __global unsigned int* hit_counts,
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
-    const unsigned int max_word_len)
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
 {{
     unsigned int global_id = get_global_id(0);
     unsigned int total = num_words * num_rules_in_batch;
@@ -322,8 +341,8 @@ void sparse_count_kernel(
     if (changed <= 0 || out_len <= 0) return;
 
     unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
-    int idx = binary_search_cracked(cracked_hashes_sorted, NUM_CRACKED, h);
-    if (idx < 0) return;
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
 
     atomic_add(&hit_counts[rule_idx], 1u);
 }}
@@ -340,14 +359,16 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void sparse_extract_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* cracked_hashes_sorted,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
     __global const unsigned int* rule_offsets,
     __global const unsigned int* rule_capacities,
     __global unsigned int* write_pos,
     __global unsigned int* out_buffer,
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
-    const unsigned int max_word_len)
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
 {{
     unsigned int global_id = get_global_id(0);
     unsigned int total = num_words * num_rules_in_batch;
@@ -379,41 +400,43 @@ void sparse_extract_kernel(
     if (changed <= 0 || out_len <= 0) return;
 
     unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
-    int idx = binary_search_cracked(cracked_hashes_sorted, NUM_CRACKED, h);
-    if (idx < 0) return;
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
 
     unsigned int pos = atomic_inc(&write_pos[rule_idx]);
     if (pos < rule_capacities[rule_idx]) {{
-        out_buffer[rule_offsets[rule_idx] + pos] = (unsigned int)idx;
+        out_buffer[rule_offsets[rule_idx] + pos] = (unsigned int)slot;
     }}
 }}
 
 // Single-pass alternative to count_kernel + extract_kernel: writes
-// matched cracked-array indices directly, with no prior count pass,
-// into a FIXED-STRIDE per-rule row of `out_buffer` (row length =
-// `stride`, the caller-supplied total word count across the whole
-// wordlist -- an upper bound on any one rule's hit count that can
-// never be exceeded, so no count pass is needed to size anything).
-// write_pos[rule_idx] is the atomic write cursor into that rule's row;
-// the caller zeroes it ONCE per rule-batch, not per word-chunk, since
-// this kernel is dispatched once per (rule-batch, word-chunk) pair and
-// cursor positions must stay contiguous across chunks. Writes from
-// atomic_inc are sequential (0, 1, 2, ...) so each row's valid hits
-// always occupy the contiguous prefix [0, write_pos[rule_idx]) -- the
-// same bounds-check-and-drop safety net as sparse_extract_kernel
-// covers the same rare hash-collision edge case, not expected overflow
-// (stride is a true upper bound by construction).
+// matched hash-table slots directly, with no prior count pass, into a
+// FIXED-STRIDE per-rule row of `out_buffer` (row length = `stride`,
+// the caller-supplied total word count across the whole wordlist -- an
+// upper bound on any one rule's hit count that can never be exceeded,
+// so no count pass is needed to size anything). write_pos[rule_idx] is
+// the atomic write cursor into that rule's row; the caller zeroes it
+// ONCE per rule-batch, not per word-chunk, since this kernel is
+// dispatched once per (rule-batch, word-chunk) pair and cursor
+// positions must stay contiguous across chunks. Writes from atomic_inc
+// are sequential (0, 1, 2, ...) so each row's valid hits always occupy
+// the contiguous prefix [0, write_pos[rule_idx]) -- the same
+// bounds-check-and-drop safety net as sparse_extract_kernel covers the
+// same rare hash-collision edge case, not expected overflow (stride is
+// a true upper bound by construction).
 __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void sparse_combined_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* cracked_hashes_sorted,
+    __global const unsigned int* hash_table,
+    __global const unsigned int* hash_table_occupied,
     __global unsigned int* write_pos,
     __global unsigned int* out_buffer,
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
     const unsigned int max_word_len,
-    const unsigned int stride)
+    const unsigned int stride,
+    const unsigned int table_mask)
 {{
     unsigned int global_id = get_global_id(0);
     unsigned int total = num_words * num_rules_in_batch;
@@ -445,12 +468,12 @@ void sparse_combined_kernel(
     if (changed <= 0 || out_len <= 0) return;
 
     unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
-    int idx = binary_search_cracked(cracked_hashes_sorted, NUM_CRACKED, h);
-    if (idx < 0) return;
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
 
     unsigned int pos = atomic_inc(&write_pos[rule_idx]);
     if (pos < stride) {{
-        out_buffer[rule_idx * stride + pos] = (unsigned int)idx;
+        out_buffer[rule_idx * stride + pos] = (unsigned int)slot;
     }}
 }}
 """
@@ -475,18 +498,45 @@ class _SparseGpuBackend(_ResidentWordlistMixin):
         self.words_per_gpu_batch = words_per_gpu_batch
         self.encoded = encoded_rules
 
+        # Open-addressed hash table instead of binary-searching the
+        # sorted cracked array for every word/rule pair -- see
+        # get_sparse_kernel_source()'s docstring and
+        # celf_recompute_gpu._GpuScorer, whose __init__ builds the
+        # exact same kind of table for the same reason (random global-
+        # memory traffic dominates once rule transforms are cheap).
+        # Hits now resolve to a SLOT in this table (0..hash_table_size-1),
+        # not a compact 0..num_cracked-1 cracked-array index -- any
+        # bitset/array keyed by stored hit indices (covered_bitset in
+        # _SparseCelfGpuBackend, covered_mask in celf_select_sparse)
+        # must be sized to hash_table_size, not num_cracked. The true
+        # num_cracked is kept separately (self.num_cracked) for
+        # %-coverage reporting, which must stay against the real
+        # universe size, not the (sparser) table size.
+        table_size = 1
+        target_size = max(2, int(math.ceil(num_cracked * 2.0)))
+        while table_size < target_size:
+            table_size <<= 1
+        self.hash_table_size = table_size
+        self.hash_table_mask = table_size - 1
+
         platform, device = select_device(device_id)
         self.context = cl.Context([device])
         self.queue = cl.CommandQueue(self.context)
-        src = get_sparse_kernel_source(num_cracked)
+        src = get_sparse_kernel_source(num_cracked, self.hash_table_size)
         prg = cl.Program(self.context, src).build()
         self.count_kernel = prg.sparse_count_kernel
         self.extract_kernel = prg.sparse_extract_kernel
         self.combined_kernel = prg.sparse_combined_kernel
 
         mf = cl.mem_flags
-        self.cracked_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                                    hostbuf=cracked_hashes_sorted)
+        t_hash0 = time.time()
+        hash_table, occupied = _build_open_addressing_table(
+            cracked_hashes_sorted, self.hash_table_size, self.hash_table_mask)
+        log(f"{dim(f'Hash table built for {num_cracked:,} cracked entries in {time.time() - t_hash0:.2f}s (vectorized)')}")
+        self.hash_table_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                       hostbuf=hash_table)
+        self.hash_table_occupied_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR,
+                                                hostbuf=occupied)
 
         words_buffer_size = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
         self.base_words_g = cl.Buffer(self.context, mf.READ_ONLY, words_buffer_size)
@@ -593,10 +643,10 @@ class _SparseGpuBackend(_ResidentWordlistMixin):
                     global_size = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
                     self.combined_kernel(
                         self.queue, global_size, (LOCAL_WORK_SIZE,),
-                        words_g, sub_rules_g, self.cracked_g,
+                        words_g, sub_rules_g, self.hash_table_g, self.hash_table_occupied_g,
                         sub_write_pos_g, sub_out_g,
                         np.uint32(num_words), np.uint32(sub_num), np.uint32(MAX_WORD_LEN),
-                        np.uint32(stride))
+                        np.uint32(stride), np.uint32(self.hash_table_mask))
 
             host_write_pos = np.zeros(self.rule_batch_size, dtype=np.uint32)
             cl.enqueue_copy(self.queue, host_write_pos, self._combined_write_pos_g).wait()
@@ -649,9 +699,10 @@ class _SparseGpuBackend(_ResidentWordlistMixin):
                         sub_start * np.uint32().itemsize, sub_num * np.uint32().itemsize)
                     global_size = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
                     self.count_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
-                                       words_g, sub_rules_g, self.cracked_g, sub_counts_g,
+                                       words_g, sub_rules_g,
+                                       self.hash_table_g, self.hash_table_occupied_g, sub_counts_g,
                                        np.uint32(num_words), np.uint32(sub_num),
-                                       np.uint32(MAX_WORD_LEN))
+                                       np.uint32(MAX_WORD_LEN), np.uint32(self.hash_table_mask))
 
             host_counts = np.zeros(self.rule_batch_size, dtype=np.uint32)
             cl.enqueue_copy(self.queue, host_counts, self.hit_counts_g).wait()
@@ -712,10 +763,11 @@ class _SparseGpuBackend(_ResidentWordlistMixin):
                     global_size = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
                     self.extract_kernel(
                         self.queue, global_size, (LOCAL_WORK_SIZE,),
-                        words_g, sub_rules_g, self.cracked_g,
+                        words_g, sub_rules_g, self.hash_table_g, self.hash_table_occupied_g,
                         sub_offsets_g, sub_capacities_g, sub_write_pos_g,
                         self._out_buffer_g,
-                        np.uint32(num_words), np.uint32(sub_num), np.uint32(MAX_WORD_LEN))
+                        np.uint32(num_words), np.uint32(sub_num), np.uint32(MAX_WORD_LEN),
+                        np.uint32(self.hash_table_mask))
 
             host_packed = np.zeros(total_capacity, dtype=np.uint32)
             sub_out_g = self._out_buffer_g.get_sub_region(0, total_capacity * np.uint32().itemsize)
@@ -771,13 +823,21 @@ def compute_sparse_coverage_gpu(rules, wordlist_path, cracked_hashes_sorted,
     many CELF rounds/revalidations celf_select_sparse() ends up needing
     afterward, unlike --recompute-gpu.
 
-    Returns (store, initial_counts) -- store is an
+    Returns (store, initial_counts, universe_size) -- store is an
     InMemorySparseCoverageStore (n_rules <= disk_threshold) or
     SQLiteSparseCoverageStore (above it); initial_counts is an
     (n_rules,) int64 array of each rule's raw hit count (used only to
     log a summary here -- celf_select_sparse() reads its own seed
     counts back out of the store, not from this array, so the two
-    strategies can't silently disagree).
+    strategies can't silently disagree); universe_size is the hash
+    table size backing the GPU coverage pass's lookup_cracked_slot()
+    probe (see get_sparse_kernel_source()) -- the indices stored in
+    `store` are slots in a table of this size (>= num_cracked, not
+    equal to it), so callers MUST pass universe_size (not
+    len(cracked_hashes_sorted)) as the bitset/covered-array size to
+    celf_select_sparse()/celf_select_sparse_gpu(); the true
+    len(cracked_hashes_sorted) remains the right value for %-coverage
+    reporting and is passed separately as cracked_size.
     """
     n_rules = len(rules)
     num_cracked = len(cracked_hashes_sorted)
@@ -848,7 +908,7 @@ def compute_sparse_coverage_gpu(rules, wordlist_path, cracked_hashes_sorted,
 
     n_with_hits = int((initial_counts > 0).sum())
     log(f"{green('Done.')} rules with >=1 hit: {cyan(f'{n_with_hits:,}')}/{cyan(f'{n_rules:,}')}")
-    return store, initial_counts
+    return store, initial_counts, backend.hash_table_size
 
 
 def _sparse_celf_gpu_kernel_source():
@@ -963,9 +1023,20 @@ class _SparseCelfGpuBackend:
 
     def __init__(self, store, cracked_size, device_id=None,
                  batch_size=DEFAULT_GPU_CELF_BATCH,
-                 hit_budget=DEFAULT_GPU_CELF_HIT_BUDGET):
+                 hit_budget=DEFAULT_GPU_CELF_HIT_BUDGET,
+                 universe_size=None):
         self.store = store
+        # cracked_size: true cracked-universe size, kept ONLY for
+        # %-coverage reporting (covered_count() is independent of it).
         self.cracked_size = cracked_size
+        # universe_size: size of the covered_bitset itself. Must be
+        # >= the largest index that can appear in `store`'s hit
+        # arrays. When the coverage store was built against the
+        # open-addressing hash table (see compute_sparse_coverage_gpu),
+        # that's the hash table size, not cracked_size -- defaults to
+        # cracked_size for callers/tests that pass already-compact
+        # 0..cracked_size-1 indices directly.
+        self.universe_size = universe_size if universe_size is not None else cracked_size
         self.batch_size = batch_size
         self.hit_budget = max(1, hit_budget)
 
@@ -977,7 +1048,7 @@ class _SparseCelfGpuBackend:
         self._mark_kernel = prg.celf_mark_covered_kernel
 
         mf = cl.mem_flags
-        n_words = (cracked_size + 31) // 32
+        n_words = (self.universe_size + 31) // 32
         self.covered_bitset_g = cl.Buffer(self.context, mf.READ_WRITE, size=max(1, n_words) * 4)
         cl.enqueue_fill_buffer(self.queue, self.covered_bitset_g, np.uint32(0), 0, max(1, n_words) * 4)
 
@@ -1104,7 +1175,7 @@ class _SparseCelfGpuBackend:
         progress display / final log line -- O(cracked_size/32), not
         O(n_candidates x cracked_size), and only paid once per
         selected rule, not per revalidation."""
-        n_words = (self.cracked_size + 31) // 32
+        n_words = (self.universe_size + 31) // 32
         buf = np.empty(max(1, n_words), dtype=np.uint32)
         cl.enqueue_copy(self.queue, buf, self.covered_bitset_g)
         return int(sum(bin(w).count('1') for w in buf.tolist()))
@@ -1112,7 +1183,8 @@ class _SparseCelfGpuBackend:
 
 def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
                             budget=None, batch_size=DEFAULT_GPU_CELF_BATCH,
-                            hit_budget=DEFAULT_GPU_CELF_HIT_BUDGET):
+                            hit_budget=DEFAULT_GPU_CELF_HIT_BUDGET,
+                            universe_size=None):
     """GPU-resident counterpart to celf_select_sparse(): identical
     lazy-greedy (CELF) algorithm and identical selection order/output
     shape, but the covered set and every marginal-gain recomputation
@@ -1163,7 +1235,7 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
     # available RAM/VRAM).
     backend = _SparseCelfGpuBackend(store, cracked_size=cracked_size,
                                      device_id=device_id, batch_size=batch_size,
-                                     hit_budget=hit_budget)
+                                     hit_budget=hit_budget, universe_size=universe_size)
 
     heap = [(-int(n_hits), int(idx), 0) for idx, n_hits in candidates]
     heapq.heapify(heap)
@@ -1213,7 +1285,7 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
 # ============================================================
 # --- Pure-CPU lazy greedy (CELF), no GPU during selection ---
 # ============================================================
-def celf_select_sparse(rules, store, cracked_size, budget=None):
+def celf_select_sparse(rules, store, cracked_size, budget=None, universe_size=None):
     """Lazy greedy (CELF) max-coverage selection against a sparse
     coverage store, entirely on the CPU -- the whole point of this
     strategy. `store` is a Mapping[int, np.ndarray[int32]] (an
@@ -1256,7 +1328,16 @@ def celf_select_sparse(rules, store, cracked_size, budget=None):
     heapq.heapify(heap)
 
     selected = []
-    covered_mask = np.zeros(cracked_size, dtype=bool)
+    # covered_mask must be sized to the largest index that can appear
+    # in `store`'s hit arrays -- cracked_size itself ONLY when the
+    # store holds compact 0..cracked_size-1 indices (e.g. tests that
+    # build a store directly). When the store came from the GPU
+    # open-addressing coverage pass (compute_sparse_coverage_gpu),
+    # indices are hash-table slots and callers must pass the table
+    # size as universe_size; cracked_size is still used below, as-is,
+    # for %-coverage reporting against the true universe.
+    bitset_size = universe_size if universe_size is not None else cracked_size
+    covered_mask = np.zeros(bitset_size, dtype=bool)
     n_covered = 0
     stamp = 0
 
@@ -1347,7 +1428,7 @@ def main(argv=None):
         log(red("Cracked list is empty -- nothing to optimize for. Aborting."))
         raise SystemExit(1)
 
-    store, initial_counts = compute_sparse_coverage_gpu(
+    store, initial_counts, universe_size = compute_sparse_coverage_gpu(
         rules, args.wordlist, cracked_hashes,
         rule_batch_size=args.rule_batch_size,
         words_per_gpu_batch=args.words_batch_size,
@@ -1362,9 +1443,10 @@ def main(argv=None):
             selected = celf_select_sparse_gpu(
                 rules, store, len(cracked_hashes), device_id=args.device,
                 budget=run_budget, batch_size=args.gpu_celf_batch,
-                hit_budget=args.gpu_celf_hit_budget)
+                hit_budget=args.gpu_celf_hit_budget, universe_size=universe_size)
         else:
-            selected = celf_select_sparse(rules, store, len(cracked_hashes), budget=run_budget)
+            selected = celf_select_sparse(rules, store, len(cracked_hashes),
+                                           budget=run_budget, universe_size=universe_size)
 
         if budgets:
             save_output_multi(selected, args.output, budgets)
