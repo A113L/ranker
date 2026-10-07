@@ -155,6 +155,8 @@ Every rule is applied to every word in the wordlist in a single exhaustive pass.
 
 The coverage-bitmap matrix (`candidates × ceil(cracked_universe / 32)` `uint32` words) can be large — e.g. ~34 GB for 20,000 candidates against 14.3M unique cracked hashes. By default it's streamed to a disk-backed `np.memmap` (`--bitmap-path`, deleted after a successful run unless `--keep-bitmap` is passed) instead of held fully in RAM. Pass `--in-ram` to use a plain in-RAM array instead — faster (no disk I/O during the GPU write pass or CELF's lazy re-validation reads) but requires the full estimated size (printed at startup) as free RAM.
 
+For very large candidate pools against very large cracked universes, even the bitmap's disk-backed form can get unwieldy — see `--strategy sparse` below, whose coverage store only ever holds per-rule *hit lists* (not a dense bitmap), and whose `--gpu-celf` selection path streams those hit lists through bounded per-batch GPU buffers rather than ever materializing one flat buffer sized to the whole candidate pool.
+
 ### Usage
 
 ```bash
@@ -180,6 +182,14 @@ python run_ranker.py postprocess --ranking-csv ranker_output.csv \
 python run_ranker.py postprocess --ranking-csv ranker_output.csv \
   --wordlist rockyou.txt --cracked cracked_passwords.txt \
   --budget 5000 --output celf_selected.rule --in-ram
+
+# Huge candidate pool / cracked universe, GPU-assisted CELF select,
+# with a conservative per-batch GPU buffer size for small-VRAM cards:
+python run_ranker.py postprocess --rules-file top_optimized.rule \
+  --wordlist rockyou.txt --cracked cracked_passwords.txt \
+  --candidates 1000000 --budgets 64,250,1500,5000,10000,25000,50000,155000 \
+  --output celf_selected.rule \
+  --strategy sparse --gpu-celf --gpu-celf-hit-budget 100000000
 ```
 
 ### Arguments
@@ -213,10 +223,18 @@ python run_ranker.py postprocess --ranking-csv ranker_output.csv \
 | --strategy                  | bitmap                   | Coverage + selection strategy: bitmap (default dense/hybrid matrix), recompute-gpu (no matrix; re-score survivors on GPU each CELF round), or sparse (sparse coverage store + CPU CELF) |
 | --sparse-disk-threshold     | 100000                   | --strategy sparse only: switch coverage store from in-memory dict to SQLite above this many candidates                                                                                  |
 | --sparse-store-path         | —                        | --strategy sparse only: persist the SQLite coverage store at this path instead of a temp file                                                                                           |
+| --sparse-combined-budget-mb | 0 (disabled)              | --strategy sparse only: EXPERIMENTAL. Max GPU memory (MB) a single-pass combined count+extract coverage kernel may use for one rule-batch's fixed-stride output buffer, trading 2 binary-search passes over the wordlist for 1 at the cost of a worst-case-sized device→host transfer every batch regardless of actual hit count. Measured ~5x **slower** than the default two-pass path on a real hashcat-rule run — only worth raising if your wordlist is small and most rules are expected to match a large fraction of it; benchmark before enabling |
 | --gpu-celf                  | off                      | --strategy sparse only: run the CELF greedy-select loop on the GPU instead of CPU                                                                                                       |
 | --gpu-celf-batch            | (module default)         | --strategy sparse --gpu-celf only: max stale heap entries revalidated per GPU dispatch                                                                                                  |
+| --gpu-celf-hit-budget       | (module default, ~50M)   | --strategy sparse --gpu-celf only: max combined hit-index count held in the per-batch GPU buffer at once (~200 MB at the default). See [GPU-CELF memory](#gpu-celf-memory-gpu-celf-hit-budget) below |
 
 By default (disk-backed bitmap, i.e. no `--in-ram`), CELF's greedy-select phase runs across all CPU cores via multiprocessing, with each worker issuing several concurrent `os.pread()` calls against the on-disk bitmap file to keep read queue depth up — this is what keeps rules/s high during lazy re-validation on fast storage. Use `--no-parallel-celf` to fall back to the plain single-threaded selector.
+
+### GPU-CELF memory (`--gpu-celf-hit-budget`)
+
+`--strategy sparse --gpu-celf` never builds one flat buffer sized to the whole candidate pool's total hit count — with a large candidate pool against a large cracked universe, that total can run into the tens of billions of entries (tens of GB), which doesn't fit in RAM or VRAM on most machines. Instead, each round's stale-heap-entry batch (`--gpu-celf-batch` candidates) is streamed from the coverage store directly into a small, bounded GPU buffer, capped at `--gpu-celf-hit-budget` combined hit-index entries (default ~50,000,000, ~200 MB as uint32) before dispatch, then freed. Only the packed covered-set bitset (a few MB, independent of pool size) stays GPU-resident for the whole run.
+
+Lower `--gpu-celf-hit-budget` on small-VRAM GPUs (and on machines with limited host RAM, since each batch is also staged in host RAM before upload) to keep per-batch memory use well under what's available; raise it on large-VRAM GPUs for fewer, larger dispatches. A single candidate whose own hit list exceeds the budget is still processed alone in its own dispatch rather than being skipped.
 
 ---
 
