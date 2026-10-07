@@ -436,7 +436,12 @@ def select_device(device_id=None):
 # --- Output ---
 # ============================================================
 def save_output(selected, output_path):
-    """Write the selected rules to the exact requested output path."""
+    """Write selected rules sorted by final Marginal_Gain (descending).
+
+    The sort is stable for equal gains, so ties retain the original greedy
+    selection order.  Both the .rule file and *_celf.csv are written from the
+    same sorted list, keeping their order and Rank column consistent.
+    """
     if os.path.splitext(output_path)[1]:
         rule_path = output_path
     else:
@@ -444,16 +449,24 @@ def save_output(selected, output_path):
     base = os.path.splitext(rule_path)[0]
     csv_path = base + '_celf.csv'
 
+    # Python's sorted() is stable: equal Marginal_Gain values keep their
+    # original greedy/CELF selection order.
+    ranked_selected = sorted(
+        selected,
+        key=lambda item: int(item[1]),
+        reverse=True,
+    )
+
     with open(rule_path, 'w', newline='\n', encoding='utf-8') as f:
         f.write(":\n")
-        for rule, _gain in selected:
+        for rule, _gain in ranked_selected:
             f.write(f"{rule}\n")
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['Rank', 'Marginal_Gain', 'Rule_Data'])
-        for i, (rule, gain) in enumerate(selected, 1):
+        for i, (rule, gain) in enumerate(ranked_selected, 1):
             w.writerow([i, gain, rule])
-    log(f"{green('Saved')} {cyan(f'{len(selected):,}')} {bold('rules to')} {rule_path}")
+    log(f"{green('Saved')} {cyan(f'{len(ranked_selected):,}')} {bold('rules to')} {rule_path}")
     log(f"{green('Saved selection detail to')} {csv_path}")
 
 
@@ -477,15 +490,24 @@ def save_output_multi(selected, output_path, budgets):
     """Save one output pair per budget plus the exact --output path."""
     base = os.path.splitext(output_path)[0]
     ext = os.path.splitext(output_path)[1] or '.rule'
+
+    # Use the same final gain ordering as save_output() before taking budget
+    # cutoffs.  This makes *_topN outputs true top-N-by-Marginal_Gain files.
+    ranked_selected = sorted(
+        selected,
+        key=lambda item: int(item[1]),
+        reverse=True,
+    )
+
     for n in budgets:
-        if n > len(selected):
+        if n > len(ranked_selected):
             log(f"{yellow('Warning:')} --budgets {cyan(str(n))} {bold('exceeds')} "
-                f"{cyan(f'{len(selected):,}')} {bold('selected rules')} "
-                f"{dim('(saturation reached earlier)')} -- {bold('writing all')} {cyan(f'{len(selected):,}')}")
-        subset = selected[:n]
+                f"{cyan(f'{len(ranked_selected):,}')} {bold('selected rules')} "
+                f"{dim('(saturation reached earlier)')} -- {bold('writing all')} {cyan(f'{len(ranked_selected):,}')}")
+        subset = ranked_selected[:n]
         path = f"{base}_top{n}{ext}"
         save_output(subset, path)
-    save_output(selected, output_path)
+    save_output(ranked_selected, output_path)
 
 
 # ============================================================
