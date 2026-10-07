@@ -675,6 +675,12 @@ class _ResidentWordlistMixin:
                 wordlist_path, MAX_WORD_LEN, self.words_per_gpu_batch):
             total_words += num_words
 
+        # Exposed so callers (e.g. sparse_coverage.py's combined count+
+        # extract kernel) can size a fixed-stride per-rule output
+        # buffer that's guaranteed to never overflow, without needing
+        # their own separate full-wordlist pass just to get this count.
+        self.total_words = total_words
+
         chunk_words = self._resident_chunk_words(total_words)
 
         host_chunks = []

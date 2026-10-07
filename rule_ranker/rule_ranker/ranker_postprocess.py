@@ -958,6 +958,21 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
         f"{cyan(f'{num_cracked:,}')} {dim(f'({bitmap_row_bytes/1024:.1f} KB/rule,')} "
         f"{cyan(str(total_rule_batches))} {dim(f'rule-batches of <= {rule_batch_size})')}")
 
+    # Without caching, optimized_wordlist_iterator() re-reads and
+    # re-parses the whole wordlist from disk once per rule-batch, which
+    # dominates runtime once there are many rule-batches. Materialize
+    # the word batches into host RAM once up front and reuse them for
+    # every rule-batch below. Memory cost is roughly the size of the
+    # wordlist itself (packed as fixed-width MAX_WORD_LEN rows), which
+    # is independent of n_rules/bitmap size, so this is safe even when
+    # the coverage matrix itself is streamed to disk.
+    cached_word_batches = [
+        (w, c) for w, c in optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
+    ]
+    cached_bytes = sum(w.nbytes for w, _ in cached_word_batches)
+    log(f"{blue('Wordlist cached in RAM:')} {cyan(str(len(cached_word_batches)))} {bold('word-batches,')} "
+        f"{cyan(f'{cached_bytes/(1024**2):.1f} MB')} -- {dim('read from disk once, reused across all rule-batches')}")
+
     rules_batch_np = np.zeros((rule_batch_size, MAX_RULE_LEN), dtype=np.uint8)
 
     pbar = tqdm(total=total_rule_batches, desc=cyan("CELF coverage (rule batches)"),
@@ -968,11 +983,21 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
 
         rules_batch_np[:num_rules_here] = encoded[start:end]
         rules_batch_np[num_rules_here:] = 0
-        cl.enqueue_copy(queue, rules_g, rules_batch_np).wait()
-        cl.enqueue_fill_buffer(queue, bitmap_g, np.uint32(0), 0, bitmap_buffer_bytes).wait()
+        cl.enqueue_copy(queue, rules_g, rules_batch_np)
+        cl.enqueue_fill_buffer(queue, bitmap_g, np.uint32(0), 0, bitmap_buffer_bytes)
 
-        for words_np, num_words in optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch):
-            cl.enqueue_copy(queue, base_words_g, words_np).wait()
+        for words_np, num_words in cached_word_batches:
+            # (a) In-order command queue already guarantees these
+            # execute on the device in the order they're enqueued, so
+            # the per-op .wait() calls that used to be here only forced
+            # the *host* (this Python loop) to block until the device
+            # caught up -- they added no correctness value, just
+            # serialization. Dropping them lets host-side prep for the
+            # next sub-dispatch (numpy slicing, get_sub_region, etc.)
+            # overlap with the device still executing the previous one.
+            # We only need one explicit sync per rule-batch, right
+            # before reading results back to host (see below).
+            cl.enqueue_copy(queue, base_words_g, words_np)
 
             rules_per_sub = max(1, min(num_rules_here, MAX_DISPATCH_ITEMS // max(num_words, 1)))
             for sub_start in range(0, num_rules_here, rules_per_sub):
@@ -983,7 +1008,7 @@ def compute_coverage_bitmaps(rules, wordlist_path, cracked_hashes_sorted,
                 global_size = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
                 kernel(queue, global_size, (LOCAL_WORK_SIZE,),
                        base_words_g, sub_rules_g, cracked_g, sub_bitmap_g,
-                       np.uint32(num_words), np.uint32(sub_num), np.uint32(MAX_WORD_LEN)).wait()
+                       np.uint32(num_words), np.uint32(sub_num), np.uint32(MAX_WORD_LEN))
 
         # Pull this rule-batch's slice of the coverage bitmap back to a
         # small plain ndarray (at most rule_batch_size rows, a few MB) --
@@ -1628,6 +1653,21 @@ def main(argv=None):
                           "coverage store at this path instead of a temp "
                           "file deleted afterward (only relevant once "
                           "--candidates exceeds --sparse-disk-threshold).")
+    ap.add_argument('--sparse-combined-budget-mb', type=int, default=None,
+                     help="--strategy sparse only: EXPERIMENTAL, off by "
+                          "default (0 MB). Max GPU memory (MB) a single-pass "
+                          "combined count+extract coverage kernel may use "
+                          "for one rule-batch's fixed-stride output buffer. "
+                          "Trades 2 binary-search passes over the wordlist "
+                          "for 1, but transfers a WORST-CASE-sized buffer "
+                          "device->host every batch regardless of actual "
+                          "hit count -- measured ~5x SLOWER than the "
+                          "default two-pass path on a real hashcat-rule "
+                          "workload, where most rules match only a tiny "
+                          "fraction of the wordlist. Only raise this above "
+                          "0 if you've measured it helping for your "
+                          "specific wordlist/rule set; otherwise leave it "
+                          "at the default.")
     ap.add_argument('--gpu-celf', action='store_true',
                      help="--strategy sparse only: run the CELF greedy-"
                           "select loop on the GPU (packed covered-bitset "
@@ -1638,6 +1678,16 @@ def main(argv=None):
                      help="--strategy sparse --gpu-celf only: max stale "
                           "heap entries revalidated per GPU dispatch "
                           "(default: sparse_coverage.DEFAULT_GPU_CELF_BATCH, "
+                          "not imported here so plain --help keeps working "
+                          "without pyopencl installed).")
+    ap.add_argument('--gpu-celf-hit-budget', type=int, default=None,
+                     help="--strategy sparse --gpu-celf only: max combined "
+                          "hit-index count held in the per-batch GPU buffer "
+                          "at once (default: sparse_coverage."
+                          "DEFAULT_GPU_CELF_HIT_BUDGET, ~200MB). Lower this "
+                          "on small-VRAM GPUs -- this is what keeps the "
+                          "selection stage from ever needing a full-pool "
+                          "flat buffer resident on the GPU/host at once, "
                           "not imported here so plain --help keeps working "
                           "without pyopencl installed).")
     args = ap.parse_args(argv)
@@ -1728,7 +1778,7 @@ def main(argv=None):
         # rounds/revalidations are needed. See sparse_coverage.py.
         from .sparse_coverage import (
             compute_sparse_coverage_gpu, celf_select_sparse, celf_select_sparse_gpu,
-            SPARSE_DISK_THRESHOLD, DEFAULT_GPU_CELF_BATCH,
+            SPARSE_DISK_THRESHOLD, DEFAULT_GPU_CELF_BATCH, DEFAULT_GPU_CELF_HIT_BUDGET,
         )
         _sparse_dim_note = dim(
             'no coverage bitmap matrix will be allocated, '
@@ -1740,6 +1790,12 @@ def main(argv=None):
             f"{'GPU' if args.gpu_celf else 'pure-CPU'} CELF -- {_sparse_dim_note}")
 
         disk_threshold = args.sparse_disk_threshold or SPARSE_DISK_THRESHOLD
+        from .sparse_coverage import DEFAULT_SPARSE_COMBINED_BUDGET_BYTES
+        combined_budget_bytes = (
+            args.sparse_combined_budget_mb * 1024 * 1024
+            if args.sparse_combined_budget_mb is not None
+            else DEFAULT_SPARSE_COMBINED_BUDGET_BYTES
+        )
         store, _initial_counts = compute_sparse_coverage_gpu(
             rules, args.wordlist, cracked_hashes,
             rule_batch_size=args.rule_batch_size,
@@ -1747,6 +1803,7 @@ def main(argv=None):
             device_id=args.device,
             disk_threshold=disk_threshold,
             store_path=args.sparse_store_path,
+            combined_budget_bytes=combined_budget_bytes,
         )
         try:
             budgets = parse_budgets(args.budgets) if args.budgets else []
@@ -1756,7 +1813,8 @@ def main(argv=None):
                 selected = celf_select_sparse_gpu(
                     rules, store, len(cracked_hashes), device_id=args.device,
                     budget=run_budget,
-                    batch_size=args.gpu_celf_batch or DEFAULT_GPU_CELF_BATCH)
+                    batch_size=args.gpu_celf_batch or DEFAULT_GPU_CELF_BATCH,
+                    hit_budget=args.gpu_celf_hit_budget or DEFAULT_GPU_CELF_HIT_BUDGET)
             else:
                 selected = celf_select_sparse(rules, store, len(cracked_hashes), budget=run_budget)
 
