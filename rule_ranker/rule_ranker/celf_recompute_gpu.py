@@ -2,42 +2,21 @@
 """
 celf_recompute_gpu.py -- memory-light GPU greedy coverage selection
 =====================================================================
-Alternative to celf_postprocess.py's compute_coverage_bitmaps() +
-celf_select(), using a recompute-then-select greedy strategy instead
-of a memoize-then-select one.
+The single recompute-then-select greedy strategy used by
+ranker_postprocess.py.  No per-candidate coverage matrix is materialized.
 
 WHY THIS EXISTS
 ----------------
-celf_postprocess.py's coverage-evaluation stage materializes a
-(n_candidates x ceil(cracked_universe/32)) uint32 bitmap matrix -- one
-row per candidate rule, one bit per cracked-password target. For large
-inputs (tens of thousands of candidates x millions of cracked hashes)
-that matrix is tens to hundreds of GB. The existing code already
-mitigates this heavily (streamed to a memmap, hybrid dense/sparse
-row packing, --in-ram opt-out), but the *shape* of the algorithm is
-unchanged: it is CELF (Cost-Effective Lazy Forward selection), which
-is a *memoize-then-select* algorithm -- it computes and stores each
-candidate's full coverage vector once, then does lazy-greedy picks by
-re-reading rows from that stored matrix. Memory (RAM or disk) scales
-with n_candidates x cracked_universe.
-
-A recompute-then-select greedy solves the same "pick the next best
-rule" problem completely differently from CELF's memoize-then-select
-approach: it never stores a coverage matrix at all. Each round it
-re-scores every still-viable candidate rule directly on the GPU
-against the CURRENT (shrinking) uncracked target set, keeps only the
-round's single best rule, removes the words it covered from the
-target set, and repeats. It prunes most rules from re-evaluation with
-a classic lazy-greedy bound: a rule's ORIGINAL (full-target) hit count
-is a monotonically non-increasing upper bound on what it can score in
-any later round (targets only ever shrink), so once a round's current
-best is found, any untested rule whose upper bound is <= that best
-can't possibly beat it and is skipped without a GPU launch.
+The post-processing stage used to support large, materialized coverage stores.
+That design imposed memory/disk growth proportional to candidates times the
+cracked universe.  The recompute path avoids that entirely: it scores the
+remaining candidates directly on the GPU against a shrinking active target set
+and uses monotone upper bounds to skip candidates that cannot win the current
+round.
 
 This module implements that recompute + lazy-upper-bound strategy in
-rule_ranker, reusing this package's own GPU rule-application kernel
-(the same apply_hashcat_rule() transform celf_postprocess.py's
-coverage kernel uses, so results match). Hash membership uses a GPU
+rule_ranker, reusing the same GPU rule-application transform as the
+post-processing kernel so results match. Hash membership uses a GPU
 open-addressing table rather than a per-hit binary search through the
 sorted cracked array, substantially reducing random global-memory reads.
 The only state kept between
@@ -46,11 +25,10 @@ rounds is:
     covered (W = ceil(cracked_universe/32) words -- e.g. ~1.2 MB for a
     10M-entry universe, however many candidate rules there are).
   - `upper_bound` : (n_rules,) int32 -- each rule's static full-target
-    popcount, computed ONCE in a single streaming pass (same shape as
-    compute_coverage_bitmaps()'s pass, but accumulating one atomic
-    counter per rule instead of writing a whole bitmap row).
+    popcount, computed ONCE in a single streaming pass, accumulating one
+    atomic counter per rule instead of writing a coverage row.
   - `order`/`last_bound`/`excluded`, three (n_rules,)-shaped arrays
-    that together play the same role as celf_select()'s lazy heap
+    that together provide the lazy-greedy ordering/refinement state
     (see celf_select_recompute_gpu()'s block comment for why this is a
     fixed sorted array with two upper bounds rather than an actual
     heapq, which an earlier version of this module used) -- either
@@ -59,28 +37,10 @@ rounds is:
     batch of several at once) instead of a memmap row read.
 
 Nothing shaped (n_rules x cracked_universe) is ever allocated, in RAM
-or on disk. Peak extra memory beyond the wordlist/rule pool is
+or on disk. Peak extra memory beyond the rule pool is
 O(n_rules) + O(cracked_universe bits) + O(wordlist), since the
-wordlist itself is now kept resident (GPU memory if it fits, host RAM
-otherwise) rather than re-streamed from disk on every rescore -- see
-_GpuScorer's docstring below for why.
-
-Trade-off vs. the matrix approach: this recomputes each surviving
-candidate's coverage from scratch (a GPU pass over the wordlist) every
-time the lazy heap needs to revalidate it, instead of reading a
-precomputed row. That is more GPU compute, but GPU rule-application +
-hashing over a wordlist is exactly what this package's OpenCL kernel
-is already fast at (it's the same kernel ranker.py's exhaustive/MAB
-scoring stages use), and it fully replaces slow, memory/IO-bound
-random reads against a huge on-disk matrix -- which celf_select()'s
-own comments identify as its actual bottleneck at scale ("CELF is
-I/O-bound on random reads of the coverage matrix, not CPU-bound").
-For candidate pools where the coverage matrix would be very large but
-the final --budget is much smaller than n_candidates (the common
-case), this mode is both lower-memory AND faster in practice, since
-CELF's lazy bound means most rounds validate in one GPU rescore and
-most candidates are pruned by `upper_bound` without ever touching the
-GPU again.
+wordlist itself is kept resident (GPU memory if it fits, host RAM
+otherwise) rather than re-streamed from disk on every rescore.
 
 Usage
 -----
@@ -94,7 +54,7 @@ Usage
 Or import celf_select_recompute_gpu() directly and feed it the same
 `rules` list load_candidate_rules()/load_cracked_universe() from
 ranker_postprocess.py already produce, to drop it into an existing
-pipeline as an alternative to compute_coverage_bitmaps()+celf_select().
+pipeline as the recompute-gpu CELF implementation.
 """
 
 import argparse
@@ -111,19 +71,16 @@ from tqdm import tqdm
 from .ranker_postprocess import (
     MAX_WORD_LEN, MAX_OUTPUT_LEN, MAX_RULE_LEN, LOCAL_WORK_SIZE,
     DEFAULT_WORDS_PER_GPU_BATCH, MAX_DISPATCH_ITEMS,
-    log, red, green, yellow, blue, cyan, bold, dim, get_rss_mb,
+    log, red, green, yellow, blue, cyan, bold, dim,
     optimized_wordlist_iterator, load_cracked_universe, load_candidate_rules,
     select_device, save_output, parse_budgets, save_output_multi,
 )
 
-# The full apply_hashcat_rule()/apply_single_command()/
-# binary_search_cracked() C source is identical to the one in
-# ranker_postprocess.get_celf_kernel_source(); it is not re-derived
-# here, only re-templated with two different __kernel entry points
-# (score-against-active-set, and apply-and-clear-for-the-winner)
-# instead of celf_coverage_kernel's bitmap-row write. Keeping this as
-# a separate string (rather than string-surgery on the other module's
-# kernel) keeps each kernel source independently readable/buildable.
+# The full apply_hashcat_rule()/apply_single_command() C source is kept
+# in this module rather than imported from another implementation. The two
+# kernel entry points are specialized for scoring against the active target
+# set and for clearing the winning rule's newly-covered targets. Keeping
+# this source local makes each kernel independently readable/buildable.
 _COMMON_KERNEL_BODY = r"""
 int is_lower(unsigned char c) { return (c >= 'a' && c <= 'z'); }
 int is_upper(unsigned char c) { return (c >= 'A' && c <= 'Z'); }
@@ -313,26 +270,6 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
     for (int i=0;i<in_len;i++) output[i]=in_buf[i];
     *changed = final_changed;
 }
-// Binary search over the sorted cracked-hash array: O(log2(N)) random
-// global-memory reads per lookup. Kept here (alongside the newer
-// lookup_cracked_slot() hash-table probe below) because it's a real
-// extern dependency of sparse_coverage.py's kernels, which are built
-// around a plain sorted cracked_hashes_sorted buffer rather than the
-// open-addressing table celf_recompute_gpu's own kernels use -- both
-// modules import this same _COMMON_KERNEL_BODY string, so both lookup
-// styles need to be present for whichever module's kernel calls them.
-// Dead code (never called) from celf_recompute_gpu's own kernels,
-// which use lookup_cracked_slot() instead for its O(1)-probe win.
-int binary_search_cracked(__global const unsigned int* sorted_hashes, unsigned int n, unsigned int key) {
-    int lo = 0, hi = (int)n - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) >> 1;
-        unsigned int v = sorted_hashes[mid];
-        if (v == key) return mid;
-        if (v < key) lo = mid + 1; else hi = mid - 1;
-    }
-    return -1;
-}
 // Open-addressed hash table lookup.  The old implementation used a
 // binary search over the sorted cracked-hash array (O(log2(N)) random
 // global-memory reads for every word/rule pair).  On GPUs that random
@@ -363,9 +300,8 @@ int lookup_cracked_slot(__global const unsigned int* hash_table,
 
 
 def get_recompute_kernel_source(num_cracked, hash_table_size):
-    """Two kernels sharing the same rule-transform/hash/binary-search
-    plumbing as celf_postprocess.get_celf_kernel_source(), but neither
-    one ever writes a per-rule bitmap ROW:
+    """Two kernels sharing the same rule-transform/hash plumbing as the
+    scorer's common kernel body; neither kernel writes per-rule coverage rows:
 
     - score_against_active_kernel: for each (word, rule) pair in the
       current dispatch, if the transformed word hashes to a cracked
@@ -389,9 +325,8 @@ def get_recompute_kernel_source(num_cracked, hash_table_size):
 {_COMMON_KERNEL_BODY}
 
 // active: ceil(NUM_CRACKED/32) words, bit=1 means "not yet covered".
-// gains: one int32 accumulator per rule in this dispatch batch,
-// caller zeroes it before each rule-batch (same convention as
-// celf_coverage_kernel's bitmap zeroing in ranker_postprocess.py).
+// gains: one int32 accumulator per rule in this dispatch batch;
+// the host zeroes it before each rule-batch.
 __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void score_against_active_kernel(
     __global const unsigned char* base_words_in,
@@ -576,8 +511,7 @@ __kernel void clear_recorded_slots_kernel(
 class _ResidentWordlistMixin:
     """Parse-once, stay-resident wordlist handling, shared by every GPU
     backend in this package that needs to run MANY dispatches over the
-    same wordlist across a run (celf_recompute_gpu.py's `_GpuScorer`,
-    and sparse_coverage.py's coverage-extraction backend).
+    same wordlist across a run (the celf_recompute_gpu `_GpuScorer`).
 
     WHY THIS EXISTS
     ----------------
@@ -619,9 +553,9 @@ class _ResidentWordlistMixin:
     """
 
     # Fraction of device global memory we're willing to spend holding
-    # the whole encoded wordlist resident, leaving room for whatever
-    # else the subclass's buffers need (cracked-hash array, coverage/
-    # active buffers, rule batch buffers, driver overhead, ...).
+    # the whole encoded wordlist resident, leaving room for the
+    # cracked-hash table, active target bitset, rule batch buffers,
+    # and driver overhead.
     # Conservative on purpose -- falling back to the host-resident path
     # is still a large win over per-call disk streaming, so there's no
     # need to cut this close.
@@ -674,12 +608,6 @@ class _ResidentWordlistMixin:
         for _words_np, num_words in optimized_wordlist_iterator(
                 wordlist_path, MAX_WORD_LEN, self.words_per_gpu_batch):
             total_words += num_words
-
-        # Exposed so callers (e.g. sparse_coverage.py's combined count+
-        # extract kernel) can size a fixed-stride per-rule output
-        # buffer that's guaranteed to never overflow, without needing
-        # their own separate full-wordlist pass just to get this count.
-        self.total_words = total_words
 
         chunk_words = self._resident_chunk_words(total_words)
 
@@ -852,9 +780,8 @@ class _GpuScorer(_ResidentWordlistMixin):
     on the GPU for the whole run; only word batches stream through (see
     _ResidentWordlistMixin), so the only thing that scales with n_rules
     is a small on-device buffer sized for one rule dispatch batch
-    (rule_batch_size rows), exactly like compute_coverage_bitmaps()'s
-    bitmap_g -- except this buffer holds int32 SCALARS per rule, not a
-    full bitmap row, so it's ~W/32 times smaller for the same
+    (rule_batch_size rows); the buffer holds int32 SCALARS per rule,
+    not a full per-rule coverage row, so it is ~W/32 times smaller for the same
     rule_batch_size."""
 
     def __init__(self, encoded_rules, num_cracked, cracked_hashes_sorted,
@@ -1156,13 +1083,11 @@ class _GpuScorer(_ResidentWordlistMixin):
 def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
                                rule_batch_size, words_per_gpu_batch,
                                device_id=None, budget=None):
-    """Lazy-greedy max-coverage selection with the same selection
-    semantics/order as celf_select() (marginal-gain-order, ties broken
-    by discovery order), but with O(n_rules) + O(cracked_universe bits)
-    peak memory instead of O(n_rules x cracked_universe bits) -- see
-    module docstring. Returns list[(rule, gain)] best-first, same
-    shape as celf_select()'s return value so callers (save_output(),
-    save_output_multi()) don't need to change."""
+    """Lazy-greedy max-coverage selection with stable marginal-gain order
+    and deterministic tie-breaking by original rule index.  Selection state
+    is O(n_rules) plus the uncovered-target bitset.  Returns
+    list[(rule, gain)] best-first for the output helpers used by postprocess.
+    """
     n_rules = len(rules)
     log(f"{blue('Recompute-GPU greedy select:')} {cyan(f'{n_rules:,}')} {bold('candidates,')} "
         f"{cyan(f'{len(cracked_hashes_sorted):,}')} {bold('cracked universe')} "
@@ -1180,8 +1105,8 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
                          wordlist_path=wordlist_path, rule_lens=rule_lens)
 
     # --- Pass 1: static upper bound for every candidate, against the
-    # full (all-active) target set. Same GPU work as
-    # compute_coverage_bitmaps()'s single streaming pass, but the only
+    # full (all-active) target set. This is the one-time GPU scoring pass;
+    # the only
     # thing retained afterwards is one int per rule.
     upper_bound = np.zeros(n_rules, dtype=np.int64)
     total_batches = math.ceil(n_rules / rule_batch_size)
@@ -1191,7 +1116,6 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
         end = min(start + rule_batch_size, n_rules)
         idx_chunk = np.arange(start, end)
         upper_bound[start:end] = scorer.score_batch(idx_chunk, wordlist_path)
-        pbar.set_postfix({"rss_mb": f"{get_rss_mb():.0f}"})
         pbar.update(1)
     pbar.close()
 
@@ -1309,7 +1233,6 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
             "round": round_num,
             "gpu_dispatches": dispatches_this_pick,
             "s/round": f"{round_elapsed:.1f}",
-            "rss_mb": f"{get_rss_mb():.0f}",
         })
     pbar.close()
 
@@ -1317,15 +1240,13 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     total_covered = len(cracked_hashes_sorted) - remaining
     log(f"{green('Done.')} {bold('Selected')} {cyan(f'{len(selected):,}')} {bold('rules,')} "
         f"{bold('covering')} {cyan(f'{total_covered:,}')}/{cyan(f'{len(cracked_hashes_sorted):,}')} "
-        f"{bold('cracked entries')} -- {dim('peak extra memory: O(n_rules) + O(universe bits), no matrix')}")
+        f"{bold('cracked entries')} -- {dim('selection state: O(n_rules) + O(universe bits)')}")
     return selected
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        description="Memory-light GPU recompute+lazy-greedy max-coverage "
-                     "selection, drop-in alternative to celf_postprocess.py's "
-                     "matrix-based CELF.")
+        description="Memory-light GPU recompute+lazy-greedy max-coverage selection.")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument('-r', '--ranking-csv', help="ranker output CSV (Rule_Data/Combined_Score columns)")
     src.add_argument('-f', '--rules-file', help="Plain .rule file (already ranked/optimized)")

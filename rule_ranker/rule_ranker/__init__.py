@@ -5,7 +5,7 @@ Modular package wrapping the three original standalone scripts:
 
     rule_ranker.ranker              -- ranker.py (GPU rule ranking, v5.2)
     rule_ranker.ranker_handler      -- ranker_handler.py (fast CSV/rule analysis)
-    rule_ranker.ranker_postprocess  -- ranker_postprocess.py (GPU/CPU CELF coverage stage)
+    rule_ranker.ranker_postprocess  -- ranker_postprocess.py (GPU recompute + lazy-greedy CELF stage)
 
 Each submodule is kept byte-for-byte identical in logic to the original
 script -- nothing was rewritten, only relocated into a package and given
