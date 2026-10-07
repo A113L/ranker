@@ -125,6 +125,13 @@ class InMemorySparseCoverageStore(dict):
     def count_with_hits(self):
         return sum(1 for arr in self.values() if len(arr))
 
+    def get_many(self, indices):
+        """Batched counterpart to __getitem__ -- trivial here (no I/O,
+        plain dict lookups), but present so callers (recompute_gains())
+        can use the SAME code path regardless of store type instead of
+        branching on store class."""
+        return {int(i): self[int(i)] for i in indices}
+
     def close(self):
         pass
 
@@ -206,6 +213,56 @@ class SQLiteSparseCoverageStore(Mapping):
     def __contains__(self, idx):
         return self._conn.execute(
             'SELECT 1 FROM coverage WHERE idx = ?', (int(idx),)).fetchone() is not None
+
+    def get_many(self, indices):
+        """Batched counterpart to __getitem__: ONE SQL round trip
+        (chunked only by SQLite's parameter-count limit, ~999) for a
+        whole list of indices, instead of one `SELECT ... WHERE idx =
+        ?` per index. CELF's lazy-revalidation batches (up to
+        DEFAULT_GPU_CELF_BATCH=4096 stale heap entries at once) used to
+        call __getitem__ in a plain Python loop here -- thousands of
+        sequential single-row queries per CELF round, each paying its
+        own cursor/round-trip overhead regardless of how fast the
+        underlying disk is. This is the dominant cost of a GPU-CELF
+        round once covered_count() itself is cheap (see
+        _SparseCelfGpuBackend.covered_count()'s vectorized popcount).
+        Returns {idx: hits_array}; indices already resident in the
+        small getitem LRU cache are served from there without hitting
+        SQLite at all, and any fetched rows populate that same cache
+        (same eviction policy as __getitem__) so later single-item
+        lookups of the same idx stay fast too. Raises KeyError if any
+        requested idx isn't present (matching __getitem__'s contract)."""
+        idx_list = [int(i) for i in indices]
+        result = {}
+        missing = []
+        for idx in idx_list:
+            cached = self._getitem_cache.get(idx)
+            if cached is not None:
+                self._getitem_cache.move_to_end(idx)
+                result[idx] = cached
+            else:
+                missing.append(idx)
+
+        CHUNK = 900  # stay under SQLite's default ~999 bound-parameter limit
+        for cs in range(0, len(missing), CHUNK):
+            chunk = missing[cs:cs + CHUNK]
+            placeholders = ','.join('?' * len(chunk))
+            cur = self._conn.execute(
+                f'SELECT idx, hits FROM coverage WHERE idx IN ({placeholders})', chunk)
+            for idx, blob in cur:
+                hits = np.frombuffer(blob, dtype=np.int32) if blob else EMPTY_HITS
+                result[idx] = hits
+                self._getitem_cache[idx] = hits
+                self._getitem_cache.move_to_end(idx)
+
+        missing_keys = [i for i in idx_list if i not in result]
+        if missing_keys:
+            raise KeyError(missing_keys[0])
+
+        while len(self._getitem_cache) > self._getitem_cache_max:
+            self._getitem_cache.popitem(last=False)
+
+        return result
 
     def __iter__(self):
         cur = self._conn.execute('SELECT idx FROM coverage')
@@ -1129,11 +1186,30 @@ class _SparseCelfGpuBackend:
         marginal gain against the CURRENT covered_bitset in as few GPU
         calls as hit_budget allows (almost always one, for the normal
         batch_size=4096-ish stale-revalidation batches), and returns
-        results in the SAME order as candidate_indices."""
+        results in the SAME order as candidate_indices.
+
+        Fetches the WHOLE batch's hit arrays from `store` in one
+        get_many() call (one SQL round trip on SQLiteSparseCoverageStore,
+        chunked only by its bound-parameter limit) instead of indexing
+        the store once per candidate in a Python loop -- at
+        batch_size=4096-ish stale entries per CELF round, that used to
+        mean thousands of sequential single-row SQL queries per round
+        (each paying its own cursor/round-trip overhead on top of
+        whatever the underlying disk costs), which dominates GPU-CELF
+        wall-clock once covered_count() itself is cheap (see that
+        method's docstring)."""
         idx_list = [int(i) for i in candidate_indices]
         n = len(idx_list)
         if n == 0:
             return np.empty(0, dtype=np.uint32)
+
+        if hasattr(self.store, 'get_many'):
+            arrays_by_idx = self.store.get_many(idx_list)
+        else:
+            # Fallback for a plain dict or any other bare Mapping
+            # without a batched get_many() (both of this package's own
+            # store types have one).
+            arrays_by_idx = {i: self.store[i] for i in idx_list}
 
         results = np.empty(n, dtype=np.uint32)
         i = 0
@@ -1143,7 +1219,7 @@ class _SparseCelfGpuBackend:
             chunk_hits = 0
             j = i
             while j < n:
-                arr = self.store[idx_list[j]]
+                arr = arrays_by_idx[idx_list[j]]
                 m = len(arr)
                 # Always take at least one candidate per sub-batch
                 # even if it alone exceeds hit_budget (a single huge
