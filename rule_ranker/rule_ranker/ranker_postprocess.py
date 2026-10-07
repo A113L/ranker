@@ -392,6 +392,9 @@ def load_candidate_rules(args):
     else:
         raise ValueError("Provide --ranking-csv or --rules-file")
 
+    if args.candidates and args.candidates > 0:
+        rules = rules[:args.candidates]
+
     # Keep the postprocess rule width identical to rank's GPU rule width.
     # Overlong rules are skipped rather than silently truncated because
     # truncation can change Hashcat rule semantics.
