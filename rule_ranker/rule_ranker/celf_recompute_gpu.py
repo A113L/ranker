@@ -567,34 +567,26 @@ class _ResidentWordlistMixin:
     # need to cut this close.
     _GPU_RESIDENT_WORDLIST_FRACTION = 0.78
 
-    def _resident_chunk_words(self, total_words):
-        """How many words to pack into each resident chunk when
-        preloading. The original 150,000-word default
-        (--words-batch-size) was sized for STREAMING batches off disk
-        within a fixed memory budget; it has nothing to do with how
-        large a single GPU dispatch can be. Once the wordlist is
-        resident, using that same small size just means many more
-        kernel-launch/.wait() round trips than necessary -- the
-        dominant cost once disk I/O and re-parsing are already
-        eliminated (each launch+wait is a host<->device sync point,
-        and a single-rule revalidation does exactly one dispatch per
-        chunk). So for resident chunks we instead pick the LARGEST
-        chunk size that still respects (a) MAX_DISPATCH_ITEMS -- the
-        total (words x rules) work-items allowed in one kernel launch
-        -- for a single-rule dispatch, and (b) the device's reported
-        max single allocation size, so one chunk's buffer is always a
-        legal OpenCL allocation. This collapses what used to be
-        dozens-to-hundreds of small chunks into a handful of large
-        ones, cutting launch/sync overhead by the same factor."""
+    def _resident_chunk_words(self, total_words=None):
+        """Choose a larger resident chunk without a preliminary wordlist pass.
+
+        Four streaming batches per resident chunk reduce kernel-launch/sync
+        overhead substantially while remaining conservative about host/GPU
+        memory.  The chunk is additionally bounded by OpenCL's maximum single
+        allocation and the global dispatch-item ceiling.
+        """
         try:
             max_alloc_bytes = self.device.get_info(cl.device_info.MAX_MEM_ALLOC_SIZE)
         except Exception:
             max_alloc_bytes = 0
-        words_per_alloc_limit = (max_alloc_bytes // MAX_WORD_LEN) if max_alloc_bytes else total_words
-        # MAX_DISPATCH_ITEMS bounds num_words * num_rules_in_batch for
-        # one launch; for the single-rule case (the hot path during
-        # lazy-heap revalidation) that's just num_words itself.
-        chunk_words = min(total_words, words_per_alloc_limit, MAX_DISPATCH_ITEMS)
+        if max_alloc_bytes:
+            words_per_alloc_limit = max_alloc_bytes // MAX_WORD_LEN
+        else:
+            words_per_alloc_limit = max(1, int(self.words_per_gpu_batch) * 4)
+        chunk_words = min(max(1, int(self.words_per_gpu_batch) * 4),
+                          words_per_alloc_limit, MAX_DISPATCH_ITEMS)
+        if total_words is not None:
+            chunk_words = min(chunk_words, max(1, int(total_words)))
         return max(1, int(chunk_words))
 
     def _preload_wordlist(self, wordlist_path):
@@ -603,27 +595,21 @@ class _ResidentWordlistMixin:
         apply_winner_and_clear() never touch disk or re-parse text
         again for the rest of the run. See class docstring."""
         t0 = time.time()
+        chunk_words = self._resident_chunk_words()
 
-        # First pass: figure out how many words there are so we can
-        # size resident chunks correctly (see _resident_chunk_words).
-        # This still only reads/parses the file once for that count --
-        # the iterator below (which builds the actual resident chunks)
-        # is what matters for total preload cost, this pass is cheap
-        # relative to it since it doesn't allocate any GPU buffers.
-        total_words = 0
-        for _words_np, num_words in optimized_wordlist_iterator(
-                wordlist_path, MAX_WORD_LEN, self.words_per_gpu_batch):
-            total_words += num_words
-
-        chunk_words = self._resident_chunk_words(total_words)
-
+        # Single pass: choose a conservative resident chunk size from device
+        # limits, then retain the parsed chunks while counting them.  The old
+        # implementation ran the mmap parser once merely to count words and
+        # immediately ran it a second time to build the resident chunks.
         host_chunks = []
+        total_words = 0
         for words_np, num_words in optimized_wordlist_iterator(
                 wordlist_path, MAX_WORD_LEN, chunk_words):
             # optimized_wordlist_iterator() reuses/mutates its buffer
             # across yields except on the final partial chunk, so copy
             # defensively before holding onto it long-term.
             host_chunks.append((words_np.copy(), num_words))
+            total_words += num_words
 
         total_bytes = sum(len(w) for w, _ in host_chunks)
         try:
@@ -1220,9 +1206,21 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
             while pos < len(live):
                 chunk_end = min(pos + rule_batch_size, len(live))
                 chunk = live[pos:chunk_end]
-                if int(upper_bound[chunk[0]]) <= best_gain:
-                    break  # sorted descending -- nothing later can beat best_gain either
-                need_rescore = chunk[last_bound[chunk] > best_gain]
+                chunk_upper = int(upper_bound[chunk[0]])
+                # Keep scanning on an exact upper-bound tie only when the first
+                # tied candidate has a smaller original rule index than the
+                # current best.  That preserves the promised deterministic
+                # tie-break (lower original index wins) without rescoring later
+                # candidates that cannot possibly beat the current winner.
+                if chunk_upper < best_gain or (
+                    chunk_upper == best_gain and best_idx >= 0 and int(chunk[0]) > best_idx
+                ):
+                    break
+                need_mask = (
+                    (last_bound[chunk] > best_gain)
+                    | ((last_bound[chunk] == best_gain) & ((best_idx < 0) | (chunk < best_idx)))
+                )
+                need_rescore = chunk[need_mask]
                 if len(need_rescore):
                     gains = scorer.score_batch(need_rescore, wordlist_path)
                     dispatches_this_pick += 1

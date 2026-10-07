@@ -42,6 +42,7 @@ coverage matrix.
 
 import argparse
 import csv
+import heapq
 import mmap
 import os
 import sys
@@ -255,7 +256,12 @@ def estimate_worst_case_output_len(rules, max_word_len):
 
 
 def load_candidate_rules(args):
-    """Return candidate rules, best-score first, capped at --candidates."""
+    """Return candidate rules, best-score first, capped at --candidates.
+
+    For ranking CSV input, a bounded heap is used when ``--candidates`` is
+    positive.  This preserves the old stable score ordering while avoiding a
+    full in-memory copy of a very large ranking CSV just to keep its Top-C.
+    """
     rules = []
     if args.rules_file:
         with open(args.rules_file, 'r', encoding='latin-1') as f:
@@ -266,21 +272,38 @@ def load_candidate_rules(args):
     elif args.ranking_csv:
         with open(args.ranking_csv, 'r', encoding='utf-8', newline='') as f:
             reader = csv.DictReader(f)
-            rows = list(reader)
+            limit = args.candidates if args.candidates and args.candidates > 0 else None
+            if limit is None:
+                rows = list(reader)
 
-        def score_of(row):
-            try:
-                return float(row.get('Combined_Score', 0))
-            except (TypeError, ValueError):
-                return 0.0
+                def score_of(row):
+                    try:
+                        return float(row.get('Combined_Score', 0))
+                    except (TypeError, ValueError):
+                        return 0.0
 
-        rows.sort(key=score_of, reverse=True)
-        rules = [row['Rule_Data'] for row in rows if row.get('Rule_Data')]
+                rows.sort(key=score_of, reverse=True)
+                rules = [row['Rule_Data'] for row in rows if row.get('Rule_Data')]
+            else:
+                heap = []
+                for seq, row in enumerate(reader):
+                    rule = row.get('Rule_Data')
+                    if not rule:
+                        continue
+                    try:
+                        score = float(row.get('Combined_Score', 0))
+                    except (TypeError, ValueError):
+                        score = 0.0
+                    entry = (score, -seq, rule)
+                    if len(heap) < limit:
+                        heapq.heappush(heap, entry)
+                    elif entry[:2] > heap[0][:2]:
+                        heapq.heapreplace(heap, entry)
+                rules = [rule for _score, _neg_seq, rule in
+                         sorted(heap, key=lambda item: (-item[0], -item[1]))]
     else:
         raise ValueError("Provide --ranking-csv or --rules-file")
 
-    if args.candidates and len(rules) > args.candidates:
-        rules = rules[:args.candidates]
     # Keep the postprocess rule width identical to rank's GPU rule width.
     # Overlong rules are skipped rather than silently truncated because
     # truncation can change Hashcat rule semantics.

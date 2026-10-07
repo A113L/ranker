@@ -36,6 +36,7 @@ import pyopencl as cl
 import numpy as np
 import argparse
 import csv
+import heapq
 from tqdm import tqdm
 import math
 import warnings
@@ -511,9 +512,16 @@ def load_rules(path):
     return rules_list
 
 def load_cracked_hashes(path, max_len):
-    """Loads cracked passwords and returns their FNV‑1a hashes."""
+    """Loads cracked passwords and returns their FNV‑1a hashes.
+
+    Uses a compact uint32 accumulator instead of a Python int list.  This
+    keeps the exact hash values/order while avoiding one Python object per
+    cracked entry, which matters for multi-million-entry cracked lists.
+    """
+    from array import array
+
     print(f"{blue('Loading cracked list for effectiveness check from:')} {path}...")
-    cracked_hashes = []
+    cracked_hashes = array('I')
     try:
         with open(path, 'rb') as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -536,7 +544,11 @@ def load_cracked_hashes(path, max_len):
     except FileNotFoundError:
         print(f"{yellow('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
         return np.array([], dtype=np.uint32)
-    unique_hashes = np.unique(np.array(cracked_hashes, dtype=np.uint32))
+    if cracked_hashes.itemsize == np.dtype(np.uint32).itemsize:
+        raw_hashes = np.frombuffer(cracked_hashes, dtype=np.uint32)
+    else:  # defensive fallback for unusual platforms where C unsigned int is not 32-bit
+        raw_hashes = np.asarray(cracked_hashes, dtype=np.uint32)
+    unique_hashes = np.unique(raw_hashes)
     print(f"{green('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password hashes.')}")
     return unique_hashes
 
@@ -625,33 +637,57 @@ def save_ranking_data(ranking_list, output_path, legacy=False):
         return None
 
 def load_and_save_optimized_rules(csv_path, output_path, top_k):
-    """Loads ranking data from CSV, sorts, and saves the Top K rules."""
+    """Load ranking data and save Top K without materializing the full CSV.
+
+    The bounded heap preserves the old stable ``reverse=True`` sort semantics:
+    higher Combined_Score wins, and equal scores keep their original CSV order.
+    """
     if not csv_path:
         print(f"{yellow('Optimization skipped: Ranking CSV path is missing.')}")
         return
     print(f"{blue('Loading ranking from CSV:')} {csv_path} {bold('and saving Top')} {cyan(f'{top_k}')} {bold('Optimized Rules to:')} {output_path}...")
+    valid_count = 0
     ranked_data = []
     try:
         with open(csv_path, 'r', newline='', encoding='utf-8') as f:
             reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    row['Combined_Score'] = int(row['Combined_Score'])
-                    ranked_data.append(row)
-                except ValueError:
-                    continue
+            if top_k > 0:
+                heap = []
+                for seq, row in enumerate(reader):
+                    try:
+                        score = int(row['Combined_Score'])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    valid_count += 1
+                    entry = (score, -seq, row)
+                    if len(heap) < top_k:
+                        heapq.heappush(heap, entry)
+                    elif entry[:2] > heap[0][:2]:
+                        heapq.heapreplace(heap, entry)
+                ranked_data = [row for _score, _neg_seq, row in
+                               sorted(heap, key=lambda item: (-item[0], -item[1]))]
+            else:
+                # Preserve the old top_k<=0 behaviour exactly.
+                for row in reader:
+                    try:
+                        row['Combined_Score'] = int(row['Combined_Score'])
+                        ranked_data.append(row)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                valid_count = len(ranked_data)
+                ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
     except FileNotFoundError:
         print(f"{red('Error: Ranking CSV file not found at:')} {csv_path}")
         return
     except Exception as e:
         print(f"{red('Error while reading CSV:')} {e}")
         return
-    print(f"{blue('Loaded')} {cyan(f'{len(ranked_data):,}')} {bold('total rules from CSV')}")
-    ranked_data.sort(key=lambda row: row['Combined_Score'], reverse=True)
-    available_rules = len(ranked_data)
+
+    print(f"{blue('Loaded')} {cyan(f'{valid_count:,}')} {bold('total valid rules from CSV')}")
+    available_rules = valid_count
     if top_k > available_rules:
         print(f"{yellow('Warning: Requested')} {cyan(f'{top_k:,}')} {bold('rules but only')} {cyan(f'{available_rules:,}')} {bold('available. Saving')} {cyan(f'{available_rules:,}')} {bold('rules.')}")
-        final_optimized_list = ranked_data[:available_rules]
+        final_optimized_list = ranked_data
     else:
         final_optimized_list = ranked_data[:top_k]
     if not final_optimized_list:
@@ -663,6 +699,30 @@ def load_and_save_optimized_rules(csv_path, output_path, top_k):
             for rule in final_optimized_list:
                 f.write(f"{rule['Rule_Data']}\n")
         print(f"{green('Top')} {cyan(f'{len(final_optimized_list):,}')} {bold('optimized rules saved successfully to')} {output_path}.")
+    except Exception as e:
+        print(f"{red('Error while saving optimized rules to file:')} {e}")
+
+
+def save_top_k_rules(ranking_list, output_path, top_k):
+    """Write Top K directly from the already-ranked in-memory list.
+
+    ``save_ranking_data()`` sorts ``ranking_list`` in place immediately before
+    this helper is called.  Re-reading and re-sorting the CSV would therefore
+    do the same work twice and is especially wasteful for large ``-k`` runs.
+    """
+    available_rules = len(ranking_list)
+    final_count = min(max(int(top_k), 0), available_rules)
+    if top_k > available_rules:
+        print(f"{yellow('Warning: Requested')} {cyan(f'{top_k:,}')} {bold('rules but only')} {cyan(f'{available_rules:,}')} {bold('available. Saving')} {cyan(f'{available_rules:,}')} {bold('rules.')}")
+    if final_count <= 0:
+        print(f"{red('No rules available for optimized output.')}")
+        return
+    try:
+        with open(output_path, 'w', newline='\n', encoding='utf-8') as f:
+            f.write(":\n")
+            for rule in ranking_list[:final_count]:
+                f.write(f"{rule['rule_data']}\n")
+        print(f"{green('Top')} {cyan(f'{final_count:,}')} {bold('optimized rules saved successfully to')} {output_path}.")
     except Exception as e:
         print(f"{red('Error while saving optimized rules to file:')} {e}")
 
@@ -1571,7 +1631,7 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         else:
             platform, device = select_platform_and_device()
         context = cl.Context([device])
-        queue = cl.CommandQueue(context, properties=cl.command_queue_properties.PROFILING_ENABLE)
+        queue = cl.CommandQueue(context)
         total_vram, available_vram = get_gpu_memory_info(device)
         print(f"\n{green('GPU:')} {cyan(device.name.strip())}")
         print(f"{blue('Platform:')} {cyan(platform.name.strip())}")
@@ -2165,7 +2225,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         else:
             platform, device = select_platform_and_device()
         context = cl.Context([device])
-        queue = cl.CommandQueue(context, properties=cl.command_queue_properties.PROFILING_ENABLE)
+        queue = cl.CommandQueue(context)
         total_vram, available_vram = get_gpu_memory_info(device)
         print(f"\n{green('GPU:')} {cyan(device.name.strip())}")
         print(f"{blue('Platform:')} {cyan(platform.name.strip())}")
@@ -2469,9 +2529,9 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
 
     # Save results
     csv_path = save_ranking_data(rules_list, ranking_output_path, legacy=False)
-    if top_k > 0:
+    if top_k > 0 and csv_path:
         optimized_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-        load_and_save_optimized_rules(csv_path, optimized_path, top_k)
+        save_top_k_rules(rules_list, optimized_path, top_k)
 
 # ====================================================================
 # --- MAIN ENTRY POINT ---
