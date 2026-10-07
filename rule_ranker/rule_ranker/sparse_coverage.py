@@ -88,6 +88,14 @@ DEFAULT_GPU_CELF_BATCH = 4096
 # for every zero-coverage rule (there are often many in a large pool).
 EMPTY_HITS = np.empty(0, dtype=np.int32)
 
+# Popcount of every possible byte value (0..255), used to vectorize
+# _SparseCelfGpuBackend.covered_count()'s bitset popcount in numpy
+# instead of a pure-Python `bin(w).count('1')` loop -- see that
+# method's docstring for why the Python-loop version is a real
+# bottleneck at hash-table-backed universe sizes (tens of millions of
+# bits), not just a style preference.
+_POPCOUNT_BYTE_TABLE = np.array([bin(i).count('1') for i in range(256)], dtype=np.uint8)
+
 # Candidate-pool size above which SparseCoverageStore switches from a
 # plain in-memory dict to the SQLite-backed store. rule_ranker's
 # typical --candidates default (20,000) sits comfortably below this --
@@ -1174,11 +1182,22 @@ class _SparseCelfGpuBackend:
         """Host-side popcount of the bitset, only for the tqdm
         progress display / final log line -- O(cracked_size/32), not
         O(n_candidates x cracked_size), and only paid once per
-        selected rule, not per revalidation."""
+        selected rule, not per revalidation.
+
+        Vectorized via a 256-entry byte popcount lookup table (numpy),
+        NOT a pure-Python `sum(bin(w).count('1') for w in ...)` loop --
+        that loop costs O(n_words) PYTHON-level work, re-paid on every
+        single accepted rule (once per CELF round, up to `budget`
+        times), which dominates wall-clock at real hashcat scale (the
+        hash-table-backed coverage pass's universe_size is ~2x
+        cracked_size -- see _SparseGpuBackend -- so this got twice as
+        expensive there too). The lookup-table version does the same
+        popcount in vectorized numpy C code instead."""
         n_words = (self.universe_size + 31) // 32
         buf = np.empty(max(1, n_words), dtype=np.uint32)
         cl.enqueue_copy(self.queue, buf, self.covered_bitset_g)
-        return int(sum(bin(w).count('1') for w in buf.tolist()))
+        byte_view = buf.view(np.uint8)
+        return int(_POPCOUNT_BYTE_TABLE[byte_view].sum(dtype=np.int64))
 
 
 def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
