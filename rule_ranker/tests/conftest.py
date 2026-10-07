@@ -42,6 +42,7 @@ def _install_pyopencl_stub():
             "an actual GPU and is out of scope for unit tests."
         )
 
+    stub._RULE_RANKER_STUB = True
     stub.device_type = _DeviceType
     stub.mem_flags = _MemFlags
     stub.get_platforms = _unavailable

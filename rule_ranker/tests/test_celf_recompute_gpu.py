@@ -245,3 +245,11 @@ class TestBuildOpenAddressingTableVectorized:
             assert bits_set == len(cracked)
             for key in cracked:
                 assert self._lookup(vec_table, vec_occ, mask, int(key)) != -1
+
+
+def test_opencl_source_contains_empty_rotate_guard_and_overflow_abort():
+    src = crg.get_recompute_kernel_source(num_cracked=8, hash_table_size=16)
+    assert 'if (in_len <= 0)' in src
+    assert 'if (in_len*2>MAX_OUTPUT_LEN) return -2;' in src
+    assert 'if (in_len+1>MAX_OUTPUT_LEN) return -2;' in src
+    assert 'if (result < 0)' in src

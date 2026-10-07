@@ -293,3 +293,9 @@ class TestPostprocessCLI:
             rp.main(["-w", "w.txt", "-k", "c.txt", "-o", "out.rule",
                      "--recompute-gpu"])
         assert excinfo.value.code == 2
+
+
+def test_postprocess_rule_length_matches_ranker():
+    from rule_ranker import ranker
+    assert rp.MAX_RULE_LEN == ranker.MAX_RULE_LEN == 255
+

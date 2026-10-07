@@ -117,3 +117,10 @@ class TestArgParser:
             assert e.code == 0
         else:
             raise AssertionError("expected SystemExit(0) from --list-devices")
+
+
+def test_load_rules_skips_overlong_rules(tmp_path):
+    rules_path = tmp_path / "rules.rule"
+    rules_path.write_text(":" + "\n" + ("l" * 256) + "\n", encoding="latin-1")
+    loaded = ranker.load_rules(str(rules_path))
+    assert [row["rule_data"] for row in loaded] == [":"]
