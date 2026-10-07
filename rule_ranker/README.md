@@ -98,13 +98,3 @@ minimal stub for `pyopencl` so the GPU-dependent modules can still be
 OpenCL/GPU stack. If `pyopencl` is genuinely installed, the stub is
 skipped and the real module is used.
 
-## Comparison of Bitmap, Recompute-GPU, and Sparse Strategies for Coverage Matrix and CELF
-
-| Aspect | `bitmap` | `recompute-gpu` | `sparse` |
-|---|---|---|---|
-| Coverage matrix | Yes (dense/hybrid) | No | No (sparse lists) |
-| Memory | High | Low | Low–medium |
-| GPU during build | Yes | — | Yes |
-| GPU in CELF | No | Yes (every round) | No (unless `--gpu-celf`) |
-| CELF cost dependence on #rounds | Low | Strong | None |
-| Best when | Lots of RAM, large budget | Small budget relative to candidates | Bitmap too large / uncertainty |
