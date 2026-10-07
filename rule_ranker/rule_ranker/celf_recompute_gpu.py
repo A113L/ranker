@@ -102,34 +102,39 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
     for (unsigned int i = 0; i < len; i++) { hash ^= data[i]; hash *= 16777619U; }
     return hash;
 }
-static void duplicate_front(const unsigned char* in, int in_len,
-                            unsigned char* out, int* out_len, int* changed, int n) {
-    if (n > in_len) n = in_len;
-    int new_len = in_len + n;
-    if (new_len > MAX_OUTPUT_LEN) return;
-    for (int i = 0; i < n; i++) out[i] = in[i];
-    for (int i = 0; i < in_len; i++) out[n + i] = in[i];
-    *out_len = new_len; *changed = 1;
-}
-static void duplicate_back(const unsigned char* in, int in_len,
+// Return 0 on success, -2 on output-length overflow.
+static int duplicate_front(const unsigned char* in, int in_len,
                            unsigned char* out, int* out_len, int* changed, int n) {
     if (n > in_len) n = in_len;
     int new_len = in_len + n;
-    if (new_len > MAX_OUTPUT_LEN) return;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
+    for (int i = 0; i < n; i++) out[i] = in[i];
+    for (int i = 0; i < in_len; i++) out[n + i] = in[i];
+    *out_len = new_len; *changed = 1;
+    return 0;
+}
+static int duplicate_back(const unsigned char* in, int in_len,
+                          unsigned char* out, int* out_len, int* changed, int n) {
+    if (n > in_len) n = in_len;
+    int new_len = in_len + n;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
     for (int i = 0; i < in_len; i++) out[i] = in[i];
     for (int i = 0; i < n; i++) out[in_len + i] = in[in_len - n + i];
     *out_len = new_len; *changed = 1;
+    return 0;
 }
-static void duplicate_word(const unsigned char* in, int in_len,
-                           unsigned char* out, int* out_len, int* changed, int times) {
+static int duplicate_word(const unsigned char* in, int in_len,
+                          unsigned char* out, int* out_len, int* changed, int times) {
     int new_len = in_len * (times + 1);
-    if (new_len > MAX_OUTPUT_LEN) return;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
     for (int rep = 0; rep <= times; rep++)
         for (int i = 0; i < in_len; i++) out[rep * in_len + i] = in[i];
     *out_len = new_len; *changed = 1;
+    return 0;
 }
 static void rotate_left(const unsigned char* in, int in_len,
                         unsigned char* out, int* out_len, int* changed, int n) {
+    if (in_len <= 0) { *out_len = 0; *changed = 0; return; }
     if (n <= 0) n = 1;
     n %= in_len;
     *out_len = in_len;
@@ -139,6 +144,7 @@ static void rotate_left(const unsigned char* in, int in_len,
 }
 static void rotate_right(const unsigned char* in, int in_len,
                          unsigned char* out, int* out_len, int* changed, int n) {
+    if (in_len <= 0) { *out_len = 0; *changed = 0; return; }
     if (n <= 0) n = 1;
     n %= in_len;
     *out_len = in_len;
@@ -159,12 +165,12 @@ static int apply_single_command(const unsigned char* in, int in_len,
             case 'C': *out_len = in_len; if (in_len>0) out[0]=to_lower(in[0]); for (int i=1;i<in_len;i++) out[i]=to_upper(in[i]); changed=1; break;
             case 't': *out_len = in_len; for (int i=0;i<in_len;i++) out[i]=toggle_case(in[i]); changed=1; break;
             case 'r': *out_len = in_len; for (int i=0;i<in_len;i++) out[i]=in[in_len-1-i]; changed=1; break;
-            case 'd': if (in_len*2<=MAX_OUTPUT_LEN) { *out_len=in_len*2; for(int i=0;i<in_len;i++){out[i]=in[i];out[in_len+i]=in[i];} changed=1; } break;
-            case 'f': if (in_len*2<=MAX_OUTPUT_LEN) { *out_len=in_len*2; for(int i=0;i<in_len;i++){out[i]=in[i];out[in_len+i]=in[in_len-1-i];} changed=1; } break;
+            case 'd': if (in_len*2>MAX_OUTPUT_LEN) return -2; *out_len=in_len*2; for(int i=0;i<in_len;i++){out[i]=in[i];out[in_len+i]=in[i];} changed=1; break;
+            case 'f': if (in_len*2>MAX_OUTPUT_LEN) return -2; *out_len=in_len*2; for(int i=0;i<in_len;i++){out[i]=in[i];out[in_len+i]=in[in_len-1-i];} changed=1; break;
             case 'k': *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; if(in_len>=2){out[0]=in[1];out[1]=in[0];changed=1;} break;
             case 'K': *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; if(in_len>=2){out[in_len-2]=in[in_len-1];out[in_len-1]=in[in_len-2];changed=1;} break;
             case ':': *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; changed=0; break;
-            case 'q': if (in_len*2<=MAX_OUTPUT_LEN) { int idx=0; for(int i=0;i<in_len;i++){out[idx++]=in[i];out[idx++]=in[i];} *out_len=in_len*2; changed=1; } break;
+            case 'q': if (in_len*2>MAX_OUTPUT_LEN) return -2; int idx=0; for(int i=0;i<in_len;i++){out[idx++]=in[i];out[idx++]=in[i];} *out_len=in_len*2; changed=1; break;
             case 'E': { *out_len=in_len; int cap=1; for(int i=0;i<in_len;i++){ if(cap&&is_lower(in[i])) out[i]=to_upper(in[i]); else out[i]=to_lower(in[i]); cap=(in[i]==' '||in[i]=='-'||in[i]=='_'); } changed=1; } break;
             case '{': rotate_left(in,in_len,out,out_len,&changed,1); break;
             case '}': rotate_right(in,in_len,out,out_len,&changed,1); break;
@@ -189,18 +195,18 @@ static int apply_single_command(const unsigned char* in, int in_len,
             case '.': if (n>=0&&n<in_len){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; out[n]=in[n]+1; changed=1; } break;
             case ',': if (n>=0&&n<in_len){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; out[n]=in[n]-1; changed=1; } break;
             case '\'': if (n>=0&&n<in_len){ *out_len=n; for(int i=0;i<n;i++) out[i]=in[i]; changed=1; } break;
-            case '^': if (in_len+1<=MAX_OUTPUT_LEN){ out[0]=arg; for(int i=0;i<in_len;i++) out[i+1]=in[i]; *out_len=in_len+1; changed=1; } break;
-            case '$': if (in_len+1<=MAX_OUTPUT_LEN){ for(int i=0;i<in_len;i++) out[i]=in[i]; out[in_len]=arg; *out_len=in_len+1; changed=1; } break;
+            case '^': if (in_len+1>MAX_OUTPUT_LEN) return -2; out[0]=arg; for(int i=0;i<in_len;i++) out[i+1]=in[i]; *out_len=in_len+1; changed=1; break;
+            case '$': if (in_len+1>MAX_OUTPUT_LEN) return -2; for(int i=0;i<in_len;i++) out[i]=in[i]; out[in_len]=arg; *out_len=in_len+1; changed=1; break;
             case '@': *out_len=0; for(int i=0;i<in_len;i++){ if(in[i]!=arg) out[(*out_len)++]=in[i]; else changed=1; } break;
             case '!': for(int i=0;i<in_len;i++) if(in[i]==arg) return -1; *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; return 0;
             case '/': for(int i=0;i<in_len;i++) if(in[i]==arg){ *out_len=in_len; for(int j=0;j<in_len;j++) out[j]=in[j]; return 0; } return -1;
             case '(': if (in_len>0&&in[0]==arg){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; return 0; } return -1;
             case ')': if (in_len>0&&in[in_len-1]==arg){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; return 0; } return -1;
-            case 'y': if (n>=0) duplicate_front(in,in_len,out,out_len,&changed,n); break;
-            case 'Y': if (n>=0) duplicate_back(in,in_len,out,out_len,&changed,n); break;
-            case 'z': if (n>0 && in_len+n<=MAX_OUTPUT_LEN){ out[0]=in[0]; for(int i=0;i<n;i++) out[i+1]=in[0]; for(int i=1;i<in_len;i++) out[n+i]=in[i]; *out_len=in_len+n; changed=1; } break;
-            case 'Z': if (n>0 && in_len+n<=MAX_OUTPUT_LEN){ for(int i=0;i<in_len;i++) out[i]=in[i]; for(int i=0;i<n;i++) out[in_len+i]=in[in_len-1]; *out_len=in_len+n; changed=1; } break;
-            case 'p': if (n>=0) duplicate_word(in,in_len,out,out_len,&changed,n); break;
+            case 'y': if (n>=0) return duplicate_front(in,in_len,out,out_len,&changed,n); break;
+            case 'Y': if (n>=0) return duplicate_back(in,in_len,out,out_len,&changed,n); break;
+            case 'z': if (n>0) { if (in_len+n>MAX_OUTPUT_LEN) return -2; out[0]=in[0]; for(int i=0;i<n;i++) out[i+1]=in[0]; for(int i=1;i<in_len;i++) out[n+i]=in[i]; *out_len=in_len+n; changed=1; } break;
+            case 'Z': if (n>0) { if (in_len+n>MAX_OUTPUT_LEN) return -2; for(int i=0;i<in_len;i++) out[i]=in[i]; for(int i=0;i<n;i++) out[in_len+i]=in[in_len-1]; *out_len=in_len+n; changed=1; } break;
+            case 'p': if (n>=0) return duplicate_word(in,in_len,out,out_len,&changed,n); break;
             case '{': if (n>=0) rotate_left(in,in_len,out,out_len,&changed,n); break;
             case '}': if (n>=0) rotate_right(in,in_len,out,out_len,&changed,n); break;
             case '[': if (n>=0&&n<in_len){ *out_len=in_len-n; for(int i=n;i<in_len;i++) out[i-n]=in[i]; changed=1; } break;
@@ -220,7 +226,7 @@ static int apply_single_command(const unsigned char* in, int in_len,
         switch (cmd_char) {
             case 'x': if (n1>=0&&n2>0&&n1<in_len){ int end=n1+n2; if(end>in_len) end=in_len; *out_len=end-n1; for(int i=0;i<*out_len;i++) out[i]=in[n1+i]; changed=1; } break;
             case 'O': if (n1>=0&&n2>0&&n1<in_len){ int end=n1+n2; if(end>in_len) end=in_len; int rm=end-n1; *out_len=in_len-rm; for(int i=0;i<n1;i++) out[i]=in[i]; for(int i=end;i<in_len;i++) out[i-rm]=in[i]; changed=1; } break;
-            case 'i': if (n1>=0&&in_len+1<=MAX_OUTPUT_LEN){ int p=n1; if(p>in_len) p=in_len; for(int i=0;i<p;i++) out[i]=in[i]; out[p]=a2; for(int i=p;i<in_len;i++) out[i+1]=in[i]; *out_len=in_len+1; changed=1; } break;
+            case 'i': if (n1>=0) { if (in_len+1>MAX_OUTPUT_LEN) return -2; int p=n1; if(p>in_len) p=in_len; for(int i=0;i<p;i++) out[i]=in[i]; out[p]=a2; for(int i=p;i<in_len;i++) out[i+1]=in[i]; *out_len=in_len+1; changed=1; } break;
             case 's': *out_len=in_len; for(int i=0;i<in_len;i++){ out[i]=(in[i]==a1)?a2:in[i]; if(in[i]==a1) changed=1; } break;
             case 'o': if (n1>=0&&n1<in_len){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; out[n1]=a2; changed=1; } break;
             case '*': if (n1>=0&&n2>=0&&n1<in_len&&n2<in_len&&n1!=n2){ *out_len=in_len; for(int i=0;i<in_len;i++) out[i]=in[i]; unsigned char tmp=out[n1]; out[n1]=out[n2]; out[n2]=tmp; changed=1; } break;
@@ -259,7 +265,7 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
         if (pos + cmd_len > rule_len) break;
         int out_len_local = 0;
         int result = apply_single_command(in_buf, in_len, buf0, &out_len_local, rule+pos, cmd_len);
-        if (result == -1) { *out_len = 0; *changed = -1; return; }
+        if (result < 0) { *out_len = 0; *changed = result; return; }
         if (result == 1) final_changed = 1;
         in_len = out_len_local;
         for (int i=0;i<in_len;i++) buf1[i]=buf0[i];
@@ -1088,6 +1094,15 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     is O(n_rules) plus the uncovered-target bitset.  Returns
     list[(rule, gain)] best-first for the output helpers used by postprocess.
     """
+    # Public callers may bypass ranker_postprocess.load_candidate_rules(),
+    # so keep the 255-byte rule contract enforced here too. Silent truncation
+    # would change Hashcat rule semantics.
+    overlong = [r for r in rules if len(r.encode('latin-1', errors='ignore')) > MAX_RULE_LEN]
+    if overlong:
+        raise ValueError(
+            f"{len(overlong)} candidate rules exceed MAX_RULE_LEN={MAX_RULE_LEN}; "
+            "refusing to truncate rule bytes."
+        )
     n_rules = len(rules)
     log(f"{blue('Recompute-GPU greedy select:')} {cyan(f'{n_rules:,}')} {bold('candidates,')} "
         f"{cyan(f'{len(cracked_hashes_sorted):,}')} {bold('cracked universe')} "

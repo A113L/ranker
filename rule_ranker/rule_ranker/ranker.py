@@ -480,12 +480,18 @@ def load_rules(path):
     rule_id_counter = 0
     total_lines = 0
     invalid_count = 0
+    overlong_count = 0
     try:
         with open(path, 'r', encoding='latin-1') as f:
             for line in f:
                 total_lines += 1
                 rule = line.strip()
                 if not rule or rule.startswith('#'):
+                    continue
+                # Keep the GPU rule buffer contract explicit: never silently
+                # truncate a rule that would not fit in MAX_RULE_LEN bytes.
+                if len(rule.encode('latin-1', errors='ignore')) > MAX_RULE_LEN:
+                    overlong_count += 1
                     continue
                 # Validate using rulest's validator
                 if not HashcatRuleValidator.validate_rule_for_gpu(rule):
@@ -499,6 +505,8 @@ def load_rules(path):
         exit(1)
     if invalid_count > 0:
         print(f"{yellow('Warning:')} {cyan(f'{invalid_count:,}')} rules were skipped because they are not GPU-compatible (rulest validator).")
+    if overlong_count > 0:
+        print(f"{yellow('Warning:')} {cyan(f'{overlong_count:,}')} rules longer than {MAX_RULE_LEN} characters were skipped (no truncation).")
     print(f"{green('Loaded')} {cyan(f'{len(rules_list):,}')} {bold('valid rules.')}")
     return rules_list
 
@@ -826,35 +834,37 @@ unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
 // ----------------------------------------------------------------------------
 // Operation helpers (take input buffer, output buffer, lengths, and arguments)
 // ----------------------------------------------------------------------------
-static void duplicate_front(const unsigned char* in, int in_len,
+static int duplicate_front(const unsigned char* in, int in_len,
                             unsigned char* out, int* out_len, int* changed, int n) {{
     // BUG FIX: 'y' operator prepends first N chars to the FRONT of the word.
     // Old code appended them to the back (which is what 'Y'/duplicate_back does).
     // Correct: out = in[0..n) + in[0..in_len)
     if (n > in_len) n = in_len;
     int new_len = in_len + n;
-    if (new_len > MAX_OUTPUT_LEN) return;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
     for (int i = 0; i < n; i++) out[i] = in[i];
     for (int i = 0; i < in_len; i++) out[n + i] = in[i];
     *out_len = new_len;
     *changed = 1;
+    return 0;
 }}
 
-static void duplicate_back(const unsigned char* in, int in_len,
+static int duplicate_back(const unsigned char* in, int in_len,
                            unsigned char* out, int* out_len, int* changed, int n) {{
     if (n > in_len) n = in_len;
     int new_len = in_len + n;
-    if (new_len > MAX_OUTPUT_LEN) return;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
     for (int i = 0; i < in_len; i++) out[i] = in[i];
     for (int i = 0; i < n; i++) out[in_len + i] = in[in_len - n + i];
     *out_len = new_len;
     *changed = 1;
+    return 0;
 }}
 
-static void duplicate_word(const unsigned char* in, int in_len,
+static int duplicate_word(const unsigned char* in, int in_len,
                            unsigned char* out, int* out_len, int* changed, int times) {{
     int new_len = in_len * (times + 1);
-    if (new_len > MAX_OUTPUT_LEN) return;
+    if (new_len > MAX_OUTPUT_LEN) return -2;
     for (int rep = 0; rep <= times; rep++) {{
         for (int i = 0; i < in_len; i++) {{
             out[rep * in_len + i] = in[i];
@@ -862,10 +872,12 @@ static void duplicate_word(const unsigned char* in, int in_len,
     }}
     *out_len = new_len;
     *changed = 1;
+    return 0;
 }}
 
 static void rotate_left(const unsigned char* in, int in_len,
                         unsigned char* out, int* out_len, int* changed, int n) {{
+    if (in_len <= 0) {{ *out_len = 0; *changed = 0; return; }}
     if (n <= 0) n = 1;
     n %= in_len;
     if (n == 0) {{
@@ -883,6 +895,7 @@ static void rotate_left(const unsigned char* in, int in_len,
 
 static void rotate_right(const unsigned char* in, int in_len,
                          unsigned char* out, int* out_len, int* changed, int n) {{
+    if (in_len <= 0) {{ *out_len = 0; *changed = 0; return; }}
     if (n <= 0) n = 1;
     n %= in_len;
     if (n == 0) {{
@@ -943,7 +956,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 changed = 1;
                 break;
             case 'd':
-                if (in_len * 2 <= MAX_OUTPUT_LEN) {{
+                if (in_len * 2 > MAX_OUTPUT_LEN) return -2;
+                {{
                     *out_len = in_len * 2;
                     for (int i = 0; i < in_len; i++) {{
                         out[i] = in[i];
@@ -953,7 +967,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case 'f':
-                if (in_len * 2 <= MAX_OUTPUT_LEN) {{
+                if (in_len * 2 > MAX_OUTPUT_LEN) return -2;
+                {{
                     *out_len = in_len * 2;
                     for (int i = 0; i < in_len; i++) {{
                         out[i] = in[i];
@@ -986,7 +1001,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 changed = 0;
                 break;
             case 'q':
-                if (in_len * 2 <= MAX_OUTPUT_LEN) {{
+                if (in_len * 2 > MAX_OUTPUT_LEN) return -2;
+                {{
                     int idx = 0;
                     for (int i = 0; i < in_len; i++) {{
                         out[idx++] = in[i];
@@ -1116,7 +1132,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case '^':
-                if (in_len + 1 <= MAX_OUTPUT_LEN) {{
+                if (in_len + 1 > MAX_OUTPUT_LEN) return -2;
+                {{
                     out[0] = arg;
                     for (int i = 0; i < in_len; i++) out[i+1] = in[i];
                     *out_len = in_len + 1;
@@ -1124,7 +1141,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case '$':
-                if (in_len + 1 <= MAX_OUTPUT_LEN) {{
+                if (in_len + 1 > MAX_OUTPUT_LEN) return -2;
+                {{
                     for (int i = 0; i < in_len; i++) out[i] = in[i];
                     out[in_len] = arg;
                     *out_len = in_len + 1;
@@ -1169,13 +1187,14 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 return -1;
             case 'y':
-                if (n >= 0) duplicate_front(in, in_len, out, out_len, &changed, n);
+                if (n >= 0) return duplicate_front(in, in_len, out, out_len, &changed, n);
                 break;
             case 'Y':
-                if (n >= 0) duplicate_back(in, in_len, out, out_len, &changed, n);
+                if (n >= 0) return duplicate_back(in, in_len, out, out_len, &changed, n);
                 break;
             case 'z':
-                if (n > 0 && in_len + n <= MAX_OUTPUT_LEN) {{
+                if (n > 0) {{
+                    if (in_len + n > MAX_OUTPUT_LEN) return -2;
                     out[0] = in[0];
                     for (int i = 0; i < n; i++) out[i+1] = in[0];
                     for (int i = 1; i < in_len; i++) out[n + i] = in[i];
@@ -1184,7 +1203,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case 'Z':
-                if (n > 0 && in_len + n <= MAX_OUTPUT_LEN) {{
+                if (n > 0) {{
+                    if (in_len + n > MAX_OUTPUT_LEN) return -2;
                     for (int i = 0; i < in_len; i++) out[i] = in[i];
                     for (int i = 0; i < n; i++) out[in_len + i] = in[in_len-1];
                     *out_len = in_len + n;
@@ -1192,7 +1212,7 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case 'p':
-                if (n >= 0) duplicate_word(in, in_len, out, out_len, &changed, n);
+                if (n >= 0) return duplicate_word(in, in_len, out, out_len, &changed, n);
                 break;
             case '{{':
                 if (n >= 0) rotate_left(in, in_len, out, out_len, &changed, n);
@@ -1276,7 +1296,8 @@ static int apply_single_command(const unsigned char* in, int in_len,
                 }}
                 break;
             case 'i':
-                if (n1 >= 0 && in_len + 1 <= MAX_OUTPUT_LEN) {{
+                if (n1 >= 0) {{
+                    if (in_len + 1 > MAX_OUTPUT_LEN) return -2;
                     if (n1 > in_len) n1 = in_len;
                     *out_len = in_len + 1;
                     for (int i = 0; i < n1; i++) out[i] = in[i];
@@ -1390,10 +1411,11 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
 
         // Apply the command to the current input buffer
         int result = apply_single_command(in_buf, in_len, buf0, out_len, rule + pos, cmd_len);
-        if (result == -1) {{
-            // Reject: no output
+        if (result < 0) {{
+            // Reject or overflow: the entire rule is invalid for this word.
+            // Never continue the rule chain with an empty intermediate.
             *out_len = 0;
-            *changed = -1;
+            *changed = result;
             return;
         }}
         if (result == 1) {{

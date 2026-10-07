@@ -55,8 +55,8 @@ import numpy as np
 # Defaults -- overridable via --max-word-len/--max-rule-len/--max-output-len.
 # Smaller, realistic values reduce private-memory pressure on the GPU.
 MAX_WORD_LEN = 32
-MAX_OUTPUT_LEN = 64
-MAX_RULE_LEN = 32
+MAX_OUTPUT_LEN = 512
+MAX_RULE_LEN = 255
 LOCAL_WORK_SIZE = 256
 DEFAULT_WORDS_PER_GPU_BATCH = 150000
 MAX_DISPATCH_ITEMS = 32 * 1024 * 1024
@@ -281,6 +281,13 @@ def load_candidate_rules(args):
 
     if args.candidates and len(rules) > args.candidates:
         rules = rules[:args.candidates]
+    # Keep the postprocess rule width identical to rank's GPU rule width.
+    # Overlong rules are skipped rather than silently truncated because
+    # truncation can change Hashcat rule semantics.
+    too_long = [r for r in rules if len(r.encode('latin-1', errors='ignore')) > MAX_RULE_LEN]
+    if too_long:
+        log(f"{yellow('Skipped')} {cyan(f'{len(too_long):,}')} {yellow('rules longer than')} {cyan(str(MAX_RULE_LEN))} {yellow('characters.')}")
+        rules = [r for r in rules if len(r.encode('latin-1', errors='ignore')) <= MAX_RULE_LEN]
     log(f"{green('Candidate pool:')} {cyan(f'{len(rules):,}')} {bold('rules')}")
     return rules
 
@@ -414,7 +421,7 @@ def main(argv=None):
         sys.exit(1)
     log(f"{blue('Buffer limits:')} max-word-len={cyan(MAX_WORD_LEN)} "
         f"max-rule-len={cyan(MAX_RULE_LEN)} max-output-len={cyan(MAX_OUTPUT_LEN)} "
-        f"{dim('(entries/rules exceeding these limits are skipped/truncated)')}")
+        f"{dim('(entries/rules exceeding these limits are skipped)')}")
 
     t0 = time.time()
     rules = load_candidate_rules(args)
