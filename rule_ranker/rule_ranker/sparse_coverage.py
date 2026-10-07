@@ -1051,6 +1051,234 @@ __kernel void celf_mark_covered_kernel(
 
 DEFAULT_GPU_CELF_HIT_BUDGET = 50_000_000  # ~200 MB flat/batch at uint32
 
+# Fraction of total GPU VRAM we're willing to use for the fully-
+# resident CSR buffer (hits_flat + offsets + lengths + bitset) before
+# falling back to the streaming backend. Leaves headroom for whatever
+# else is already allocated on the device (driver overhead, other
+# processes, the query/gain scratch buffers).
+DEFAULT_GPU_CELF_VRAM_FRACTION = 0.7
+
+
+def _peek_device_global_mem(device_id=None):
+    """Read a GPU device's total VRAM (bytes) WITHOUT creating a
+    cl.Context or printing the 'Using GPU: ...' banner that
+    select_device() does -- this is just a capacity probe used to
+    decide which backend to build, not the actual device selection
+    (that still happens once, inside whichever backend gets picked)."""
+    try:
+        for p in cl.get_platforms():
+            try:
+                devices = p.get_devices()
+            except Exception:
+                continue
+            gpus = [d for d in devices if d.type == cl.device_type.GPU]
+            if gpus:
+                dev = gpus[device_id] if device_id is not None and device_id < len(gpus) else gpus[0]
+                return int(dev.get_info(cl.device_info.GLOBAL_MEM_SIZE))
+    except Exception:
+        pass
+    return None
+
+
+def _sparse_celf_gpu_resident_kernel_source():
+    """Resident-mode counterpart to the two kernels in
+    _sparse_celf_gpu_kernel_source(): same bit-set bookkeeping, but
+    indexed through a GLOBAL per-rule offsets/lengths table (sized
+    n_rules, uploaded once) plus an explicit query_indices array per
+    dispatch, instead of a small per-batch-local buffer. This is what
+    lets _SparseCelfGpuResidentBackend keep hits_flat/offsets/lengths
+    resident on the GPU for the WHOLE run (built once in __init__)
+    and never re-touch the host-side store during CELF rounds at
+    all -- the thing that made the old all-resident design fast.
+    """
+    return """
+__kernel void celf_gain_resident_kernel(
+    __global const unsigned int* hits_flat,
+    __global const unsigned int* offsets,
+    __global const unsigned int* lengths,
+    __global const unsigned int* covered_bitset,
+    __global const unsigned int* query_indices,
+    __global unsigned int* gains_out,
+    const unsigned int n_queries)
+{
+    unsigned int gid = get_global_id(0);
+    if (gid >= n_queries) return;
+    unsigned int cand = query_indices[gid];
+    unsigned int off = offsets[cand];
+    unsigned int len = lengths[cand];
+    unsigned int gain = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        unsigned int bit = hits_flat[off + i];
+        unsigned int word = covered_bitset[bit >> 5];
+        if (((word >> (bit & 31)) & 1u) == 0u) gain++;
+    }
+    gains_out[gid] = gain;
+}
+
+__kernel void celf_mark_covered_resident_kernel(
+    __global const unsigned int* hits_flat,
+    __global unsigned int* covered_bitset,
+    const unsigned int offset,
+    const unsigned int length)
+{
+    unsigned int gid = get_global_id(0);
+    if (gid >= length) return;
+    unsigned int bit = hits_flat[offset + gid];
+    atomic_or(&covered_bitset[bit >> 5], (1u << (bit & 31)));
+}
+"""
+
+
+class _SparseCelfGpuResidentBackend:
+    """Fully GPU-resident CELF backend: builds ONE flat CSR layout
+    (hits_flat/offsets/lengths) from `store` ONCE, uploads it as
+    read-only GPU buffers that live for the whole run, and never
+    touches `store` (never mind SQL) again afterward. Every CELF
+    round -- both gain revalidation and mark_covered -- is a pure
+    GPU-resident operation against buffers that already live in VRAM.
+
+    This trades the streaming backend's "works regardless of how big
+    total_hits gets" guarantee for raw speed: the whole thing only
+    works if hits_flat (total_hits * 4 bytes) + offsets/lengths
+    (n_rules * 4 bytes each) + the covered bitset fit in VRAM at once.
+    celf_select_sparse_gpu() checks that before picking this backend
+    (see DEFAULT_GPU_CELF_VRAM_FRACTION) and falls back to
+    _SparseCelfGpuBackend (streaming) if it doesn't.
+    """
+
+    def __init__(self, store, n_rules, cracked_size, total_hits, device_id=None,
+                 universe_size=None):
+        self.cracked_size = cracked_size
+        self.universe_size = universe_size if universe_size is not None else cracked_size
+
+        platform, device = select_device(device_id)
+        self.context = cl.Context([device])
+        self.queue = cl.CommandQueue(self.context)
+        prg = cl.Program(self.context, _sparse_celf_gpu_resident_kernel_source()).build()
+        self._gain_kernel = prg.celf_gain_resident_kernel
+        self._mark_kernel = prg.celf_mark_covered_resident_kernel
+
+        # --- one-time CSR build, straight from the store, into ONE
+        # preallocated buffer (no list-of-arrays + concatenate, which
+        # would transiently need 2-3x total_hits memory) ---
+        offsets = np.zeros(n_rules, dtype=np.uint32)
+        lengths = np.zeros(n_rules, dtype=np.uint32)
+        hits_flat = np.empty(max(total_hits, 1), dtype=np.uint32)
+        if hasattr(store, 'iter_candidates_with_hits'):
+            idx_hits = ((idx, store[idx]) for idx, _n in store.iter_candidates_with_hits())
+        else:
+            idx_hits = ((idx, arr) for idx, arr in store.items() if len(arr))
+
+        pos = 0
+        _t0 = time.perf_counter()
+        pbar = tqdm(total=total_hits, desc=cyan("GPU-CELF resident buffer build"),
+                    unit="hit", unit_scale=True, colour="cyan")
+        last_report = 0
+        for idx, arr in idx_hits:
+            n = len(arr)
+            offsets[idx] = pos
+            lengths[idx] = n
+            if n:
+                hits_flat[pos:pos + n] = arr
+            pos += n
+            if pos - last_report >= 1_000_000:
+                pbar.update(pos - last_report)
+                pbar.set_postfix({"rss_mb": f"{get_rss_mb():.0f}"})
+                last_report = pos
+        pbar.update(pos - last_report)
+        pbar.close()
+        log(f"{dim(f'[PROFILE] resident CSR build (host, one-time): {time.perf_counter() - _t0:.2f}s')}")
+
+        self.offsets_host = offsets  # kept on host too -- mark_covered() needs offset/length by idx
+        self.lengths_host = lengths
+
+        _t1 = time.perf_counter()
+        mf = cl.mem_flags
+        self.hits_flat_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=hits_flat)
+        self.offsets_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=offsets)
+        self.lengths_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=lengths)
+        hits_flat = None  # free the host copy; GPU has its own now
+        log(f"{dim(f'[PROFILE] resident CSR upload to VRAM: {time.perf_counter() - _t1:.2f}s')}")
+
+        n_words = (self.universe_size + 31) // 32
+        self.covered_bitset_g = cl.Buffer(self.context, mf.READ_WRITE, size=max(1, n_words) * 4)
+        cl.enqueue_fill_buffer(self.queue, self.covered_bitset_g, np.uint32(0), 0, max(1, n_words) * 4)
+
+        self._q_cap = 0
+        self._query_g = None
+        self._gains_g = None
+        self._ensure_query_buffers(4096)
+
+        # profiling accumulators -- per-round cost only (setup is
+        # logged separately above)
+        self.t_gpu_kernel = 0.0
+        self.t_mark_covered = 0.0
+        self.t_covered_count = 0.0
+        self.n_gain_dispatches = 0
+        self.n_mark_calls = 0
+        self.n_count_calls = 0
+
+    def _ensure_query_buffers(self, n):
+        if n <= self._q_cap:
+            return
+        mf = cl.mem_flags
+        self._query_g = cl.Buffer(self.context, mf.READ_ONLY, size=max(1, n) * 4)
+        self._gains_g = cl.Buffer(self.context, mf.READ_WRITE, size=max(1, n) * 4)
+        self._q_cap = n
+
+    def recompute_gains(self, candidate_indices):
+        n = len(candidate_indices)
+        if n == 0:
+            return np.empty(0, dtype=np.uint32)
+        self.n_gain_dispatches += 1
+        _t0 = time.perf_counter()
+        self._ensure_query_buffers(n)
+        q = np.asarray(candidate_indices, dtype=np.uint32)
+        cl.enqueue_copy(self.queue, self._query_g, q)
+        self._gain_kernel(self.queue, (n,), None,
+                           self.hits_flat_g, self.offsets_g, self.lengths_g,
+                           self.covered_bitset_g, self._query_g, self._gains_g,
+                           np.uint32(n))
+        out = np.empty(n, dtype=np.uint32)
+        cl.enqueue_copy(self.queue, out, self._gains_g).wait()
+        self.t_gpu_kernel += time.perf_counter() - _t0
+        return out
+
+    def mark_covered(self, idx):
+        _t0 = time.perf_counter()
+        self.n_mark_calls += 1
+        offset = int(self.offsets_host[idx])
+        length = int(self.lengths_host[idx])
+        if length:
+            self._mark_kernel(self.queue, (length,), None,
+                               self.hits_flat_g, self.covered_bitset_g,
+                               np.uint32(offset), np.uint32(length))
+            self.queue.finish()
+        self.t_mark_covered += time.perf_counter() - _t0
+
+    def covered_count(self):
+        _t0 = time.perf_counter()
+        self.n_count_calls += 1
+        n_words = (self.universe_size + 31) // 32
+        buf = np.empty(max(1, n_words), dtype=np.uint32)
+        cl.enqueue_copy(self.queue, buf, self.covered_bitset_g)
+        byte_view = buf.view(np.uint8)
+        result = int(_POPCOUNT_BYTE_TABLE[byte_view].sum(dtype=np.int64))
+        self.t_covered_count += time.perf_counter() - _t0
+        return result
+
+    def profile_report(self):
+        lines = [
+            "---- GPU-CELF profile (resident backend) ----",
+            f"GPU gain kernel (incl. small upload/download): {self.t_gpu_kernel:8.2f}s  "
+            f"({self.n_gain_dispatches} dispatches)",
+            f"mark_covered() total:         {self.t_mark_covered:8.2f}s  ({self.n_mark_calls} calls)",
+            f"covered_count() total:        {self.t_covered_count:8.2f}s  ({self.n_count_calls} calls)",
+            "(no per-round store/SQL access -- hits_flat/offsets/lengths are VRAM-resident)",
+            "-----------------------------------------------",
+        ]
+        return "\n".join(lines)
+
 
 class _SparseCelfGpuBackend:
     """Owns the OpenCL buffers for one celf_select_sparse_gpu() run.
@@ -1127,6 +1355,19 @@ class _SparseCelfGpuBackend:
         self._lengths_g = None
         self._gains_g = None
 
+        # --- profiling accumulators (PROFILE patch) ---
+        self.t_store_fetch = 0.0      # time inside store.get_many()
+        self.t_flat_build = 0.0       # python-side concat of hit arrays into `flat`
+        self.t_gpu_upload = 0.0       # enqueue_copy host->device
+        self.t_gpu_kernel = 0.0       # kernel dispatch + queue.finish
+        self.t_gpu_download = 0.0     # enqueue_copy device->host
+        self.t_mark_covered = 0.0     # whole mark_covered() call
+        self.t_covered_count = 0.0    # whole covered_count() call
+        self.n_gain_dispatches = 0
+        self.n_mark_calls = 0
+        self.n_count_calls = 0
+        self.total_flat_elems = 0     # sum of `total` across all gain dispatches
+
     def _ensure_hits_buffer(self, n):
         if n <= self._hits_cap:
             return
@@ -1160,6 +1401,11 @@ class _SparseCelfGpuBackend:
         self._ensure_offset_buffers(n)
         self._ensure_hits_buffer(max(total, 1))
 
+        # --- PROFILE patch: time each phase of one sub-batch dispatch ---
+        self.n_gain_dispatches += 1
+        self.total_flat_elems += total
+
+        _t0 = time.perf_counter()
         if total:
             flat = np.empty(total, dtype=np.uint32)
             pos = 0
@@ -1168,15 +1414,30 @@ class _SparseCelfGpuBackend:
                 if m:
                     flat[pos:pos + m] = a
                     pos += m
+        _t1 = time.perf_counter()
+        self.t_flat_build += _t1 - _t0
+
+        if total:
             cl.enqueue_copy(self.queue, self._hits_flat_g, flat, device_offset=0)
         cl.enqueue_copy(self.queue, self._offsets_g, offsets)
         cl.enqueue_copy(self.queue, self._lengths_g, lengths)
+        self.queue.finish()
+        _t2 = time.perf_counter()
+        self.t_gpu_upload += _t2 - _t1
 
         self._gain_kernel(self.queue, (n,), None,
                            self._hits_flat_g, self._offsets_g, self._lengths_g,
                            self.covered_bitset_g, self._gains_g, np.uint32(n))
+        self.queue.finish()
+        _t3 = time.perf_counter()
+        self.t_gpu_kernel += _t3 - _t2
+
         out = np.empty(n, dtype=np.uint32)
         cl.enqueue_copy(self.queue, out, self._gains_g)
+        self.queue.finish()
+        _t4 = time.perf_counter()
+        self.t_gpu_download += _t4 - _t3
+
         return out
 
     def recompute_gains(self, candidate_indices):
@@ -1203,6 +1464,8 @@ class _SparseCelfGpuBackend:
         if n == 0:
             return np.empty(0, dtype=np.uint32)
 
+        # --- PROFILE patch ---
+        _ts0 = time.perf_counter()
         if hasattr(self.store, 'get_many'):
             arrays_by_idx = self.store.get_many(idx_list)
         else:
@@ -1210,6 +1473,7 @@ class _SparseCelfGpuBackend:
             # without a batched get_many() (both of this package's own
             # store types have one).
             arrays_by_idx = {i: self.store[i] for i in idx_list}
+        self.t_store_fetch += time.perf_counter() - _ts0
 
         results = np.empty(n, dtype=np.uint32)
         i = 0
@@ -1242,9 +1506,12 @@ class _SparseCelfGpuBackend:
         uploads just this one selected candidate's hit array (NOT a
         slice of some larger resident buffer) and sets its bits in the
         resident covered bitset."""
+        _tm0 = time.perf_counter()
+        self.n_mark_calls += 1
         arr = self.store[idx]
         length = len(arr)
         if length == 0:
+            self.t_mark_covered += time.perf_counter() - _tm0
             return
         flat = np.ascontiguousarray(arr, dtype=np.uint32)
         self._ensure_hits_buffer(length)
@@ -1253,6 +1520,7 @@ class _SparseCelfGpuBackend:
                            self._hits_flat_g, self.covered_bitset_g,
                            np.uint32(length))
         self.queue.finish()
+        self.t_mark_covered += time.perf_counter() - _tm0
 
     def covered_count(self):
         """Host-side popcount of the bitset, only for the tqdm
@@ -1269,17 +1537,39 @@ class _SparseCelfGpuBackend:
         cracked_size -- see _SparseGpuBackend -- so this got twice as
         expensive there too). The lookup-table version does the same
         popcount in vectorized numpy C code instead."""
+        _tc0 = time.perf_counter()
+        self.n_count_calls += 1
         n_words = (self.universe_size + 31) // 32
         buf = np.empty(max(1, n_words), dtype=np.uint32)
         cl.enqueue_copy(self.queue, buf, self.covered_bitset_g)
         byte_view = buf.view(np.uint8)
-        return int(_POPCOUNT_BYTE_TABLE[byte_view].sum(dtype=np.int64))
+        result = int(_POPCOUNT_BYTE_TABLE[byte_view].sum(dtype=np.int64))
+        self.t_covered_count += time.perf_counter() - _tc0
+        return result
+
+    def profile_report(self):
+        """PROFILE patch: human-readable breakdown of where time went."""
+        lines = [
+            "---- GPU-CELF profile ----",
+            f"store fetch (get_many):      {self.t_store_fetch:8.2f}s",
+            f"flat buffer build (python):  {self.t_flat_build:8.2f}s  "
+            f"({self.n_gain_dispatches} dispatches, {self.total_flat_elems:,} elems total)",
+            f"GPU upload (h2d):             {self.t_gpu_upload:8.2f}s",
+            f"GPU gain kernel:              {self.t_gpu_kernel:8.2f}s",
+            f"GPU download (d2h):           {self.t_gpu_download:8.2f}s",
+            f"mark_covered() total:         {self.t_mark_covered:8.2f}s  ({self.n_mark_calls} calls)",
+            f"covered_count() total:        {self.t_covered_count:8.2f}s  ({self.n_count_calls} calls)",
+            "---------------------------",
+        ]
+        return "\n".join(lines)
 
 
 def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
                             budget=None, batch_size=DEFAULT_GPU_CELF_BATCH,
                             hit_budget=DEFAULT_GPU_CELF_HIT_BUDGET,
-                            universe_size=None):
+                            universe_size=None,
+                            vram_fraction=DEFAULT_GPU_CELF_VRAM_FRACTION,
+                            force_mode=None):
     """GPU-resident counterpart to celf_select_sparse(): identical
     lazy-greedy (CELF) algorithm and identical selection order/output
     shape, but the covered set and every marginal-gain recomputation
@@ -1306,6 +1596,7 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
     log(f"{blue('Sparse CELF greedy select (GPU):')} "
         f"{dim('covered set + gain recompute resident on GPU, batch=' + str(batch_size))}")
 
+    _tsetup0 = time.perf_counter()  # PROFILE patch
     if hasattr(store, 'iter_candidates_with_hits'):
         log(f"{dim('Querying coverage store for candidates with hits...')}")
         candidates = list(store.iter_candidates_with_hits())
@@ -1314,23 +1605,64 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
     else:
         candidates = [(idx, len(c)) for idx, c in store.items() if len(c)]
         n_candidates = len(candidates)
+    _tsetup1 = time.perf_counter()
+    log(f"{dim(f'[PROFILE] candidate listing took {_tsetup1 - _tsetup0:.2f}s')}")
 
     limit = budget if budget else n_candidates
     log(f"{green('Candidates with >=1 hit:')} {cyan(f'{n_candidates:,}')} -- "
         f"{bold('budget')} {cyan(str(limit) if budget else 'unbounded (saturation)')}")
 
     total_hits = sum(n for _, n in candidates)
-    log(f"{blue('GPU-CELF:')} {cyan(f'{total_hits:,}')} total hit indices across all candidates -- "
-        f"{dim(f'streamed per-batch (hit budget {hit_budget:,}/dispatch), no full buffer ever built')}")
+    _tsetup2 = time.perf_counter()
+    log(f"{dim(f'[PROFILE] total_hits sum took {_tsetup2 - _tsetup1:.2f}s')}")
 
-    # Streaming backend: keeps `store` open and queries it on demand,
-    # batch by batch, for the whole run -- see _SparseCelfGpuBackend's
-    # docstring for why this replaced the old "build one huge flat
-    # buffer up front" design (total_hits can be far larger than
-    # available RAM/VRAM).
-    backend = _SparseCelfGpuBackend(store, cracked_size=cracked_size,
-                                     device_id=device_id, batch_size=batch_size,
-                                     hit_budget=hit_budget, universe_size=universe_size)
+    n_rules = (max((i for i, _ in candidates), default=-1) + 1)
+    uni = universe_size if universe_size is not None else cracked_size
+    n_words = (uni + 31) // 32
+
+    # --- Decide: fully GPU-resident CSR (fast, no per-round store/SQL
+    # I/O) vs. streaming per-batch (works at any scale, slower). ---
+    needed_bytes = (total_hits * 4) + (n_rules * 4 * 2) + (n_words * 4)
+    dev_mem = _peek_device_global_mem(device_id)
+    use_resident = force_mode == 'resident'
+    if force_mode is None and dev_mem is not None:
+        use_resident = needed_bytes <= dev_mem * vram_fraction
+    budget_bytes = int(dev_mem * vram_fraction) if dev_mem else None
+
+    if dev_mem is not None:
+        _vram_msg = (
+            f"[PROFILE] VRAM check: need ~{needed_bytes/1e6:,.0f} MB for a fully-resident "
+            f"CSR buffer, budget ~{(budget_bytes or 0)/1e6:,.0f} MB "
+            f"({vram_fraction:.0%} of {dev_mem/1e6:,.0f} MB total VRAM)"
+        )
+        log(dim(_vram_msg))
+    else:
+        log(dim("[PROFILE] Could not probe device VRAM -- defaulting to streaming backend "
+                "(pass force_mode='resident' to override)."))
+
+    if use_resident:
+        log(f"{green('GPU-CELF:')} {cyan(f'{total_hits:,}')} total hit indices -- "
+            f"{dim('fits VRAM budget: using fully-resident CSR backend (no store/SQL access during CELF rounds)')}")
+        _tbackend0 = time.perf_counter()
+        backend = _SparseCelfGpuResidentBackend(
+            store, n_rules=n_rules, cracked_size=cracked_size, total_hits=total_hits,
+            device_id=device_id, universe_size=universe_size)
+        log(f"{dim(f'[PROFILE] resident backend init total: {time.perf_counter() - _tbackend0:.2f}s')}")
+        # Resident backend has copied everything it needs out of
+        # `store` into VRAM/host-side offset tables -- safe to close
+        # the store now (frees SQLite connection / dict memory early).
+        store.close()
+    else:
+        _fallback_note = (f"exceeds VRAM budget: falling back to streamed per-batch backend "
+                           f"(hit budget {hit_budget:,}/dispatch)")
+        log(f"{yellow('GPU-CELF:')} {cyan(f'{total_hits:,}')} total hit indices -- "
+            f"{dim(_fallback_note)}")
+        _tbackend0 = time.perf_counter()  # PROFILE patch
+        backend = _SparseCelfGpuBackend(store, cracked_size=cracked_size,
+                                         device_id=device_id, batch_size=batch_size,
+                                         hit_budget=hit_budget, universe_size=universe_size)
+        _init_took = time.perf_counter() - _tbackend0
+        log(dim(f"[PROFILE] streaming backend init took {_init_took:.2f}s"))
 
     heap = [(-int(n_hits), int(idx), 0) for idx, n_hits in candidates]
     heapq.heapify(heap)
@@ -1338,6 +1670,8 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
     selected = []
     n_covered = 0
     stamp = 0
+    _stale_pops_total = 0        # PROFILE patch
+    _PROFILE_EVERY = 25          # log a breakdown every N accepted rules
 
     pbar = tqdm(total=limit, desc=cyan("Sparse CELF greedy select (GPU)"), unit="rule", colour="cyan")
     while heap and len(selected) < limit:
@@ -1351,7 +1685,13 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
             n_covered = backend.covered_count()
             stamp += 1
             pbar.update(1)
-            pbar.set_postfix({"recovered": n_covered, "rss_mb": f"{get_rss_mb():.0f}"})
+            pbar.set_postfix({
+                "recovered": n_covered,
+                "rss_mb": f"{get_rss_mb():.0f}",
+                "stale_pops": _stale_pops_total,
+            })
+            if len(selected) % _PROFILE_EVERY == 0:
+                log(backend.profile_report())
             continue
 
         # Drain a batch of consecutive stale entries (bounded by
@@ -1363,6 +1703,7 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
             neg_g2, idx2, s2 = heapq.heappop(heap)
             batch_idx.append(idx2)
             batch_entries.append((neg_g2, idx2, s2))
+        _stale_pops_total += len(batch_idx)  # PROFILE patch
 
         gains = backend.recompute_gains(np.asarray(batch_idx, dtype=np.uint32))
         for (_, cand_idx, _), gain in zip(batch_entries, gains):
@@ -1374,6 +1715,8 @@ def celf_select_sparse_gpu(rules, store, cracked_size, device_id=None,
     log(f"{green('Done.')} {bold('Selected')} {cyan(f'{len(selected):,}')} {bold('rules,')} "
         f"{bold('covering')} {cyan(f'{n_covered:,}')}/{cyan(f'{cracked_size:,}')} "
         f"{bold('cracked-universe entries')}")
+    log(f"[PROFILE] total stale heap pops requiring recompute: {_stale_pops_total:,}")
+    log(backend.profile_report())
     return selected
 
 
@@ -1512,6 +1855,15 @@ def main(argv=None):
                           f"~{DEFAULT_GPU_CELF_HIT_BUDGET * 4 / 1e6:.0f} MB). "
                           f"Lower this on small-VRAM GPUs; raise it on "
                           f"large-VRAM GPUs for fewer, bigger dispatches.")
+    ap.add_argument('--gpu-celf-vram-fraction', type=float, default=DEFAULT_GPU_CELF_VRAM_FRACTION,
+                     help=f"--gpu-celf only: fraction of total device VRAM the fully-resident "
+                          f"CSR backend is allowed to use before falling back to streaming "
+                          f"(default {DEFAULT_GPU_CELF_VRAM_FRACTION:.0%}).")
+    ap.add_argument('--gpu-celf-mode', choices=['auto', 'resident', 'streaming'], default='auto',
+                     help="--gpu-celf only: 'auto' (default) picks the fully-resident CSR "
+                          "backend if it fits the VRAM budget, else streams per-batch; "
+                          "'resident' forces the fast all-in-VRAM path (fails if it doesn't "
+                          "fit); 'streaming' forces the per-batch path regardless of size.")
     args = ap.parse_args(argv)
 
     t0 = _time.time()
@@ -1535,10 +1887,12 @@ def main(argv=None):
         budgets = parse_budgets(args.budgets) if args.budgets else []
         run_budget = max(budgets) if budgets else args.budget
         if args.gpu_celf:
+            force_mode = None if args.gpu_celf_mode == 'auto' else args.gpu_celf_mode
             selected = celf_select_sparse_gpu(
                 rules, store, len(cracked_hashes), device_id=args.device,
                 budget=run_budget, batch_size=args.gpu_celf_batch,
-                hit_budget=args.gpu_celf_hit_budget, universe_size=universe_size)
+                hit_budget=args.gpu_celf_hit_budget, universe_size=universe_size,
+                vram_fraction=args.gpu_celf_vram_fraction, force_mode=force_mode)
         else:
             selected = celf_select_sparse(rules, store, len(cracked_hashes),
                                            budget=run_budget, universe_size=universe_size)

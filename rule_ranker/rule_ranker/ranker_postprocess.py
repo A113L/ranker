@@ -1690,6 +1690,16 @@ def main(argv=None):
                           "flat buffer resident on the GPU/host at once, "
                           "not imported here so plain --help keeps working "
                           "without pyopencl installed).")
+    ap.add_argument('--gpu-celf-vram-fraction', type=float, default=None,
+                     help="--strategy sparse --gpu-celf only: fraction of total "
+                          "device VRAM the fully-resident CSR backend is allowed "
+                          "to use before falling back to streaming (default: "
+                          "sparse_coverage.DEFAULT_GPU_CELF_VRAM_FRACTION, 0.7).")
+    ap.add_argument('--gpu-celf-mode', choices=['auto', 'resident', 'streaming'], default='auto',
+                     help="--strategy sparse --gpu-celf only: 'auto' (default) picks the "
+                          "fully-resident CSR backend if it fits the VRAM budget, else "
+                          "streams per-batch; 'resident' forces the fast all-in-VRAM path "
+                          "(fails if it doesn't fit); 'streaming' forces the per-batch path.")
     args = ap.parse_args(argv)
 
     strategy = args.strategy or 'bitmap'
@@ -1779,6 +1789,7 @@ def main(argv=None):
         from .sparse_coverage import (
             compute_sparse_coverage_gpu, celf_select_sparse, celf_select_sparse_gpu,
             SPARSE_DISK_THRESHOLD, DEFAULT_GPU_CELF_BATCH, DEFAULT_GPU_CELF_HIT_BUDGET,
+            DEFAULT_GPU_CELF_VRAM_FRACTION,
         )
         _sparse_dim_note = dim(
             'no coverage bitmap matrix will be allocated, '
@@ -1810,12 +1821,15 @@ def main(argv=None):
             run_budget = max(budgets) if budgets else args.budget
 
             if args.gpu_celf:
+                _force_mode = None if args.gpu_celf_mode == 'auto' else args.gpu_celf_mode
                 selected = celf_select_sparse_gpu(
                     rules, store, len(cracked_hashes), device_id=args.device,
                     budget=run_budget,
                     batch_size=args.gpu_celf_batch or DEFAULT_GPU_CELF_BATCH,
                     hit_budget=args.gpu_celf_hit_budget or DEFAULT_GPU_CELF_HIT_BUDGET,
-                    universe_size=universe_size)
+                    universe_size=universe_size,
+                    vram_fraction=args.gpu_celf_vram_fraction or DEFAULT_GPU_CELF_VRAM_FRACTION,
+                    force_mode=_force_mode)
             else:
                 selected = celf_select_sparse(rules, store, len(cracked_hashes),
                                                budget=run_budget, universe_size=universe_size)
