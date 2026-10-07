@@ -27,14 +27,11 @@ rounds is:
   - `upper_bound` : (n_rules,) int32 -- each rule's static full-target
     popcount, computed ONCE in a single streaming pass, accumulating one
     atomic counter per rule instead of writing a coverage row.
-  - `order`/`last_bound`/`excluded`, three (n_rules,)-shaped arrays
-    that together provide the lazy-greedy ordering/refinement state
-    (see celf_select_recompute_gpu()'s block comment for why this is a
-    fixed sorted array with two upper bounds rather than an actual
-    heapq, which an earlier version of this module used) -- either
-    way, "revalidating" a candidate means one GPU rescore of that rule
-    against the current wordlist (cheap: one rule x the wordlist, or a
-    batch of several at once) instead of a memmap row read.
+  - `candidate_heap` : a heap of `(negative_upper_bound, rule_index)`
+    entries for candidates with at least one hit. After a candidate is
+    rescored, its exact marginal gain becomes a tighter heap bound. This
+    keeps true lazy-greedy/CELF ordering without repeatedly scanning a
+    fixed list whose initial bounds become stale as coverage shrinks.
 
 Nothing shaped (n_rules x cracked_universe) is ever allocated, in RAM
 or on disk. Peak extra memory beyond the rule pool is
@@ -1075,20 +1072,33 @@ class _GpuScorer(_ResidentWordlistMixin):
 def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
                                rule_batch_size, words_per_gpu_batch,
                                device_id=None, budget=None):
-    """Lazy-greedy max-coverage selection with stable marginal-gain order
-    and deterministic tie-breaking by original rule index.  Selection state
-    is O(n_rules) plus the uncovered-target bitset.  Returns
-    list[(rule, gain)] best-first for the output helpers used by postprocess.
+    """Lazy-greedy max-coverage selection using a batched CELF heap.
+
+    The previous implementation kept a fixed array sorted by the original
+    full-target upper bound. As the active target set shrank, more candidates
+    had to be revalidated because the round's best marginal gain decreased,
+    causing more full-wordlist GPU rescans per selected rule.
+
+    This version keeps the current upper bound of each candidate in a max-heap
+    (implemented as min-heap of negative gains). Once a candidate is rescored,
+    its exact gain becomes its new bound and is pushed back into the heap.
+    A round stops as soon as the heap's next bound cannot beat the current
+    exact winner. This preserves the CELF lazy-greedy invariant and the
+    original deterministic tie-break: smaller rule index wins equal gain.
+
+    RANKER_GREEDY_RESCORE_BATCH controls speculative contenders rescored
+    together after the first candidate (default 32). Smaller values reduce
+    speculative work; larger values reduce kernel-launch overhead.
     """
-    # Public callers may bypass ranker_postprocess.load_candidate_rules(),
-    # so keep the 255-byte rule contract enforced here too. Silent truncation
-    # would change Hashcat rule semantics.
+    import heapq
+
     overlong = [r for r in rules if len(r.encode('latin-1', errors='ignore')) > MAX_RULE_LEN]
     if overlong:
         raise ValueError(
             f"{len(overlong)} candidate rules exceed MAX_RULE_LEN={MAX_RULE_LEN}; "
             "refusing to truncate rule bytes."
         )
+
     n_rules = len(rules)
     log(f"{blue('Recompute-GPU greedy select:')} {cyan(f'{n_rules:,}')} {bold('candidates,')} "
         f"{cyan(f'{len(cracked_hashes_sorted):,}')} {bold('cracked universe')} "
@@ -1105,10 +1115,8 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
                          rule_batch_size, words_per_gpu_batch, device_id,
                          wordlist_path=wordlist_path, rule_lens=rule_lens)
 
-    # --- Pass 1: static upper bound for every candidate, against the
-    # full (all-active) target set. This is the one-time GPU scoring pass;
-    # the only
-    # thing retained afterwards is one int per rule.
+    # Pass 1: exact score against the full target set. These values are valid
+    # upper bounds for every later round because coverage is monotone.
     upper_bound = np.zeros(n_rules, dtype=np.int64)
     total_batches = math.ceil(n_rules / rule_batch_size)
     pbar = tqdm(total=total_batches, desc=cyan("Upper-bound pass (rule batches)"),
@@ -1120,142 +1128,157 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
         pbar.update(1)
     pbar.close()
 
-    # --- Greedy round loop: fixed-order array scan with two upper
-    # bounds, NOT a heap. See the module docstring's "WHY NOT A HEAP"
-    # note below for why this replaced an earlier heap-based version.
-    #
-    # `order` is EVERY candidate with upper_bound > 0, sorted descending
-    # by upper_bound ONCE and never re-sorted (upper_bound is a static,
-    # global ceiling -- valid for every round, by submodularity: a
-    # rule's gain against any round's `active` set can never exceed its
-    # gain against the full original target set). `last_bound[idx]`
-    # additionally tracks each rule's most recently COMPUTED exact gain
-    # (tighter than upper_bound after round 1, since it reflects a
-    # smaller, more-covered `active` set than the original one) -- this
-    # is the same "lazy" refinement celf_select()'s heap gets from
-    # re-pushing a candidate with a fresh version stamp, here realized
-    # as a plain array write instead of a heap push.
-    #
-    # Each round scans `order` (skipping already-picked rules) in
-    # FIXED, RULE_BATCH_SIZE-sized chunks:
-    #   - if even the chunk's first (best-upper-bound) rule can't beat
-    #     the round's current best, BREAK the whole round's scan --
-    #     sorted order means nothing later can beat it either.
-    #   - within a surviving chunk, only candidates whose last_bound
-    #     still exceeds the round's current best are actually sent to
-    #     the GPU (one score_batch() call for the whole surviving
-    #     sub-chunk); the rest are skipped without any dispatch.
-    #
-    # WHY NOT A HEAP: a heap only ever exposes ONE item at a time
-    # (heappop), so batching "several items per GPU call" on top of it
-    # means blindly grabbing a fixed number of pops (the previous
-    # version of this function always grabbed up to `rule_batch_size`
-    # pops the instant it saw even one stale entry) with no way to
-    # check whether they were actually still needed once the round's
-    # winner had already been established by the first one or two --
-    # in practice this meant nearly every round rescored close to a
-    # full rule_batch_size candidates even when 1-2 would have settled
-    # it, which is what made greedy selection "terribly slow" despite
-    # each individual GPU dispatch being reasonably large/well-utilized
-    # (the problem was too many such dispatches, not too little work in
-    # each one). The fixed sorted array lets `chunk[0]`'s bound decide,
-    # BEFORE any GPU call, whether the rest of the round's candidates
-    # are even worth dispatching at all -- once a round's best_gain is
-    # high relative to what's left, most later chunks fail that check
-    # and cost zero GPU dispatches, not a wasted rule_batch_size-sized
-    # one.
-    order = np.argsort(-upper_bound, kind='stable')
-    order = order[upper_bound[order] > 0]
-    n_active = len(order)
+    # Max-heap by upper bound; smaller rule index wins ties naturally because
+    # heap entries are (-gain, rule_index). A candidate's exact gain replaces
+    # its older, looser bound after it is rescored.
+    candidate_heap = [
+        (-int(upper_bound[i]), int(i))
+        for i in range(n_rules)
+        if upper_bound[i] > 0
+    ]
+    heapq.heapify(candidate_heap)
+    n_active = len(candidate_heap)
     log(f"{green('Candidates with >=1 hit:')} {cyan(f'{n_active:,}')}/{cyan(f'{n_rules:,}')}")
 
-    last_bound = upper_bound.astype(np.int64).copy()
-    excluded = np.zeros(n_rules, dtype=bool)
-
     limit = budget if budget else n_active
-
-    # No heuristic warning here: the recompute path is intentionally a
-    # selectable memory-light strategy. Runtime depends strongly on GPU,
-    # wordlist residency, candidate distribution and budget; printing a
-    # fixed pool/budget warning was noisy and did not predict actual runtime.
+    greedy_rescore_batch = max(
+        1,
+        int(os.environ.get('RANKER_GREEDY_RESCORE_BATCH', '32')),
+    )
+    greedy_rescore_batch = min(
+        greedy_rescore_batch,
+        max(1, int(rule_batch_size)),
+    )
 
     selected = []
     round_num = 0
-    dispatches_this_pick = 0
+    total_rescored_rules = 0
     round_t0 = time.time()
 
-    pbar = tqdm(total=limit, desc=cyan("CELF greedy select [recompute-gpu]"), unit="rule", colour="cyan")
-    while len(selected) < limit and n_active > 0:
-        round_num += 1
-        dispatches_this_pick = 0
+    pbar = tqdm(total=limit, desc=cyan("CELF greedy select [recompute-gpu+heap]"),
+                unit="rule", colour="cyan")
 
-        if round_num == 1:
-            # Free: `active` is still every cracked hash, so
-            # upper_bound[order[0]] (the largest full-target hit
-            # count, already computed) IS this round's exact answer --
-            # no GPU rescore needed to find it. Mirrors
-            # RuleOptimizer-CUDA's generatePhase2(), which seeds
-            # lastBestFitness from rules[0].Fitness the same way.
-            best_idx = int(order[0])
-            best_gain = int(upper_bound[best_idx])
-        else:
-            best_idx = -1
-            best_gain = 0
-            live = order[~excluded[order]]
-            pos = 0
-            while pos < len(live):
-                chunk_end = min(pos + rule_batch_size, len(live))
-                chunk = live[pos:chunk_end]
-                chunk_upper = int(upper_bound[chunk[0]])
-                # Keep scanning on an exact upper-bound tie only when the first
-                # tied candidate has a smaller original rule index than the
-                # current best.  That preserves the promised deterministic
-                # tie-break (lower original index wins) without rescoring later
-                # candidates that cannot possibly beat the current winner.
-                if chunk_upper < best_gain or (
-                    chunk_upper == best_gain and best_idx >= 0 and int(chunk[0]) > best_idx
-                ):
-                    break
-                need_mask = (
-                    (last_bound[chunk] > best_gain)
-                    | ((last_bound[chunk] == best_gain) & ((best_idx < 0) | (chunk < best_idx)))
-                )
-                need_rescore = chunk[need_mask]
-                if len(need_rescore):
-                    gains = scorer.score_batch(need_rescore, wordlist_path)
-                    dispatches_this_pick += 1
-                    last_bound[need_rescore] = gains
-                    for local_i, ridx in enumerate(need_rescore):
-                        g = int(gains[local_i])
-                        if g > best_gain or (g == best_gain and best_idx >= 0 and int(ridx) < best_idx):
-                            best_gain = g
-                            best_idx = int(ridx)
-                pos = chunk_end
-
-        if best_idx < 0 or best_gain <= 0:
-            break
-
-        true_cleared = scorer.apply_winner_and_clear(best_idx, rules[best_idx], wordlist_path)
+    # Round 1: top full-target bound is already exact; no rescoring needed.
+    if candidate_heap and limit > 0:
+        _neg_gain, best_idx = heapq.heappop(candidate_heap)
+        true_cleared = scorer.apply_winner_and_clear(
+            best_idx, rules[best_idx], wordlist_path)
         selected.append((rules[best_idx], true_cleared))
-        excluded[best_idx] = True
+        round_num = 1
         n_active -= 1
         pbar.update(1)
         round_elapsed = time.time() - round_t0
         round_t0 = time.time()
         pbar.set_postfix({
             "round": round_num,
-            "gpu_dispatches": dispatches_this_pick,
+            "gpu_dispatches": 1,
+            "rescored": 0,
+            "heap": n_active,
             "s/round": f"{round_elapsed:.1f}",
         })
+
+    while len(selected) < limit and candidate_heap:
+        round_num += 1
+        dispatches_this_pick = 0
+        rescored_this_pick = 0
+
+        # Seed this round with one exact evaluation. The scorer's singleton
+        # path also records hit slots, allowing an in-place clear if this
+        # candidate wins the round without another wordlist pass.
+        _neg_bound, seed_idx = heapq.heappop(candidate_heap)
+        seed_gain = int(scorer.score_batch(
+            np.asarray([seed_idx], dtype=np.int64), wordlist_path)[0])
+        dispatches_this_pick += 1
+        rescored_this_pick += 1
+        total_rescored_rules += 1
+
+        best_idx = int(seed_idx)
+        best_gain = seed_gain
+
+        while candidate_heap:
+            top_bound = int(-candidate_heap[0][0])
+            top_idx = int(candidate_heap[0][1])
+            # No unseen candidate can beat the exact winner. For equal gain,
+            # only a smaller original index could replace it.
+            if top_bound < best_gain or (
+                top_bound == best_gain and top_idx >= best_idx
+            ):
+                break
+
+            batch = []
+            while candidate_heap and len(batch) < greedy_rescore_batch:
+                top_bound = int(-candidate_heap[0][0])
+                top_idx = int(candidate_heap[0][1])
+                if top_bound < best_gain or (
+                    top_bound == best_gain and top_idx >= best_idx
+                ):
+                    break
+                heapq.heappop(candidate_heap)
+                batch.append(top_idx)
+
+            if not batch:
+                break
+
+            gains = scorer.score_batch(
+                np.asarray(batch, dtype=np.int64), wordlist_path)
+            dispatches_this_pick += 1
+            rescored_this_pick += len(batch)
+            total_rescored_rules += len(batch)
+
+            old_best_idx = best_idx
+            old_best_gain = best_gain
+            for local_i, ridx in enumerate(batch):
+                gain = int(gains[local_i])
+                if gain > best_gain or (
+                    gain == best_gain and int(ridx) < best_idx
+                ):
+                    best_gain = gain
+                    best_idx = int(ridx)
+
+            # Every exact-but-not-winning contender remains in the heap with
+            # its tighter bound. Zero-gain candidates are dropped permanently.
+            for local_i, ridx in enumerate(batch):
+                gain = int(gains[local_i])
+                if int(ridx) != best_idx and gain > 0:
+                    heapq.heappush(candidate_heap, (-gain, int(ridx)))
+
+            # If a batch candidate displaced the seed, return the seed's exact
+            # gain to the heap rather than losing it.
+            if old_best_idx != best_idx and old_best_gain > 0:
+                heapq.heappush(candidate_heap, (-old_best_gain, int(old_best_idx)))
+
+        if best_gain <= 0:
+            break
+
+        true_cleared = scorer.apply_winner_and_clear(
+            best_idx, rules[best_idx], wordlist_path)
+        selected.append((rules[best_idx], true_cleared))
+        n_active -= 1
+
+        pbar.update(1)
+        round_elapsed = time.time() - round_t0
+        round_t0 = time.time()
+        pbar.set_postfix({
+            "round": round_num,
+            "gpu_dispatches": dispatches_this_pick,
+            "rescored": rescored_this_pick,
+            "heap": n_active,
+            "s/round": f"{round_elapsed:.1f}",
+        })
+
     pbar.close()
 
     remaining = scorer.remaining_active_count()
     total_covered = len(cracked_hashes_sorted) - remaining
+    if os.environ.get('RANKER_GREEDY_PROFILE', '0') == '1':
+        log(f"{blue('Greedy profile:')} {cyan(f'{total_rescored_rules:,}')} "
+            f"candidate rescoring(s) after the initial pass; "
+            f"rescore_batch={cyan(str(greedy_rescore_batch))}.")
+
     log(f"{green('Done.')} {bold('Selected')} {cyan(f'{len(selected):,}')} {bold('rules,')} "
         f"{bold('covering')} {cyan(f'{total_covered:,}')}/{cyan(f'{len(cracked_hashes_sorted):,}')} "
         f"{bold('cracked entries')} -- {dim('selection state: O(n_rules) + O(universe bits)')}")
     return selected
-
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
