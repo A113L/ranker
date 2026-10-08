@@ -2237,13 +2237,23 @@ class MultiPassMAB:
             available = active_arr[avail_mask]
 
             if len(available) > 0:
+                # Do not spend MAB trials on rules that already reached the
+                # configured final-trial budget while other rules remain.
+                available = available[self.trials[available] < self.final_trials]
+
+            if len(available) > 0:
                 alpha = self.successes[available]          # shape (n,)
                 beta_v = self.failures[available]          # shape (n,)
 
                 # Single vectorised call – the key optimisation vs original
                 thompson = np.random.beta(alpha, beta_v)
 
-                trials_needed = np.maximum(0, self.final_trials - self.trials[available]).astype(np.float32)
+                # `self.trials` is uint32; cast before subtraction to avoid
+                # unsigned underflow (e.g. 50 - 60 -> 4294967286).
+                trials_needed = np.maximum(
+                    0,
+                    self.final_trials - self.trials[available].astype(np.int64),
+                ).astype(np.float32)
                 trials_score = trials_needed / max(self.final_trials, 1)
 
                 zero_pen = np.where(
@@ -2491,6 +2501,18 @@ class MultiPassMAB:
 # ====================================================================
 # --- MAB RANKING FUNCTION (v4.0) ---
 # ====================================================================
+def _estimate_mab_remaining_iterations(rule_bandit) -> int:
+    """Estimate remaining MAB batches without unsigned integer underflow."""
+    active_arr = rule_bandit._get_active_array()
+    if len(active_arr) == 0:
+        return 0
+    remaining_rule_trials = int(np.maximum(
+        0,
+        rule_bandit.final_trials - rule_bandit.trials[active_arr].astype(np.int64),
+    ).sum())
+    return int(math.ceil(remaining_rule_trials / max(MAX_RULES_IN_BATCH, 1)))
+
+
 def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k,
                    words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
                    preset=None, device_id=None, mab_exploration_factor=None, mab_final_trials=None,
@@ -2559,16 +2581,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     # elapsed time, ETA and throughput without spamming new lines.
     progress_enabled = bool(sys.stderr.isatty() or sys.stdout.isatty())
 
-    def _estimated_remaining_iterations():
-        active_arr = rule_bandit._get_active_array()
-        if len(active_arr) == 0:
-            return 0
-        remaining_rule_trials = int(np.maximum(
-            0, rule_bandit.final_trials - rule_bandit.trials[active_arr]
-        ).sum())
-        return int(math.ceil(remaining_rule_trials / max(MAX_RULES_IN_BATCH, 1)))
-
-    initial_total = max(1, _estimated_remaining_iterations())
+    initial_total = max(1, _estimate_mab_remaining_iterations(rule_bandit))
     pbar = tqdm(
         total=initial_total,
         desc="MAB sampling",
@@ -2619,7 +2632,7 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
         stats = rule_bandit.get_statistics()
         # Re-estimate remaining work after eliminations. This keeps the ETA
         # meaningful even when early elimination removes large rule batches.
-        estimated_remaining = _estimated_remaining_iterations()
+        estimated_remaining = _estimate_mab_remaining_iterations(rule_bandit)
         pbar.total = max(pbar.n, pbar.n + estimated_remaining)
         pbar.set_postfix_str(
             f"active={stats['active_rules']:,} | "
