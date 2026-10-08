@@ -1,6 +1,6 @@
 # Hashcat Rule Ranker
 
-> **GPU-Accelerated Hashcat Rule Ranking using Multi-Armed Bandit (MAB) with Early Elimination, a CELF greedy max-coverage post-stage, and a fast CSV/rule analysis tool — all under one `rule_ranker` package**
+> **GPU-Accelerated Hashcat Rule Ranking with sample-based MAB, independent per-rule 64-bit fingerprints, CELF greedy max-coverage post-processing, and fast CSV/rule analysis — all under one `rule_ranker` package**
 
 The project is three tools sharing one package, reachable through a single dispatcher (`run_ranker.py`):
 
@@ -17,10 +17,10 @@ Each submodule is a thin wrapper around the original standalone script — nothi
 ## Features
 
 - **GPU-accelerated** rule application via [PyOpenCL](https://documen.tician.de/pyopencl/) — supports NVIDIA, AMD, and Intel devices
-- **Multi-Pass MAB mode** (default) — Thompson Sampling bandit with a screening phase and early elimination of low-performing rules, dramatically reducing compute time on large rulesets
-- **Legacy exhaustive mode** — tests every rule against every word (v3.2 behaviour)
-- **Full Hashcat rule support** — all GPU-compatible rules up to 255 characters
-- **Adaptive VRAM management** — auto-tunes batch size and hash map dimensions to available GPU memory; supports `low_memory / medium_memory / high_memory / recommend` presets
+- **Sample-Based MAB mode** (default) — Thompson Sampling uses fresh stratified wordlist samples per trial instead of rescanning the full wordlist for every bandit update
+- **Legacy exhaustive mode** — tests every rule against every word (full-pass reference mode)
+- **Validated Hashcat-compatible subset** — explicitly filtered GPU-supported rule syntax up to 255 characters; no silent truncation
+- **Adaptive VRAM management** — sizes independent per-rule fingerprint tables from the requested word batch/sample and available VRAM
 - **Memory-mapped file I/O** — handles wordlists of any size with minimal RAM overhead
 - **Graceful interrupt handling** — `Ctrl+C` saves intermediate results so a run can be inspected
 - **Dual output** — ranked CSV with full statistics and a ready-to-use `.rule` file of top-K rules
@@ -65,7 +65,7 @@ python run_ranker.py rank \
   -k 500
 
 # List available OpenCL devices
-python run_ranker.py rank --list-devices
+python run_ranker.py rank -w words.txt -r rules.rule -c cracked.txt --list-devices
 
 # Any subcommand also works invoked directly as a module, e.g.:
 python -m rule_ranker.ranker -w rockyou.txt -r best64.rule -c cracked_passwords.txt -o ranked_output.csv
@@ -102,9 +102,9 @@ python run_ranker.py <rank|handler|postprocess> --help   # each subcommand's own
 | Argument | Default | Description |
 |---|---|---|
 | `--batch-size` | auto | Words per GPU batch (overrides auto-detection) |
-| `--global-bits` | `35` | Bit width of the global uniqueness hash map |
-| `--cracked-bits` | `33` | Bit width of the cracked-password hash map |
-| `--preset` | — | Memory preset: `low_memory`, `medium_memory`, `high_memory`, or `recommend` |
+| `--global-bits` | legacy | Deprecated compatibility option; independent 64-bit scoring no longer uses a shared global bitmap |
+| `--cracked-bits` | legacy | Deprecated compatibility option; cracked membership now uses a 64-bit open-addressing table |
+| `--preset` | — | Legacy compatibility option; MAB sizing is derived from sample size + VRAM |
 
 ### MAB Options
 
@@ -112,7 +112,8 @@ python run_ranker.py <rank|handler|postprocess> --help   # each subcommand's own
 |---|---|---|
 | `--mab-exploration` | `2.0` | UCB / Thompson exploration factor |
 | `--mab-final-trials` | `50` | Minimum trials required before a surviving rule is finalised |
-| `--mab-screening-trials` | `5` | Trials before a rule is eligible for early elimination |
+| `--mab-screening-trials` | `5` | Sample trials before a rule is eligible for early elimination |
+| `--mab-sample-words` | `8192` | Words sampled per MAB trial; samples are stratified across the wordlist |
 | `--mab-no-zero-eliminate` | — | Flag — disables automatic elimination of rules with zero successes |
 
 ### Mode & Device
@@ -131,13 +132,18 @@ Note: `run_ranker.py` imports each subcommand's module lazily, only once you act
 
 ### MAB Mode (default)
 
-1. **Screening phase** — every rule receives a minimum number of trials (`--mab-screening-trials`). Rules that produce zero successes are eliminated early.
-2. **Deep-testing phase** — surviving rules are selected by a Thompson Sampling bandit. Rules that consistently underperform are eliminated; high-performing rules receive more trials until all survivors reach `--mab-final-trials`.
-3. **Scoring** — each rule accumulates an *effectiveness score* (transforms that match a cracked password) and a *uniqueness score* (transforms that produce any new candidate). The combined score is `effectiveness × 10 + uniqueness + mab_success_probability × 1000`.
+1. **Fresh stratified sample** — each MAB iteration reads only `--mab-sample-words` valid words, drawing windows from byte ranges spread across the wordlist. The full wordlist is not rescanned for every trial.
+2. **Screening phase** — every rule receives `--mab-screening-trials` sample trials. Rules with no observed cracked outputs can be eliminated early.
+3. **Deep testing** — surviving rules are selected by Thompson Sampling until they reach `--mab-final-trials`.
+4. **Independent scoring** — every evaluated rule owns a disjoint 64-bit fingerprint table. A duplicate generated by one rule therefore cannot suppress the uniqueness or effectiveness score of another rule in the same dispatch.
+
+### Fingerprinting
+
+Ranking and CELF use FNV-1a-64 fingerprints stored in linear-probing tables. Table collisions are resolved by probing and never by sharing a bitmap bit between rules. A fixed 64-bit fingerprint is collision-resistant at practical scales, but it is not cryptographically collision-proof; the implementation does not pretend otherwise.
 
 ### Legacy Mode (`--legacy`)
 
-Every rule is applied to every word in the wordlist in a single exhaustive pass. Use this when you need reproducible, fully-deterministic rankings or when the ruleset is small enough that MAB overhead is not worthwhile.
+Every rule is applied to every word in the wordlist. The implementation still uses independent per-rule fingerprint tables, but uniqueness is accumulated per streamed word batch so VRAM remains bounded. Use this mode as a deterministic/full-pass reference rather than as the fast path for large rule sets.
 
 ---
 
@@ -150,6 +156,12 @@ Every rule is applied to every word in the wordlist in a single exhaustive pass.
 1. **Upper-bound pass (GPU)** — every candidate is scored once against the full cracked-password universe. These full-target hit counts become monotone upper bounds for later rounds.
 2. **Lazy-greedy selection (GPU)** — a single `active` bitset tracks cracked targets that are still uncovered. In each round, only candidates whose upper bound can still beat the current best are re-scored on the GPU. Once a winner is chosen, its newly covered targets are cleared from `active`.
 3. **Output** — a `.rule` file containing the selected rules, ordered best-first by marginal gain, plus a `_celf.csv` with each selected rule's incremental gain.
+
+### Heap usage in CELF
+
+The lazy-greedy selector (`celf_recompute_gpu.py`) keeps candidates in a max-heap by upper bound, stored as a min-heap of `(-upper_bound, rule_index)` pairs via `heapq`. Each round pops the current best bound and re-scores it exactly on the GPU; if no remaining bound can beat that exact gain, the round ends immediately without touching the rest of the heap — that's the "lazy" part. Otherwise a small batch of next-best bounds is popped and re-scored together, losers are pushed back with their now-exact gain as a tighter bound, and zero-gain candidates are dropped for good. Ties go to the smaller rule index. This replaces an older flat-array approach that needed more full rescans per round as the uncovered-target set shrank — the heap always surfaces just the most promising unresolved candidate instead.
+
+A smaller heap is also used when loading candidates from a ranking CSV (`ranker_postprocess.py`): with `--candidates` set, rows are streamed and only the current top-C by `Combined_Score` are kept in a bounded heap, so the full CSV never has to sit in memory.
 
 ### Memory model
 
@@ -197,14 +209,29 @@ python run_ranker.py postprocess --ranking-csv ranker_output.csv \
 | -R, --rule-batch-size | 1024 | Candidate rules evaluated per GPU dispatch batch and used as the upper-bound scan chunk size |
 | -W, --words-batch-size | 150000 | Words per GPU batch when the scorer streams the wordlist |
 | --max-word-len | 32 | Words/cracked entries longer than this are skipped (not truncated) |
-| --max-rule-len | 32 | Max characters per hashcat rule considered |
-| --max-output-len | 64 | Max length of a rule's output word the GPU kernel will produce |
+| --max-rule-len | 255 | Max characters per hashcat rule considered (matches `rank`) |
+| --max-output-len | 512 | Max length of a rule's output word the GPU kernel will produce |
 | --auto-max-output-len | off | Estimate the worst-case rule output length before the GPU pass and use that value (+ margin) |
 | --print-output-len-estimate | off | Print the recommended --max-output-len and exit without touching the GPU |
 | -d, --device | — | OpenCL device ID |
 | --strategy | recompute-gpu | The only supported coverage/selection strategy; no per-candidate coverage matrix is materialized |
 
+There are intentionally no bitmap-store, sparse-store, parallel-file-I/O, or GPU-CELF tuning flags in this version. Those belonged to the removed `bitmap` and `sparse` strategies.
+
 ---
+
+
+### GPU safety semantics
+
+The GPU rule engine treats `MAX_OUTPUT_LEN` overflow as a **rule rejection for the current word**, not as an empty intermediate word. If any command would exceed the configured output buffer, the current rule chain stops for that word and produces no candidate hash. This prevents a later command in the same chain from accidentally operating on a zero-length intermediate.
+
+The `rank` and `postprocess` stages both support rules up to **255 characters** by default. Post-processing skips rules longer than the configured `--max-rule-len` instead of silently truncating their bytes.
+
+### OpenCL integration testing
+
+The test suite contains a real OpenCL integration test for the CELF GPU scorer and CPU-side regression tests for the 64-bit fingerprint table, sample-based MAB wiring, and top-K boundary handling. It executes the generated OpenCL kernels against a small reference workload and also covers the empty-input rotate guard and output-overflow rejection. The test is run automatically when a working OpenCL Python binding plus at least one OpenCL CPU/GPU device is available; on machines without an OpenCL ICD/device it is explicitly skipped rather than counted as a passing GPU test.
+
+For CI, use a portable CPU OpenCL implementation such as **PoCL** together with `pyopencl` to make this integration test reproducible on machines without a discrete GPU.
 
 
 ## Handler (CSV/Rule Analysis)
@@ -339,7 +366,9 @@ rule_ranker/
 │   ├── ranker.py            # `rank` — GPU MAB/legacy rule ranking
 │   ├── ranker_postprocess.py# `postprocess` — CELF max-coverage selection
 │   ├── ranker_handler.py    # `handler` — fast CSV/rule analysis (CPU-only)
-│   └── celf_recompute_gpu.py# GPU recompute + lazy-greedy CELF implementation used by postprocess
+│   ├── celf_recompute_gpu.py# GPU recompute + lazy-greedy CELF implementation used by postprocess
+│   ├── hashing.py           # shared hashing helpers (cracked-password/global hash maps)
+│   └── progress.py          # shared progress-bar/console output helpers
 └── tests/                   # pytest suite covering the above
 ```
 
