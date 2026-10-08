@@ -124,3 +124,33 @@ def test_load_rules_skips_overlong_rules(tmp_path):
     rules_path.write_text(":" + "\n" + ("l" * 256) + "\n", encoding="latin-1")
     loaded = ranker.load_rules(str(rules_path))
     assert [row["rule_data"] for row in loaded] == [":"]
+
+
+def test_ranker_uses_64_bit_independent_fingerprint_kernel():
+    src = ranker.get_kernel_source(rule_hash_table_bits=8, cracked_hash_table_bits=8)
+    assert 'fnv1a_hash_64' in src
+    assert '__global ulong* rule_hash_tables' in src
+    assert '__global uint* rule_hash_states' in src
+    assert 'table_base = rule_idx * (rule_hash_table_mask + 1U)' in src
+    assert 'insert_rule_fingerprint' in src
+    assert 'lookup_cracked_fingerprint' in src
+    assert 'GLOBAL_HASH_MAP_MASK' not in src
+
+
+def test_sample_reader_is_bounded_and_non_empty(tmp_path):
+    path = tmp_path / 'words.txt'
+    path.write_bytes(b'\n'.join(f'word{i}'.encode() for i in range(1000)) + b'\n')
+    arr, count = ranker._read_stratified_word_sample(str(path), max_len=32, sample_words=64, seed=123)
+    assert count > 0
+    assert count <= 64
+    assert arr.shape == (count, 32)
+    assert arr.dtype == __import__('numpy').uint8
+
+
+def test_mab_top_rules_handles_request_equal_to_population():
+    rules = [{'rule_id': i, 'rule_data': ':'} for i in range(2)]
+    bandit = ranker.MultiPassMAB(rules, final_trials=1, screening_trials=1)
+    bandit.trials[:] = 1
+    bandit.successes[:] = [4.0, 2.0]
+    bandit.failures[:] = [2.0, 4.0]
+    assert [r['rule_id'] for r in bandit.get_top_rules(2)] == [0, 1]

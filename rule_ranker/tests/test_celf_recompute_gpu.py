@@ -154,6 +154,14 @@ class TestGreedyRoundLogic:
         assert selected[0][0] == "first"
 
 
+def _mix64_reference(x):
+    with np.errstate(over="ignore"):
+        x = (np.uint64(x) + np.uint64(0x9E3779B97F4A7C15)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        x = ((x ^ (x >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        x = ((x ^ (x >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)) & np.uint64(0xFFFFFFFFFFFFFFFF)
+        return (x ^ (x >> np.uint64(31))) & np.uint64(0xFFFFFFFFFFFFFFFF)
+
+
 class TestBuildOpenAddressingTableVectorized:
     """_build_open_addressing_table() is the vectorized (NumPy,
     wave-based) replacement for the original per-key Python `for h in
@@ -166,10 +174,10 @@ class TestBuildOpenAddressingTableVectorized:
 
     @staticmethod
     def _reference_loop_build(cracked, table_size, mask):
-        hash_table = np.zeros(table_size, dtype=np.uint32)
+        hash_table = np.zeros(table_size, dtype=np.uint64)
         occupied = np.zeros((table_size + 31) // 32, dtype=np.uint32)
-        for h in np.asarray(cracked, dtype=np.uint32):
-            slot = (int(h) * 2654435761) & mask
+        for h in np.asarray(cracked, dtype=np.uint64):
+            slot = int(_mix64_reference(np.uint64(h))) & mask
             while occupied[slot >> 5] & (1 << (slot & 31)):
                 slot = (slot + 1) & mask
             hash_table[slot] = h
@@ -179,7 +187,7 @@ class TestBuildOpenAddressingTableVectorized:
     @staticmethod
     def _lookup(hash_table, occupied, mask, key):
         """Mirrors the GPU kernel's lookup_cracked_slot() probe rule."""
-        slot = (int(key) * 2654435761) & mask
+        slot = int(_mix64_reference(np.uint64(key))) & mask
         for _ in range(len(hash_table)):
             word, bit = slot >> 5, slot & 31
             if occupied[word] & (1 << bit):
@@ -199,7 +207,7 @@ class TestBuildOpenAddressingTableVectorized:
 
     def test_matches_reference_occupied_bitcount(self):
         rng = np.random.default_rng(42)
-        cracked = np.unique(rng.integers(0, 2**32, size=5000, dtype=np.uint64).astype(np.uint32))
+        cracked = np.unique(rng.integers(0, 2**64, size=5000, dtype=np.uint64))
         table_size = self._table_size_for(len(cracked))
         mask = table_size - 1
 
@@ -214,7 +222,7 @@ class TestBuildOpenAddressingTableVectorized:
 
     def test_every_key_findable_via_gpu_probe_rule(self):
         rng = np.random.default_rng(7)
-        cracked = np.unique(rng.integers(0, 2**32, size=20000, dtype=np.uint64).astype(np.uint32))
+        cracked = np.unique(rng.integers(0, 2**64, size=20000, dtype=np.uint64))
         table_size = self._table_size_for(len(cracked))
         mask = table_size - 1
 
@@ -224,7 +232,7 @@ class TestBuildOpenAddressingTableVectorized:
 
     def test_no_key_collisions_in_stored_table(self):
         rng = np.random.default_rng(99)
-        cracked = np.unique(rng.integers(0, 2**32, size=3000, dtype=np.uint64).astype(np.uint32))
+        cracked = np.unique(rng.integers(0, 2**64, size=3000, dtype=np.uint64))
         table_size = self._table_size_for(len(cracked))
         mask = table_size - 1
 
@@ -236,7 +244,7 @@ class TestBuildOpenAddressingTableVectorized:
 
     def test_small_and_edge_sizes(self):
         for n in (0, 1, 2, 5):
-            cracked = np.arange(n, dtype=np.uint32) * 2654435761
+            cracked = np.arange(n, dtype=np.uint64) * np.uint64(2654435761)
             cracked = np.unique(cracked)
             table_size = self._table_size_for(max(len(cracked), 1))
             mask = table_size - 1
@@ -245,6 +253,44 @@ class TestBuildOpenAddressingTableVectorized:
             assert bits_set == len(cracked)
             for key in cracked:
                 assert self._lookup(vec_table, vec_occ, mask, int(key)) != -1
+
+
+def test_opencl_source_keeps_fnv1a64_as_uint64_before_lookup():
+    src = crg.get_recompute_kernel_source(num_cracked=8, hash_table_size=16)
+    # CELF uses FNV-1a-64. Truncating the kernel result to uint32 makes
+    # every lookup effectively search for the low 32 bits in a uint64 table,
+    # which can turn a valid cracked universe into zero hits.
+    assert src.count('ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);') == 3
+    assert src.count('unsigned int h = fnv1a_hash_64(result_temp, (unsigned int)out_len);') == 0
+
+
+def test_uint64_cracked_fingerprint_with_high_bits_is_preserved():
+    from rule_ranker.hashing import build_open_addressing_table_uint64
+
+    # Regression fixture: this key is intentionally larger than uint32.
+    key = np.uint64(0xF123456789ABCDEF)
+    table, states = build_open_addressing_table_uint64(
+        np.array([key], dtype=np.uint64)
+    )
+    occupied = np.packbits(states == 2, bitorder='little')
+    pad = (-len(occupied)) % 4
+    if pad:
+        occupied = np.concatenate([occupied, np.zeros(pad, dtype=np.uint8)])
+    occupied = occupied.view(np.uint32)
+
+    mask = len(table) - 1
+    slot = int(_mix64_reference(key)) & mask
+    found = False
+    for _ in range(len(table)):
+        word, bit = slot >> 5, slot & 31
+        if occupied[word] & (1 << bit):
+            if table[slot] == key:
+                found = True
+                break
+        else:
+            break
+        slot = (slot + 1) & mask
+    assert found
 
 
 def test_opencl_source_contains_empty_rotate_guard_and_overflow_abort():

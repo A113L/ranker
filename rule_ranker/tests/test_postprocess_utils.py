@@ -15,18 +15,18 @@ from rule_ranker import ranker_postprocess as rp
 
 class TestFnv1a:
     def test_deterministic(self):
-        h1 = rp.fast_fnv1a_hash_32(b"password123")
-        h2 = rp.fast_fnv1a_hash_32(b"password123")
+        h1 = rp.fast_fnv1a_hash_64(b"password123")
+        h2 = rp.fast_fnv1a_hash_64(b"password123")
         assert h1 == h2
 
     def test_different_inputs_differ(self):
-        h1 = rp.fast_fnv1a_hash_32(b"password123")
-        h2 = rp.fast_fnv1a_hash_32(b"password124")
+        h1 = rp.fast_fnv1a_hash_64(b"password123")
+        h2 = rp.fast_fnv1a_hash_64(b"password124")
         assert h1 != h2
 
-    def test_within_32_bits(self):
-        h = rp.fast_fnv1a_hash_32(b"x" * 100)
-        assert 0 <= h <= 0xFFFFFFFF
+    def test_within_64_bits(self):
+        h = rp.fast_fnv1a_hash_64(b"x" * 100)
+        assert 0 <= h <= 0xFFFFFFFFFFFFFFFF
 
 
 class TestParseBudgets:
@@ -61,7 +61,7 @@ class TestLoadCrackedUniverse:
         arr, n_skipped = rp.load_cracked_universe(str(cracked_path), max_len=256)
         assert len(arr) == 2  # duplicate collapsed
         assert list(arr) == sorted(arr.tolist())  # sorted ascending
-        assert arr.dtype == np.uint32
+        assert arr.dtype == np.uint64
         assert n_skipped == 0
 
     def test_respects_max_len(self, tmp_path):

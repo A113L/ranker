@@ -53,11 +53,11 @@ def test_celf_gpu_reference_device_executes_kernels(monkeypatch, tmp_path, real_
     wordlist.write_bytes(b"HELLO\nWORLD\n" + b"a" * 20 + b"\n")
     cracked = np.array(
         sorted({
-            rp.fast_fnv1a_hash_32(b"hello"),
-            rp.fast_fnv1a_hash_32(b"world"),
-            rp.fast_fnv1a_hash_32(b"X"),
+            rp.fast_fnv1a_hash_64(b"hello"),
+            rp.fast_fnv1a_hash_64(b"world"),
+            rp.fast_fnv1a_hash_64(b"X"),
         }),
-        dtype=np.uint32,
+        dtype=np.uint64,
     )
 
     rules = np.zeros((2, crg.MAX_RULE_LEN), dtype=np.uint8)
