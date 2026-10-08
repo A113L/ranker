@@ -99,6 +99,115 @@ def test_legacy_progress_updates_during_gpu_dispatches(monkeypatch, tmp_path):
     assert any("complete" in text for text, _ in pbar.postfixes)
 
 
+def test_legacy_progress_bar_not_created_during_gpu_init(monkeypatch, tmp_path):
+    """The bar must not exist (and so cannot render anything) while the GPU
+    scorer is still initializing - only once init succeeds and the batch
+    loop is about to start."""
+    _FakePbar.instances.clear()
+    creation_order = []
+
+    def _tracking_scorer(**kwargs):
+        creation_order.append("scorer")
+        return _FakeScorer()
+
+    class _TrackingPbar(_FakePbar):
+        def __init__(self, *args, **kwargs):
+            creation_order.append("pbar")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(ranker, "_LegacyProgress", _TrackingPbar)
+    monkeypatch.setattr(ranker, "IndependentRuleGpuScorer", _tracking_scorer)
+    monkeypatch.setattr(ranker, "estimate_word_count", lambda path: 4)
+    monkeypatch.setattr(ranker, "load_rules", lambda path: [
+        {"rule_id": 0, "rule_data": "l"},
+        {"rule_id": 1, "rule_data": "u"},
+        {"rule_id": 2, "rule_data": "c"},
+    ])
+    monkeypatch.setattr(ranker, "load_cracked_hashes", lambda path, max_len: np.array([], dtype=np.uint64))
+    monkeypatch.setattr(
+        ranker,
+        "_encode_rules_matrix",
+        lambda rules: np.zeros((len(rules), ranker.MAX_RULE_LEN), dtype=np.uint8),
+    )
+    monkeypatch.setattr(ranker, "setup_interrupt_handler", lambda *args: None)
+    monkeypatch.setattr(ranker, "save_ranking_data", lambda *args, **kwargs: str(tmp_path / "out.csv"))
+    monkeypatch.setattr(ranker, "save_top_k_rules", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ranker, "update_progress_stats", lambda *args: None)
+    monkeypatch.setattr(ranker, "time", lambda: 0.0)
+    monkeypatch.setattr(ranker, "interrupted", False)
+    monkeypatch.setattr(ranker, "optimized_wordlist_iterator", lambda *args: iter([
+        (np.zeros((4, ranker.MAX_WORD_LEN), dtype=np.uint8), np.zeros(4, dtype=np.uint64), 4),
+    ]))
+
+    ranker.rank_rules_exhaustive(
+        wordlist_path="words.txt",
+        rules_path="rules.rule",
+        cracked_list_path="cracked.txt",
+        ranking_output_path=str(tmp_path / "out.csv"),
+        top_k=0,
+        words_per_gpu_batch=4,
+    )
+
+    # The scorer (GPU init) must be created strictly before the bar.
+    assert creation_order == ["scorer", "pbar"]
+    pbar = _TrackingPbar.instances[0]
+    # No postfix mentions "init" - the bar only ever shows post-init state.
+    assert not any("init" in text.lower() for text, _ in pbar.postfixes)
+
+
+def test_legacy_progress_words_climb_within_a_single_batch(monkeypatch, tmp_path):
+    """`words=` must move during a batch, not sit at 0 until the whole batch
+    (which can be the entire wordlist) finishes."""
+    _FakePbar.instances.clear()
+    scorer = _FakeScorer()
+
+    monkeypatch.setattr(ranker, "_LegacyProgress", _FakePbar)
+    monkeypatch.setattr(ranker, "IndependentRuleGpuScorer", lambda **kwargs: scorer)
+    monkeypatch.setattr(ranker, "estimate_word_count", lambda path: 4)
+    monkeypatch.setattr(ranker, "load_rules", lambda path: [
+        {"rule_id": 0, "rule_data": "l"},
+        {"rule_id": 1, "rule_data": "u"},
+        {"rule_id": 2, "rule_data": "c"},
+    ])
+    monkeypatch.setattr(ranker, "load_cracked_hashes", lambda path, max_len: np.array([], dtype=np.uint64))
+    monkeypatch.setattr(
+        ranker,
+        "_encode_rules_matrix",
+        lambda rules: np.zeros((len(rules), ranker.MAX_RULE_LEN), dtype=np.uint8),
+    )
+    monkeypatch.setattr(ranker, "setup_interrupt_handler", lambda *args: None)
+    monkeypatch.setattr(ranker, "save_ranking_data", lambda *args, **kwargs: str(tmp_path / "out.csv"))
+    monkeypatch.setattr(ranker, "save_top_k_rules", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ranker, "update_progress_stats", lambda *args: None)
+    monkeypatch.setattr(ranker, "time", lambda: 0.0)
+    monkeypatch.setattr(ranker, "interrupted", False)
+    # A single batch covering the entire (estimated) wordlist, mirroring the
+    # real-world case that looked "stuck" - words_per_gpu_batch >= total words.
+    monkeypatch.setattr(ranker, "optimized_wordlist_iterator", lambda *args: iter([
+        (np.zeros((4, ranker.MAX_WORD_LEN), dtype=np.uint8), np.zeros(4, dtype=np.uint64), 4),
+    ]))
+
+    ranker.rank_rules_exhaustive(
+        wordlist_path="words.txt",
+        rules_path="rules.rule",
+        cracked_list_path="cracked.txt",
+        ranking_output_path=str(tmp_path / "out.csv"),
+        top_k=0,
+        words_per_gpu_batch=4,
+    )
+
+    pbar = _FakePbar.instances[0]
+    dispatch_postfixes = [text for text, _ in pbar.postfixes if text.startswith("GPU dispatch ")]
+    # Two dispatch callbacks fire (see _FakeScorer): progress_callback(0, 2, 3)
+    # then progress_callback(2, 3, 3). words= must already show nonzero
+    # movement on the first one (2/3 of the rules done, not 0), not wait for
+    # the batch to fully finish.
+    assert len(dispatch_postfixes) == 2
+    assert "words=0/" not in dispatch_postfixes[0]
+    assert "words=2/" in dispatch_postfixes[0]  # 2 of 3 rules done -> 2/3 of this batch's 4 words
+    assert "words=4/" in dispatch_postfixes[1]  # batch's rules fully dispatched -> all 4 words
+
+
 def test_legacy_progress_writes_immediately_without_tty(monkeypatch):
     writes = []
 
