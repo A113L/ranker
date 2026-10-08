@@ -154,3 +154,23 @@ def test_mab_top_rules_handles_request_equal_to_population():
     bandit.successes[:] = [4.0, 2.0]
     bandit.failures[:] = [2.0, 4.0]
     assert [r['rule_id'] for r in bandit.get_top_rules(2)] == [0, 1]
+
+
+def test_mab_eta_does_not_underflow_uint32_trials():
+    import numpy as np
+    rules = [{'rule_id': i, 'rule_data': ':'} for i in range(3)]
+    bandit = ranker.MultiPassMAB(rules, final_trials=50, screening_trials=5)
+    # One rule is beyond the budget, one exactly at the budget, one needs one trial.
+    bandit.trials[:] = np.array([60, 50, 49], dtype=np.uint32)
+    assert ranker._estimate_mab_remaining_iterations(bandit) == 1
+
+
+def test_mab_does_not_resample_rules_past_final_trials():
+    import numpy as np
+    rules = [{'rule_id': i, 'rule_data': ':'} for i in range(3)]
+    bandit = ranker.MultiPassMAB(rules, final_trials=2, screening_trials=1)
+    bandit.trials[:] = np.array([2, 1, 2], dtype=np.uint32)
+    bandit.successes[:] = 2.0
+    bandit.failures[:] = 2.0
+    selected = bandit.select_rules(batch_size=3, iteration=0)
+    assert selected == [1]
