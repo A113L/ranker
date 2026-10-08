@@ -3,13 +3,13 @@ rule_ranker
 ===========
 Modular package wrapping the three original standalone scripts:
 
-    rule_ranker.ranker              -- ranker.py (GPU rule ranking, v5.2)
+    rule_ranker.ranker              -- ranker.py (GPU rule ranking, v6.0)
     rule_ranker.ranker_handler      -- ranker_handler.py (fast CSV/rule analysis)
     rule_ranker.ranker_postprocess  -- ranker_postprocess.py (GPU recompute + lazy-greedy CELF stage)
 
-Each submodule is kept byte-for-byte identical in logic to the original
-script -- nothing was rewritten, only relocated into a package and given
-a callable `main(argv=None)` entry point so it can be invoked either as:
+The package keeps the original CLI structure, but the ranking/CELF GPU paths
+now use independent per-rule 64-bit fingerprinting and sample-based MAB; each
+submodule exposes a callable `main(argv=None)` entry point so it can be invoked as:
 
     python3 -m rule_ranker.ranker --wordlist ... --rules ... --cracked ...
 
@@ -23,4 +23,4 @@ See run_ranker.py --help for the full subcommand list.
 """
 
 __all__ = ["ranker", "ranker_handler", "ranker_postprocess"]
-__version__ = "1.0.0"
+__version__ = "1.1.0"

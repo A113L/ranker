@@ -51,6 +51,15 @@ import time
 
 import numpy as np
 
+from .hashing import (
+    build_open_addressing_table_uint64,
+    fast_fnv1a_hash_32,
+    fast_fnv1a_hash_64,
+    load_cached_hashes,
+    save_cached_hashes,
+    table_size_for_count,
+)
+
 # ============================================================
 # --- CONSTANTS ---
 # ============================================================
@@ -88,85 +97,17 @@ def log(msg):
 # ============================================================
 # --- Loading helpers ---
 # ============================================================
-def fast_fnv1a_hash_32(data):
-    hash_val = 2166136261
-    for byte in data:
-        hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
-    return hash_val
-
-
-# ----------------------------------------------------------------------
-# Persistent cracked-hash cache (v4)
-# ----------------------------------------------------------------------
-FNV_CACHE_VERSION = 1
-
-
 def _fnv_cache_paths(source_path, max_len):
-    base = f"{source_path}.fnv1a32.max{int(max_len)}"
-    return base + ".npy", base + ".json"
+    from .hashing import cache_paths
+    return cache_paths(source_path, max_len)
 
 
 def _load_fnv_cache(source_path, max_len):
-    """Return (hashes, skipped) from a validated cache, or None."""
-    try:
-        source_stat = os.stat(source_path)
-        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if (
-            meta.get("version") != FNV_CACHE_VERSION
-            or meta.get("source_size") != source_stat.st_size
-            or meta.get("source_mtime_ns") != source_stat.st_mtime_ns
-            or meta.get("max_len") != int(max_len)
-        ):
-            return None
-        cached = np.load(cache_path, allow_pickle=False)
-        if cached.ndim != 1 or cached.dtype != np.dtype(np.uint32):
-            return None
-        if cached.size > 1 and not np.all(cached[1:] > cached[:-1]):
-            return None
-        skipped = int(meta.get("n_skipped", 0))
-        return np.asarray(cached), skipped
-    except (OSError, EOFError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-        return None
+    return load_cached_hashes(source_path, max_len)
 
 
 def _save_fnv_cache(source_path, max_len, hashes, n_skipped):
-    """Atomically write cache data; cache failures never stop ranking."""
-    tmp_npy = None
-    tmp_meta = None
-    try:
-        source_stat = os.stat(source_path)
-        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
-        cache_dir = os.path.dirname(cache_path) or "."
-        os.makedirs(cache_dir, exist_ok=True)
-        pid = os.getpid()
-        tmp_npy = f"{cache_path}.tmp.{pid}"
-        tmp_meta = f"{meta_path}.tmp.{pid}"
-        arr = np.asarray(hashes, dtype=np.uint32)
-        with open(tmp_npy, "wb") as f:
-            np.save(f, arr, allow_pickle=False)
-        os.replace(tmp_npy, cache_path)
-        meta = {
-            "version": FNV_CACHE_VERSION,
-            "source_size": int(source_stat.st_size),
-            "source_mtime_ns": int(source_stat.st_mtime_ns),
-            "max_len": int(max_len),
-            "n_hashes": int(arr.size),
-            "n_skipped": int(n_skipped),
-        }
-        with open(tmp_meta, "w", encoding="utf-8") as f:
-            json.dump(meta, f, separators=(",", ":"))
-        os.replace(tmp_meta, meta_path)
-        return True
-    except (OSError, ValueError, TypeError):
-        for p in (tmp_npy, tmp_meta):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-        return False
+    return save_cached_hashes(source_path, max_len, hashes, n_skipped)
 
 
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
@@ -200,20 +141,16 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
 
 
 def load_cracked_universe(path, max_len):
-    """Load cracked passwords -> sorted unique FNV-1a hash array.
-
-    Uses the same persistent cache as ranker.py after the first pass.
-    Returns (arr, n_skipped).
-    """
+    """Load cracked passwords -> sorted unique FNV-1a-64 fingerprints."""
     log(f"{blue('Loading cracked list:')} {path}")
     cached = _load_fnv_cache(path, max_len)
     if cached is not None:
         arr, n_skipped = cached
-        log(f"{green('Cracked universe loaded from FNV cache:')} {cyan(f'{len(arr):,}')} unique hashes")
+        log(f"{green('Cracked universe loaded from 64-bit fingerprint cache:')} {cyan(f'{len(arr):,}')} unique hashes")
         return arr, n_skipped
 
     from array import array
-    hashes = array('I')
+    hashes = array('Q')
     n_skipped = 0
     with open(path, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -228,16 +165,13 @@ def load_cracked_universe(path, max_len):
                 if len(line) == 0:
                     continue
                 if len(line) <= max_len:
-                    hashes.append(fast_fnv1a_hash_32(line))
+                    hashes.append(fast_fnv1a_hash_64(line))
                 else:
                     n_skipped += 1
-    if hashes.itemsize == np.dtype(np.uint32).itemsize:
-        raw_hashes = np.frombuffer(hashes, dtype=np.uint32)
-    else:
-        raw_hashes = np.asarray(hashes, dtype=np.uint32)
+    raw_hashes = np.frombuffer(hashes, dtype=np.uint64).copy() if hashes.itemsize == 8 else np.asarray(hashes, dtype=np.uint64)
     arr = np.unique(raw_hashes)
     _save_fnv_cache(path, max_len, arr, n_skipped)
-    log(f"{green('Cracked universe size (unique hashes):')} {cyan(f'{len(arr):,}')}")
+    log(f"{green('Cracked universe size (unique 64-bit fingerprints):')} {cyan(f'{len(arr):,}')}")
     return arr, n_skipped
 
 

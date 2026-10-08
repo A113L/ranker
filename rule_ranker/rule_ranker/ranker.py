@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Ranker v5.2 – GPU-Accelerated Hashcat Rule Ranking
+Ranker v6.0 – GPU-Accelerated Hashcat Rule Ranking
 ===================================================
 Multi-Pass MAB with Early Elimination for large rule sets.
 Optionally runs in legacy exhaustive mode (v3.2).
 All GPU‑compatible Hashcat rules are implemented.
 MAX_RULE_LEN = 255, comprehensive rule application.
 
-Changelog v5.2 (bug fixes):
+Changelog v6.0 (architecture/correctness fixes):
+- Independent per-rule GPU fingerprint tables; no shared uniqueness bitmap or race-order credit.
+- FNV-1a-64 fingerprints and versioned cracked-list caches.
+- MAB trials use stratified wordlist samples instead of full wordlist passes.
+
+Changelog v5.2 (historical bug fixes):
 - BUG FIX #1: Operator precedence error in select_rules sort_key.
   `<< 32 - x` was parsed as `<< (32 - x)` instead of `(<< 32) - x`,
   causing completely wrong screening-phase sort order.
@@ -48,6 +53,15 @@ import signal
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+
+from .hashing import (
+    build_open_addressing_table_uint64,
+    fast_fnv1a_hash_32,
+    fast_fnv1a_hash_64,
+    load_cached_hashes,
+    save_cached_hashes,
+    table_size_for_count,
+)
 
 # ====================================================================
 # --- CONSTANTS ---
@@ -332,86 +346,19 @@ def estimate_word_count(path):
         print(f"{yellow('Could not estimate word count:')} {e}")
         return 1000000
 
-def fast_fnv1a_hash_32(data):
-    """Optimized FNV-1a hash for bytes - pure integer arithmetic (no numpy overhead)"""
-    hash_val = 2166136261
-    for byte in data:
-        hash_val = (hash_val ^ byte) * 16777619 & 0xFFFFFFFF
-    return hash_val
-
-
-# ----------------------------------------------------------------------
-# Persistent cracked-hash cache (v4)
-# ----------------------------------------------------------------------
-FNV_CACHE_VERSION = 1
-
-
 def _fnv_cache_paths(source_path, max_len):
-    base = f"{source_path}.fnv1a32.max{int(max_len)}"
-    return base + ".npy", base + ".json"
+    """Backward-compatible helper retained for callers of older releases."""
+    from .hashing import cache_paths
+    return cache_paths(source_path, max_len)
 
 
 def _load_fnv_cache(source_path, max_len):
-    """Return (hashes, skipped) from a validated cache, or None."""
-    try:
-        source_stat = os.stat(source_path)
-        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if (
-            meta.get("version") != FNV_CACHE_VERSION
-            or meta.get("source_size") != source_stat.st_size
-            or meta.get("source_mtime_ns") != source_stat.st_mtime_ns
-            or meta.get("max_len") != int(max_len)
-        ):
-            return None
-        cached = np.load(cache_path, allow_pickle=False)
-        if cached.ndim != 1 or cached.dtype != np.dtype(np.uint32):
-            return None
-        if cached.size > 1 and not np.all(cached[1:] > cached[:-1]):
-            return None
-        skipped = int(meta.get("n_skipped", 0))
-        return np.asarray(cached), skipped
-    except (OSError, EOFError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
-        return None
+    return load_cached_hashes(source_path, max_len)
 
 
 def _save_fnv_cache(source_path, max_len, hashes, n_skipped):
-    """Atomically write cache data; cache failures never stop ranking."""
-    tmp_npy = None
-    tmp_meta = None
-    try:
-        source_stat = os.stat(source_path)
-        cache_path, meta_path = _fnv_cache_paths(source_path, max_len)
-        cache_dir = os.path.dirname(cache_path) or "."
-        os.makedirs(cache_dir, exist_ok=True)
-        pid = os.getpid()
-        tmp_npy = f"{cache_path}.tmp.{pid}"
-        tmp_meta = f"{meta_path}.tmp.{pid}"
-        arr = np.asarray(hashes, dtype=np.uint32)
-        with open(tmp_npy, "wb") as f:
-            np.save(f, arr, allow_pickle=False)
-        os.replace(tmp_npy, cache_path)
-        meta = {
-            "version": FNV_CACHE_VERSION,
-            "source_size": int(source_stat.st_size),
-            "source_mtime_ns": int(source_stat.st_mtime_ns),
-            "max_len": int(max_len),
-            "n_hashes": int(arr.size),
-            "n_skipped": int(n_skipped),
-        }
-        with open(tmp_meta, "w", encoding="utf-8") as f:
-            json.dump(meta, f, separators=(",", ":"))
-        os.replace(tmp_meta, meta_path)
-        return True
-    except (OSError, ValueError, TypeError):
-        for p in (tmp_npy, tmp_meta):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
-        return False
+    return save_cached_hashes(source_path, max_len, hashes, n_skipped)
+
 
 def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     """Memory‑mapped iterator over words, returning batches of words and hashes"""
@@ -420,7 +367,7 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
     print(f"{blue('File size:')} {cyan(f'{file_size / (1024**3):.2f} GB')}")
     batch_elements = batch_size * max_len
     words_buffer = np.zeros(batch_elements, dtype=np.uint8)
-    hashes_buffer = np.zeros(batch_size, dtype=np.uint32)
+    hashes_buffer = np.zeros(batch_size, dtype=np.uint64)
     load_start = time()
     total_words_loaded = 0
     try:
@@ -441,16 +388,27 @@ def optimized_wordlist_iterator(wordlist_path, max_len, batch_size):
                     start_idx = batch_count * max_len
                     end_idx = start_idx + line_len
                     words_buffer[start_idx:end_idx] = np.frombuffer(line, dtype=np.uint8, count=line_len)
-                    hashes_buffer[batch_count] = fast_fnv1a_hash_32(line)
+                    hashes_buffer[batch_count] = fast_fnv1a_hash_64(line)
                     batch_count += 1
                     total_words_loaded += 1
                     if batch_count >= batch_size:
-                        yield words_buffer.copy(), hashes_buffer.copy(), batch_count
+                        # Public batch contract: (N, max_len) uint8 matrix.
+                        # Keeping the shape explicit prevents legacy callers from
+                        # accidentally slicing N bytes out of an N*max_len buffer.
+                        yield (
+                            words_buffer.reshape(batch_size, max_len).copy(),
+                            hashes_buffer.copy(),
+                            batch_count,
+                        )
                         batch_count = 0
                         words_buffer.fill(0)
                         hashes_buffer.fill(0)
                 if batch_count > 0 and not interrupted:
-                    yield words_buffer, hashes_buffer, batch_count
+                    yield (
+                        words_buffer.reshape(batch_size, max_len)[:batch_count].copy(),
+                        hashes_buffer[:batch_count].copy(),
+                        batch_count,
+                    )
     except Exception as e:
         print(f"{red('Error in optimized loader:')} {e}")
         raise
@@ -587,21 +545,17 @@ def load_rules(path):
     return rules_list
 
 def load_cracked_hashes(path, max_len):
-    """Load cracked passwords and return their unique FNV-1a hashes.
-
-    Uses a persistent sidecar cache after the first pass. Cache validity is
-    tied to source size, nanosecond mtime and max_len.
-    """
+    """Load cracked passwords and return sorted unique FNV-1a-64 fingerprints."""
     from array import array
 
     print(f"{blue('Loading cracked list for effectiveness check from:')} {path}...")
     cached = _load_fnv_cache(path, max_len)
     if cached is not None:
         hashes, _n_skipped = cached
-        print(f"{green('Loaded')} {cyan(f'{len(hashes):,}')} {bold('unique cracked password hashes from FNV cache.')}")
+        print(f"{green('Loaded')} {cyan(f'{len(hashes):,}')} {bold('unique cracked password 64-bit fingerprints from cache.')}")
         return hashes
 
-    cracked_hashes = array('I')
+    cracked_hashes = array('Q')
     n_skipped = 0
     try:
         with open(path, 'rb') as f:
@@ -620,20 +574,17 @@ def load_cracked_hashes(path, max_len):
                         pos = end_pos + 1
                         pbar.update(advance)
                         if 1 <= len(line) <= max_len:
-                            cracked_hashes.append(fast_fnv1a_hash_32(line))
+                            cracked_hashes.append(fast_fnv1a_hash_64(line))
                         elif len(line) > max_len:
                             n_skipped += 1
     except FileNotFoundError:
         print(f"{yellow('Warning:')} Cracked list file not found at: {path}. Effectiveness scores will be zero.")
-        return np.array([], dtype=np.uint32)
+        return np.array([], dtype=np.uint64)
 
-    if cracked_hashes.itemsize == np.dtype(np.uint32).itemsize:
-        raw_hashes = np.frombuffer(cracked_hashes, dtype=np.uint32)
-    else:
-        raw_hashes = np.asarray(cracked_hashes, dtype=np.uint32)
+    raw_hashes = np.frombuffer(cracked_hashes, dtype=np.uint64).copy() if cracked_hashes.itemsize == 8 else np.asarray(cracked_hashes, dtype=np.uint64)
     unique_hashes = np.unique(raw_hashes)
     _save_fnv_cache(path, max_len, unique_hashes, n_skipped)
-    print(f"{green('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password hashes.')}")
+    print(f"{green('Loaded')} {cyan(f'{len(unique_hashes):,}')} {bold('unique cracked password 64-bit fingerprints.')}")
     return unique_hashes
 
 
@@ -932,9 +883,9 @@ def create_opencl_buffers_with_retry(context, buffer_specs, max_retries=MAX_ALLO
 # ====================================================================
 # --- COMPREHENSIVE KERNEL SOURCE (Full Hashcat Rules) ---
 # ====================================================================
-def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
-    global_hash_map_mask = (1 << (global_hash_map_bits - 5)) - 1
-    cracked_hash_map_mask = (1 << (cracked_hash_map_bits - 5)) - 1
+def get_kernel_source(rule_hash_table_bits, cracked_hash_table_bits):
+    rule_hash_table_mask = (1 << int(rule_hash_table_bits)) - 1
+    cracked_hash_table_mask = (1 << int(cracked_hash_table_bits)) - 1
     return f"""
 // ============================================================================
 // COMPREHENSIVE HASHCAT RULES KERNEL – WITH RULE CHAIN SUPPORT
@@ -943,8 +894,9 @@ def get_kernel_source(global_hash_map_bits, cracked_hash_map_bits):
 #define MAX_WORD_LEN {MAX_WORD_LEN}
 #define MAX_OUTPUT_LEN {MAX_OUTPUT_LEN}
 #define MAX_RULE_LEN {MAX_RULE_LEN}
-#define GLOBAL_HASH_MAP_MASK {global_hash_map_mask}
-#define CRACKED_HASH_MAP_MASK {cracked_hash_map_mask}
+#define RULE_HASH_TABLE_MASK {rule_hash_table_mask}
+#define RULE_HASH_TABLE_SIZE (RULE_HASH_TABLE_MASK + 1U)
+#define CRACKED_HASH_TABLE_MASK {cracked_hash_table_mask}
 
 // ----------------------------------------------------------------------------
 // Basic utility functions
@@ -967,13 +919,58 @@ unsigned int char_to_pos(unsigned char c) {{
     return 0xFFFFFFFF;
 }}
 
-unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {{
-    unsigned int hash = 2166136261U;
+ulong fnv1a_hash_64(const unsigned char* data, unsigned int len) {{
+    ulong hash = 14695981039346656037UL;
     for (unsigned int i = 0; i < len; i++) {{
-        hash ^= data[i];
-        hash *= 16777619U;
+        hash ^= (ulong)data[i];
+        hash *= 1099511628211UL;
     }}
     return hash;
+}}
+
+ulong mix64(ulong x) {{
+    x += 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}}
+
+// Per-rule exact-fingerprint insertion. states: 0=empty, 1=writer, 2=ready.
+// A separate state array keeps all uint64 fingerprints, including 0, valid.
+inline int insert_rule_fingerprint(__global ulong* hashes, __global uint* states,
+                                   uint table_base, ulong key) {{
+    uint slot = (uint)(mix64(key) & (ulong)RULE_HASH_TABLE_MASK);
+    for (uint probe = 0; probe <= RULE_HASH_TABLE_MASK; probe++) {{
+        uint absolute = table_base + slot;
+        __global volatile uint* state_ptr = (__global volatile uint*)&states[absolute];
+        uint state = atomic_cmpxchg(state_ptr, 0U, 1U);
+        if (state == 0U) {{
+            hashes[absolute] = key;
+            mem_fence(CLK_GLOBAL_MEM_FENCE);
+            atomic_xchg(state_ptr, 2U);
+            return 1;
+        }}
+        if (state == 1U) {{
+            do {{
+                state = *state_ptr;
+            }} while (state == 1U);
+        }}
+        if (state == 2U && hashes[absolute] == key) return 0;
+        slot = (slot + 1U) & RULE_HASH_TABLE_MASK;
+    }}
+    return 0; // unreachable when table capacity is >= 2x sample size
+}}
+
+inline int lookup_cracked_fingerprint(__global const ulong* hashes,
+                                      __global const uint* states, ulong key) {{
+    uint slot = (uint)(mix64(key) & (ulong)CRACKED_HASH_TABLE_MASK);
+    for (uint probe = 0; probe <= CRACKED_HASH_TABLE_MASK; probe++) {{
+        uint state = states[slot];
+        if (state == 0U) return 0;
+        if (state == 2U && hashes[slot] == key) return 1;
+        slot = (slot + 1U) & CRACKED_HASH_TABLE_MASK;
+    }}
+    return 0;
 }}
 
 // ----------------------------------------------------------------------------
@@ -1592,30 +1589,34 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
 }}
 
 // ----------------------------------------------------------------------------
-// Ranking kernel (unchanged)
+// Independent per-rule scoring kernel. Every rule owns a disjoint hash table,
+// so duplicates produced by rule A can never suppress a unique result of rule B.
+// Effectiveness is counted only on the first unique output for that rule/sample.
 // ----------------------------------------------------------------------------
 __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void ranker_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* rule_ids,
-    __global unsigned int* global_hash_map,
-    __global const unsigned int* cracked_hash_map,
-    __global unsigned int* rule_uniqueness_counts,
-    __global unsigned int* rule_effectiveness_counts,
+    __global const ulong* cracked_hash_table,
+    __global const uint* cracked_hash_states,
+    __global ulong* rule_hash_tables,
+    __global uint* rule_hash_states,
+    __global uint* rule_uniqueness_counts,
+    __global uint* rule_effectiveness_counts,
     const unsigned int num_words,
     const unsigned int num_rules_in_batch,
     const unsigned int max_word_len,
-    const unsigned int max_output_len)
+    const unsigned int rule_hash_table_mask)
 {{
     unsigned int global_id = get_global_id(0);
-    unsigned int word_per_rule_count = num_words * num_rules_in_batch;
-    if (global_id >= word_per_rule_count) return;
+    unsigned int total = num_words * num_rules_in_batch;
+    if (global_id >= total) return;
 
-    unsigned int word_idx = global_id / num_rules_in_batch;
-    unsigned int rule_batch_idx = global_id % num_rules_in_batch;
+    // Work is laid out rule-major so each rule's hash table has good spatial locality.
+    unsigned int rule_idx = global_id / num_words;
+    unsigned int word_idx = global_id % num_words;
+    unsigned int table_base = rule_idx * (rule_hash_table_mask + 1U);
 
-    // Load word
     unsigned char word[MAX_WORD_LEN];
     unsigned int word_len = 0;
     for (unsigned int i = 0; i < max_word_len; i++) {{
@@ -1625,8 +1626,7 @@ void ranker_kernel(
         word_len++;
     }}
 
-    // Load rule (fixed length byte array)
-    unsigned int rule_start = rule_batch_idx * MAX_RULE_LEN;
+    unsigned int rule_start = rule_idx * MAX_RULE_LEN;
     unsigned char rule_str[MAX_RULE_LEN];
     unsigned int rule_len = 0;
     for (unsigned int i = 0; i < MAX_RULE_LEN; i++) {{
@@ -1642,49 +1642,196 @@ void ranker_kernel(
     apply_hashcat_rule(word, word_len, rule_str, rule_len, result_temp, &out_len, &changed);
 
     if (changed > 0 && out_len > 0) {{
-        unsigned int word_hash = fnv1a_hash_32(result_temp, out_len);
-
-        unsigned int global_map_index = (word_hash >> 5) & GLOBAL_HASH_MAP_MASK;
-        unsigned int bit_index = word_hash & 31;
-        unsigned int check_bit = (1U << bit_index);
-        __global unsigned int* global_map_ptr = &global_hash_map[global_map_index];
-        unsigned int current_global_word = *global_map_ptr;
-
-        if (!(current_global_word & check_bit)) {{
-            atomic_or(global_map_ptr, check_bit);
-            atomic_inc(&rule_uniqueness_counts[rule_batch_idx]);
-
-            unsigned int cracked_map_index = (word_hash >> 5) & CRACKED_HASH_MAP_MASK;
-            __global const unsigned int* cracked_map_ptr = &cracked_hash_map[cracked_map_index];
-            unsigned int current_cracked_word = *cracked_map_ptr;
-
-            if (current_cracked_word & check_bit) {{
-                atomic_inc(&rule_effectiveness_counts[rule_batch_idx]);
+        ulong word_hash = fnv1a_hash_64(result_temp, out_len);
+        int is_new = insert_rule_fingerprint(rule_hash_tables, rule_hash_states, table_base, word_hash);
+        if (is_new) {{
+            atomic_inc(&rule_uniqueness_counts[rule_idx]);
+            if (lookup_cracked_fingerprint(cracked_hash_table, cracked_hash_states, word_hash)) {{
+                atomic_inc(&rule_effectiveness_counts[rule_idx]);
             }}
         }}
     }}
 }}
-
-// ----------------------------------------------------------------------------
-// Hash map initialisation kernel (unchanged)
-// ----------------------------------------------------------------------------
-__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
-void hash_map_init_kernel(
-    __global unsigned int* hash_map,
-    __global const unsigned int* hashes,
-    const unsigned int num_hashes,
-    const unsigned int map_mask)
-{{
-    unsigned int global_id = get_global_id(0);
-    if (global_id >= num_hashes) return;
-
-    unsigned int word_hash = hashes[global_id];
-    unsigned int map_index = (word_hash >> 5) & map_mask;
-    unsigned int bit_index = word_hash & 31;
-    unsigned int set_bit = (1U << bit_index);
-    atomic_or(&hash_map[map_index], set_bit);
-}}
 """
+
+# ====================================================================
+# --- INDEPENDENT 64-BIT GPU SCORER ---------------------------------
+# ====================================================================
+def _ceil_log2(value: int) -> int:
+    value = max(1, int(value))
+    return max(1, int(math.ceil(math.log2(value))))
+
+
+def _read_stratified_word_sample(wordlist_path, max_len, sample_words, seed):
+    """Read a small, repeatable stratified sample without loading the file.
+
+    Each trial draws line windows from byte ranges spread across the file.
+    This gives MAB fresh evidence on every trial while keeping I/O proportional
+    to the requested sample rather than to the entire wordlist.
+    """
+    sample_words = max(1, int(sample_words))
+    file_size = os.path.getsize(wordlist_path)
+    if file_size == 0:
+        return np.zeros((0, max_len), dtype=np.uint8), 0
+
+    segments = min(8, max(1, sample_words // 512))
+    per_segment = int(math.ceil(sample_words / segments))
+    rng = np.random.default_rng(np.uint64(seed))
+    out = np.zeros((sample_words, max_len), dtype=np.uint8)
+    count = 0
+
+    with open(wordlist_path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        for seg in range(segments):
+            if count >= sample_words:
+                break
+            lo = (file_size * seg) // segments
+            hi = (file_size * (seg + 1)) // segments
+            if hi <= lo:
+                continue
+            pos = int(rng.integers(lo, hi))
+            if pos > 0:
+                nl = mm.find(b'\n', pos)
+                if nl == -1:
+                    pos = file_size
+                else:
+                    pos = nl + 1
+            local = 0
+            while pos < file_size and local < per_segment and count < sample_words:
+                end = mm.find(b'\n', pos)
+                if end == -1:
+                    end = file_size
+                line = mm[pos:end].strip()
+                pos = end + 1
+                if not line or len(line) > max_len:
+                    continue
+                out[count, :len(line)] = np.frombuffer(line, dtype=np.uint8)
+                count += 1
+                local += 1
+
+    if count == 0:
+        return np.zeros((0, max_len), dtype=np.uint8), 0
+    return out[:count], count
+
+
+class IndependentRuleGpuScorer:
+    """GPU scorer with independent per-rule 64-bit fingerprint sets.
+
+    The old scorer used one shared bitmap for every rule in a dispatch. That
+    made uniqueness dependent on GPU race order: the first rule to claim a
+    bit received the credit. This class allocates a disjoint open-addressed
+    fingerprint table for every rule row in the dispatch, so rule scores are
+    statistically independent of one another.
+    """
+
+    def __init__(self, device_id, words_capacity, max_rules, cracked_hashes):
+        self.words_capacity = max(1, int(words_capacity))
+        self.requested_max_rules = max(1, int(max_rules))
+        self.cracked_hashes = np.unique(np.asarray(cracked_hashes, dtype=np.uint64))
+
+        platform, device = select_platform_and_device(device_id) if device_id is not None else select_platform_and_device()
+        self.platform = platform
+        self.device = device
+        self.context = cl.Context([device])
+        self.queue = cl.CommandQueue(self.context)
+        _total_vram, available_vram = get_gpu_memory_info(device)
+        self.available_vram = int(available_vram)
+
+        self.rule_table_size = table_size_for_count(self.words_capacity)
+        self.rule_table_bits = _ceil_log2(self.rule_table_size)
+        self.cracked_table_size = table_size_for_count(len(self.cracked_hashes))
+        self.cracked_table_bits = _ceil_log2(self.cracked_table_size)
+
+        per_rule_table_bytes = self.rule_table_size * (np.dtype(np.uint64).itemsize + np.dtype(np.uint32).itemsize)
+        memory_budget = max(16 * 1024 * 1024, int(self.available_vram * 0.12))
+        memory_limited_rules = max(1, memory_budget // max(1, per_rule_table_bytes))
+        self.max_rules = min(self.requested_max_rules, int(memory_limited_rules), MAX_RULES_IN_BATCH)
+        self.max_rules = max(1, self.max_rules)
+
+        # Avoid dispatches that exceed driver watchdog/work-item limits.
+        dispatch_limited = max(1, MAX_DISPATCH_ITEMS // self.words_capacity)
+        self.max_rules = min(self.max_rules, dispatch_limited)
+
+        src = get_kernel_source(self.rule_table_bits, self.cracked_table_bits)
+        self.program = cl.Program(self.context, src).build()
+        self.kernel_ranker = self.program.ranker_kernel
+
+        cracked_table, cracked_states = build_open_addressing_table_uint64(
+            self.cracked_hashes, self.cracked_table_size)
+        mf = cl.mem_flags
+        self.cracked_hash_table_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_table)
+        self.cracked_hash_states_g = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_states)
+
+        self.base_words_g = cl.Buffer(self.context, mf.READ_ONLY,
+                                      self.words_capacity * MAX_WORD_LEN * np.dtype(np.uint8).itemsize)
+        self.rules_g = cl.Buffer(self.context, mf.READ_ONLY,
+                                 self.max_rules * MAX_RULE_LEN * np.dtype(np.uint8).itemsize)
+        self.rule_table_hashes_g = cl.Buffer(
+            self.context, mf.READ_WRITE,
+            self.max_rules * self.rule_table_size * np.dtype(np.uint64).itemsize)
+        self.rule_table_states_g = cl.Buffer(
+            self.context, mf.READ_WRITE,
+            self.max_rules * self.rule_table_size * np.dtype(np.uint32).itemsize)
+        self.uniqueness_g = cl.Buffer(self.context, mf.READ_WRITE,
+                                      self.max_rules * np.dtype(np.uint32).itemsize)
+        self.effectiveness_g = cl.Buffer(self.context, mf.READ_WRITE,
+                                         self.max_rules * np.dtype(np.uint32).itemsize)
+
+    def score(self, words_np, rules_encoded):
+        """Return (unique_per_rule, cracked_per_rule) for one sample/batch."""
+        words_np = np.ascontiguousarray(words_np, dtype=np.uint8)
+        num_words = int(words_np.shape[0])
+        if num_words <= 0:
+            return np.zeros(len(rules_encoded), dtype=np.uint64), np.zeros(len(rules_encoded), dtype=np.uint64)
+        if words_np.shape[1] != MAX_WORD_LEN:
+            raise ValueError(f"word sample has width {words_np.shape[1]}, expected {MAX_WORD_LEN}")
+
+        n_rules_total = len(rules_encoded)
+        unique = np.zeros(n_rules_total, dtype=np.uint64)
+        cracked = np.zeros(n_rules_total, dtype=np.uint64)
+
+        cl.enqueue_copy(self.queue, self.base_words_g, words_np).wait()
+        for start in range(0, n_rules_total, self.max_rules):
+            end = min(start + self.max_rules, n_rules_total)
+            chunk = np.ascontiguousarray(rules_encoded[start:end], dtype=np.uint8)
+            n_rules = end - start
+            cl.enqueue_copy(self.queue, self.rules_g, chunk).wait()
+            cl.enqueue_fill_buffer(self.queue, self.rule_table_states_g, np.uint32(0),
+                                   0, self.max_rules * self.rule_table_size * np.dtype(np.uint32).itemsize).wait()
+            cl.enqueue_fill_buffer(self.queue, self.uniqueness_g, np.uint32(0),
+                                   0, self.max_rules * np.dtype(np.uint32).itemsize).wait()
+            cl.enqueue_fill_buffer(self.queue, self.effectiveness_g, np.uint32(0),
+                                   0, self.max_rules * np.dtype(np.uint32).itemsize).wait()
+
+            items = num_words * n_rules
+            global_size = (int(math.ceil(items / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            self.kernel_ranker(
+                self.queue, global_size, (LOCAL_WORK_SIZE,),
+                self.base_words_g, self.rules_g,
+                self.cracked_hash_table_g, self.cracked_hash_states_g,
+                self.rule_table_hashes_g, self.rule_table_states_g,
+                self.uniqueness_g, self.effectiveness_g,
+                np.uint32(num_words), np.uint32(n_rules),
+                np.uint32(MAX_WORD_LEN), np.uint32(self.rule_table_size - 1),
+            ).wait()
+            u = np.zeros(self.max_rules, dtype=np.uint32)
+            e = np.zeros(self.max_rules, dtype=np.uint32)
+            cl.enqueue_copy(self.queue, u, self.uniqueness_g).wait()
+            cl.enqueue_copy(self.queue, e, self.effectiveness_g).wait()
+            unique[start:end] = u[:n_rules]
+            cracked[start:end] = e[:n_rules]
+
+        return unique, cracked
+
+
+def _encode_rules_matrix(rules_list):
+    encoded = np.zeros((len(rules_list), MAX_RULE_LEN), dtype=np.uint8)
+    for i, rule in enumerate(rules_list):
+        rb = rule['rule_data'].encode('latin-1')
+        if len(rb) > MAX_RULE_LEN:
+            raise ValueError(f"rule exceeds MAX_RULE_LEN={MAX_RULE_LEN}: {rule['rule_data']!r}")
+        encoded[i, :len(rb)] = np.frombuffer(rb, dtype=np.uint8)
+    return encoded
+
 
 # ====================================================================
 # --- EXHAUSTIVE RANKING (Legacy v3.2) ---
@@ -1692,237 +1839,96 @@ void hash_map_init_kernel(
 def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k,
                           words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
                           preset=None, device_id=None):
-    """Original exhaustive ranking algorithm (v3.2) with full rule support."""
-    start_time = time()
+    """Full-pass ranking with independent per-rule 64-bit fingerprint sets.
 
-    # Load data (rules are already filtered by validator)
+    Legacy mode remains available as a reference path.  Uniqueness is measured
+    independently inside each streamed word batch; batches are deliberately
+    kept bounded so VRAM use does not scale with the entire wordlist.
+    """
+    start_time = time()
     total_words = estimate_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
-    total_rules = len(rules_list)
     setup_interrupt_handler(rules_list, ranking_output_path, top_k)
-
     cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
-    cracked_hashes_count = len(cracked_hashes_np)
+
+    if not rules_list:
+        save_ranking_data([], ranking_output_path, legacy=True)
+        return
+
+    words_per_gpu_batch = int(words_per_gpu_batch or DEFAULT_WORDS_PER_GPU_BATCH)
+    if words_per_gpu_batch < 1:
+        raise ValueError("--batch-size must be positive")
 
     print(f"\n{blue('Dataset Summary:')}")
-    print(f"   {bold('Words:')} {cyan(f'{total_words:,}')}")
-    print(f"   {bold('Rules:')} {cyan(f'{total_rules:,}')}")
-    print(f"   {bold('Cracked hashes:')} {cyan(f'{cracked_hashes_count:,}')}")
+    print(f"   {bold('Words (estimated):')} {cyan(f'{total_words:,}')}")
+    print(f"   {bold('Rules:')} {cyan(f'{len(rules_list):,}')}")
+    print(f"   {bold('Cracked fingerprints:')} {cyan(f'{len(cracked_hashes_np):,}')}")
 
-    # OpenCL init
     try:
-        if device_id is not None:
-            platform, device = select_platform_and_device(device_id)
-        else:
-            platform, device = select_platform_and_device()
-        context = cl.Context([device])
-        queue = cl.CommandQueue(context)
-        total_vram, available_vram = get_gpu_memory_info(device)
-        print(f"\n{green('GPU:')} {cyan(device.name.strip())}")
-        print(f"{blue('Platform:')} {cyan(platform.name.strip())}")
-        print(f"{blue('Total VRAM:')} {cyan(f'{total_vram / (1024**3):.1f} GB')}")
-        print(f"{blue('Available VRAM:')} {cyan(f'{available_vram / (1024**3):.1f} GB')}")
-
-        if preset:
-            recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count)
-            if preset == "recommend":
-                preset = recommended_preset
-            if preset in recommendations:
-                preset_config = recommendations[preset]
-                print(f"{blue('Using')} {cyan(preset_config['description'])}")
-                words_per_gpu_batch = preset_config['batch_size']
-                global_hash_map_bits = preset_config['global_bits']
-                cracked_hash_map_bits = preset_config['cracked_bits']
-            else:
-                print(f"{red('Unknown preset:')} {cyan(preset)}")
-                return
-
-        if words_per_gpu_batch is None or global_hash_map_bits is None or cracked_hash_map_bits is None:
-            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
-                available_vram, total_words, cracked_hashes_count, total_rules)
-
-        GLOBAL_HASH_MAP_WORDS = 1 << (global_hash_map_bits - 5)
-        GLOBAL_HASH_MAP_MASK = (1 << (global_hash_map_bits - 5)) - 1
-        CRACKED_HASH_MAP_WORDS = 1 << (cracked_hash_map_bits - 5)
-        CRACKED_HASH_MAP_MASK = (1 << (cracked_hash_map_bits - 5)) - 1
-
-        KERNEL_SOURCE = get_kernel_source(global_hash_map_bits, cracked_hash_map_bits)
-        prg = cl.Program(context, KERNEL_SOURCE).build()
-        kernel_ranker = prg.ranker_kernel
-        kernel_init = prg.hash_map_init_kernel
-
+        scorer = IndependentRuleGpuScorer(
+            device_id=device_id,
+            words_capacity=words_per_gpu_batch,
+            max_rules=MAX_RULES_IN_BATCH,
+            cracked_hashes=cracked_hashes_np,
+        )
+        print(f"{green('GPU:')} {cyan(scorer.device.name.strip())}")
+        print(f"{blue('Platform:')} {cyan(scorer.platform.name.strip())}")
+        print(f"{blue('Independent scorer:')} {cyan(f'{scorer.max_rules} rules/dispatch group')} | "
+              f"{cyan(f'{scorer.rule_table_size:,} slots/rule')} | {cyan('FNV-1a-64')}")
     except Exception as e:
         print(f"{red('OpenCL initialization failed:')} {e}")
         return
 
-    # Load word batches
-    print(f"{blue('Loading wordlist...')}")
-    word_batches = []
-    word_iter = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
-    for words_np, hashes_np, cnt in word_iter:
-        word_batches.append((words_np, hashes_np, cnt))
-    total_word_batches = len(word_batches)
-    print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
+    encoded_rules = _encode_rules_matrix(rules_list)
+    uniqueness = np.zeros(len(rules_list), dtype=np.uint64)
+    effectiveness = np.zeros(len(rules_list), dtype=np.uint64)
+    processed_rule_words = 0
 
-    # Pre‑encode all rules into a single contiguous 2D array (total_rules × MAX_RULE_LEN).
-    # A 2D ndarray allows filling rules_batch_np with one slice instead of a Python for-loop.
-    print(f"{blue('Encoding rules...')}")
-    encoded_rules_2d = np.zeros((total_rules, MAX_RULE_LEN), dtype=np.uint8)
-    for i, rule in enumerate(rules_list):
-        rb = rule['rule_data'].encode('latin-1')
-        encoded_rules_2d[i, :len(rb)] = np.frombuffer(rb, dtype=np.uint8)
-
-    # Split rules into batches
-    rule_batch_starts = list(range(0, total_rules, MAX_RULES_IN_BATCH))
-    total_rule_batches = len(rule_batch_starts)
-    print(f"{blue('Processing configuration:')}")
-    print(f"   {blue('Words per batch:')} {cyan(f'{words_per_gpu_batch:,}')}")
-    print(f"   {blue('Rules per batch:')} {cyan(f'{MAX_RULES_IN_BATCH:,}')}")
-    print(f"   {blue('Total rule batches:')} {cyan(f'{total_rule_batches:,}')}")
-
-    # Allocate GPU buffers
-    mf = cl.mem_flags
-    words_buffer_size = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-    hashes_buffer_size = words_per_gpu_batch * np.uint32().itemsize
-    rules_buffer_size = MAX_RULES_IN_BATCH * MAX_RULE_LEN * np.uint8().itemsize
-    counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-    global_map_bytes = int(GLOBAL_HASH_MAP_WORDS) * 4  # BUG FIX: plain int avoids np.uint32 silent overflow on large maps
-    cracked_map_bytes = int(CRACKED_HASH_MAP_WORDS) * 4  # BUG FIX: same
-
+    word_pbar = tqdm(total=total_words, desc="Processing words", unit="words",
+                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
     try:
-        base_words_g = cl.Buffer(context, mf.READ_ONLY, words_buffer_size)
-        base_hashes_g = cl.Buffer(context, mf.READ_ONLY, hashes_buffer_size)
-        rules_g = cl.Buffer(context, mf.READ_ONLY, rules_buffer_size)
-        global_hash_map_g = cl.Buffer(context, mf.READ_WRITE, global_map_bytes)
-        cracked_hash_map_g = cl.Buffer(context, mf.READ_ONLY, cracked_map_bytes)
-        rule_uniqueness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-        rule_effectiveness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-        # Pre-allocated reusable buffers – avoids per-iteration allocations inside the hot loop
-        indices_np    = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-        indices_g     = cl.Buffer(context, mf.READ_ONLY, counters_size)
-        rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-        if cracked_hashes_np.size > 0:
-            cracked_temp_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_hashes_np)
-    except cl.MemoryError:
-        print(f"{red('GPU memory allocation failed')}")
-        return
-
-    # Populate cracked hash map
-    if cracked_hashes_np.size > 0:
-        print(f"{blue('Initialising cracked hash map...')}")
-        global_size_init = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-        kernel_init(queue, global_size_init, (LOCAL_WORK_SIZE,),
-                    cracked_hash_map_g, cracked_temp_g,
-                    np.uint32(cracked_hashes_np.size), np.uint32(CRACKED_HASH_MAP_MASK)).wait()
-        print(f"{green('Cracked hash map ready')}")
-
-    # Processing loop
-    words_processed_total = 0
-    total_unique_found = 0
-    total_cracked_found = 0
-    mapped_uniqueness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-    mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-
-    word_pbar = tqdm(total=total_words, desc="Processing words", unit=" words",
-                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]',
-                     position=0)
-    rule_pbar = tqdm(total=total_rule_batches, desc="Rule batches", unit=" batches",
-                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                     position=1)
-
-    for word_batch_idx, (words_np, hashes_np, num_words) in enumerate(word_batches):
-        if interrupted:
-            break
-
-        # Upload word batch
-        cl.enqueue_copy(queue, base_words_g, words_np)
-        cl.enqueue_copy(queue, base_hashes_g, hashes_np).wait()
-
-        # Initialise global hash map for this batch
-        cl.enqueue_fill_buffer(queue, global_hash_map_g, np.uint32(0), 0, global_map_bytes).wait()
-        global_size_init = (int(math.ceil(num_words / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-        kernel_init(queue, global_size_init, (LOCAL_WORK_SIZE,),
-                    global_hash_map_g, base_hashes_g,
-                    np.uint32(num_words), np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
-
-        # Process all rule batches for this word batch
-        for rule_batch_idx, start_idx in enumerate(rule_batch_starts):
+        for words_np, _hashes_np, num_words in optimized_wordlist_iterator(
+                wordlist_path, MAX_WORD_LEN, words_per_gpu_batch):
             if interrupted:
                 break
+            # ``optimized_wordlist_iterator`` returns a 2-D word matrix.  Keep
+            # a defensive flat-buffer fallback for callers using an older cached
+            # iterator implementation, so legacy mode cannot regress on shape.
+            if words_np.ndim == 2:
+                word_matrix = words_np[:num_words]
+            else:
+                expected = int(num_words) * MAX_WORD_LEN
+                if words_np.size < expected:
+                    raise ValueError(
+                        f"word batch buffer has {words_np.size} bytes, "
+                        f"but {num_words} words require {expected} bytes"
+                    )
+                word_matrix = words_np[:expected].reshape(num_words, MAX_WORD_LEN)
+            u, e = scorer.score(word_matrix, encoded_rules)
+            uniqueness += u
+            effectiveness += e
+            processed_rule_words += int(num_words) * len(rules_list)
+            word_pbar.update(num_words)
+    finally:
+        word_pbar.close()
 
-            end_idx = min(start_idx + MAX_RULES_IN_BATCH, total_rules)
-            num_rules = end_idx - start_idx
-            if num_rules == 0:
-                continue
-
-            # Fill rules buffer via 2D slice – no Python for-loop, no per-iteration np.zeros
-            rules_batch_np[:num_rules]  = encoded_rules_2d[start_idx:end_idx]
-            rules_batch_np[num_rules:] = 0   # zero-pad remaining slots
-
-            cl.enqueue_copy(queue, rules_g, rules_batch_np).wait()
-            cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size)
-            cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size)
-
-            # Upload indices via pre-allocated buffer (no new cl.Buffer each iteration)
-            indices_np[:num_rules] = np.arange(num_rules, dtype=np.uint32)
-            cl.enqueue_copy(queue, indices_g, indices_np).wait()
-
-            global_size_aligned = (int(math.ceil(num_words * num_rules / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-            kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
-                         base_words_g, rules_g,
-                         indices_g,
-                         global_hash_map_g, cracked_hash_map_g,
-                         rule_uniqueness_g, rule_effectiveness_g,
-                         np.uint32(num_words), np.uint32(num_rules),
-                         np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
-
-            cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
-            cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
-
-            # Vectorised batch totals; per-rule dict update still requires a loop
-            u_arr = mapped_uniqueness[:num_rules].astype(np.int64)
-            e_arr = mapped_effectiveness[:num_rules].astype(np.int64)
-            for i in range(num_rules):
-                rules_list[start_idx + i]['uniqueness_score']   += int(u_arr[i])
-                rules_list[start_idx + i]['effectiveness_score'] += int(e_arr[i])
-            batch_unique  = int(np.sum(u_arr))
-            batch_cracked = int(np.sum(e_arr))
-
-            total_unique_found += batch_unique
-            total_cracked_found += batch_cracked
-            words_processed_total += num_words
-            update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
-
-            # Update progress bars
-            word_pbar.n = min(int(words_processed_total), total_words)
-            word_pbar.set_description(f"Words: {words_processed_total:,}/{total_words:,} | Unique: {total_unique_found:,} | Cracked: {total_cracked_found:,}")
-            rule_pbar.update(1)
-            rule_pbar.set_description(f"Rules: {rule_batch_idx+1}/{total_rule_batches} (Word: {word_batch_idx+1}/{total_word_batches})")
-
-        word_pbar.update(num_words)
-        rule_pbar.n = 0
-        rule_pbar.refresh()
-
-    word_pbar.close()
-    rule_pbar.close()
-
-    if interrupted:
-        print(f"\n{yellow('Processing interrupted, results saved.')}")
-        return
+    for idx, rule in enumerate(rules_list):
+        rule['uniqueness_score'] = int(uniqueness[idx])
+        rule['effectiveness_score'] = int(effectiveness[idx])
+        rule['combined_score'] = rule['effectiveness_score'] * 10 + rule['uniqueness_score']
+        rule['eliminated'] = False
+        rule['mab_trials'] = 0
+        rule['selections'] = 0
+        rule['mab_success_prob'] = 0.0
 
     end_time = time()
-    print(f"\n{green('=' * 60)}")
-    print(f"{bold('Exhaustive Ranking Complete')}")
-    print(f"{green('=' * 60)}")
-    print(f"{blue('Total Words Processed:')} {cyan(f'{words_processed_total:,}')}")
-    print(f"{blue('Total Unique Words:')} {cyan(f'{total_unique_found:,}')}")
-    print(f"{blue('Total Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
+    print(f"\n{green('EXHAUSTIVE RANKING COMPLETE')}")
+    print(f"{blue('Rule-word evaluations:')} {cyan(f'{processed_rule_words:,}')}")
     print(f"{blue('Execution Time:')} {cyan(f'{end_time - start_time:.2f} s')}")
-
     csv_path = save_ranking_data(rules_list, ranking_output_path, legacy=True)
-    if top_k > 0:
-        optimized_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-        load_and_save_optimized_rules(csv_path, optimized_path, top_k)
+    if top_k > 0 and csv_path:
+        save_top_k_rules(rules_list, os.path.splitext(ranking_output_path)[0] + "_optimized.rule", top_k)
+
 
 # ====================================================================
 # --- MULTI‑PASS MAB WITH EARLY ELIMINATION (v4.0) ---
@@ -2196,9 +2202,8 @@ class MultiPassMAB:
 
         cnt = len(elim_arr)
         self.elimination_stats['total_eliminated'] += cnt
-        if cnt >= 1000:
-            tqdm.write(f"\n{yellow('MASS ELIMINATION')}: Removed {cyan(f'{cnt:,}')} rules, "
-                       f"active now {cyan(f'{len(self.active_rules):,}')}")
+        # Do not emit a separate terminal line here.  The MAB progress bar
+        # reports the cumulative eliminated count in-place, avoiding console flood.
 
     def get_statistics(self):
         active_arr = self._get_active_array()
@@ -2250,9 +2255,14 @@ class MultiPassMAB:
         top_k = min(n, len(valid_indices))
         if top_k == 0:
             return []
-        top_local = valid_indices[np.argpartition(-probs[valid_indices], top_k)[:top_k]]
+        if top_k == len(valid_indices):
+            top_local = valid_indices
+        else:
+            partition_k = top_k - 1
+            order_local = np.argpartition(-probs[valid_indices], partition_k)[:top_k]
+            top_local = valid_indices[order_local]
         top_indices = active[top_local]
-        order = np.argsort(-probs[top_local])
+        order = np.argsort(-probs[top_local], kind='stable')
         top_indices = top_indices[order]
         results = []
         for idx in top_indices[:n]:
@@ -2278,345 +2288,177 @@ class MultiPassMAB:
 def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_path, top_k,
                    words_per_gpu_batch=None, global_hash_map_bits=None, cracked_hash_map_bits=None,
                    preset=None, device_id=None, mab_exploration_factor=None, mab_final_trials=None,
-                   mab_screening_trials=None, mab_zero_success_elimination=None):
-    start_time = time()
+                   mab_screening_trials=None, mab_zero_success_elimination=None,
+                   mab_sample_words=None):
+    """MAB ranking using small stratified samples instead of full wordlist passes.
 
-    # Load data (rules are already filtered by validator)
+    Each MAB trial evaluates the selected rules on one fresh sample drawn from
+    byte ranges distributed across the wordlist.  This changes the economics
+    from ``rules × full-wordlist`` to ``trials × sample`` while preserving the
+    bandit's Beta/Bernoulli update semantics.
+    """
+    start_time = time()
     total_words = estimate_word_count(wordlist_path)
     rules_list = load_rules(rules_path)
-    total_rules = len(rules_list)
     setup_interrupt_handler(rules_list, ranking_output_path, top_k)
-
     cracked_hashes_np = load_cracked_hashes(cracked_list_path, MAX_WORD_LEN)
-    cracked_hashes_count = len(cracked_hashes_np)
+
+    if not rules_list:
+        save_ranking_data([], ranking_output_path, legacy=False)
+        return
+
+    sample_words = int(mab_sample_words or 8192)
+    sample_words = max(256, sample_words)
+    # Keep the default sample comfortably below ordinary GPU batches, but allow
+    # users to explicitly request a larger/smaller sample for their hardware.
+    max_rules_dispatch = MAX_RULES_IN_BATCH
+    encoded_rules = _encode_rules_matrix(rules_list)
+
+    exploration_factor = mab_exploration_factor if mab_exploration_factor is not None else 2.0
+    final_trials = max(1, int(mab_final_trials if mab_final_trials is not None else 50))
+    screening_trials = max(1, int(mab_screening_trials if mab_screening_trials is not None else 5))
+    zero_elim = mab_zero_success_elimination if mab_zero_success_elimination is not None else True
+    rule_bandit = MultiPassMAB(
+        rules_list, exploration_factor, final_trials, screening_trials, zero_elim,
+        batch_size_words=sample_words,
+    )
 
     print(f"\n{blue('Dataset Summary:')}")
-    print(f"   {bold('Words:')} {cyan(f'{total_words:,}')}")
-    print(f"   {bold('Rules:')} {cyan(f'{total_rules:,}')}")
-    print(f"   {bold('Cracked hashes:')} {cyan(f'{cracked_hashes_count:,}')}")
+    print(f"   {bold('Words (estimated):')} {cyan(f'{total_words:,}')}")
+    print(f"   {bold('Rules:')} {cyan(f'{len(rules_list):,}')}")
+    print(f"   {bold('Cracked fingerprints:')} {cyan(f'{len(cracked_hashes_np):,}')}")
+    print(f"   {bold('MAB sample size:')} {cyan(f'{sample_words:,} words/trial')} (fresh stratified sample)")
 
-    # MAB initialisation
-    exploration_factor = mab_exploration_factor if mab_exploration_factor is not None else 2.0
-    final_trials = mab_final_trials if mab_final_trials is not None else 50
-    screening_trials = mab_screening_trials if mab_screening_trials is not None else 5
-    zero_elim = mab_zero_success_elimination if mab_zero_success_elimination is not None else True
-    rule_bandit = MultiPassMAB(rules_list, exploration_factor, final_trials, screening_trials, zero_elim,
-                               batch_size_words=words_per_gpu_batch or DEFAULT_WORDS_PER_GPU_BATCH)
-
-    # OpenCL init
     try:
-        if device_id is not None:
-            platform, device = select_platform_and_device(device_id)
-        else:
-            platform, device = select_platform_and_device()
-        context = cl.Context([device])
-        queue = cl.CommandQueue(context)
-        total_vram, available_vram = get_gpu_memory_info(device)
-        print(f"\n{green('GPU:')} {cyan(device.name.strip())}")
-        print(f"{blue('Platform:')} {cyan(platform.name.strip())}")
-        print(f"{blue('Total VRAM:')} {cyan(f'{total_vram / (1024**3):.1f} GB')}")
-        print(f"{blue('Available VRAM:')} {cyan(f'{available_vram / (1024**3):.1f} GB')}")
-
-        if preset:
-            recommendations, recommended_preset = get_recommended_parameters(device, total_words, cracked_hashes_count)
-            if preset == "recommend":
-                preset = recommended_preset
-            if preset in recommendations:
-                preset_config = recommendations[preset]
-                print(f"{blue('Using')} {cyan(preset_config['description'])}")
-                words_per_gpu_batch = preset_config['batch_size']
-                global_hash_map_bits = preset_config['global_bits']
-                cracked_hash_map_bits = preset_config['cracked_bits']
-            else:
-                print(f"{red('Unknown preset:')} {cyan(preset)}")
-                return
-
-        if words_per_gpu_batch is None or global_hash_map_bits is None or cracked_hash_map_bits is None:
-            words_per_gpu_batch, global_hash_map_bits, cracked_hash_map_bits = calculate_optimal_parameters_large_rules(
-                available_vram, total_words, cracked_hashes_count, total_rules)
-
-        GLOBAL_HASH_MAP_WORDS = 1 << (global_hash_map_bits - 5)
-        GLOBAL_HASH_MAP_MASK = (1 << (global_hash_map_bits - 5)) - 1
-        CRACKED_HASH_MAP_WORDS = 1 << (cracked_hash_map_bits - 5)
-        CRACKED_HASH_MAP_MASK = (1 << (cracked_hash_map_bits - 5)) - 1
-
-        KERNEL_SOURCE = get_kernel_source(global_hash_map_bits, cracked_hash_map_bits)
-        prg = cl.Program(context, KERNEL_SOURCE).build()
-        kernel_ranker = prg.ranker_kernel
-        kernel_init = prg.hash_map_init_kernel
-
+        scorer = IndependentRuleGpuScorer(
+            device_id=device_id,
+            words_capacity=sample_words,
+            max_rules=max_rules_dispatch,
+            cracked_hashes=cracked_hashes_np,
+        )
+        print(f"{green('GPU:')} {cyan(scorer.device.name.strip())}")
+        print(f"{blue('Platform:')} {cyan(scorer.platform.name.strip())}")
+        print(f"{blue('Independent scorer:')} {cyan(f'{scorer.max_rules} rules/dispatch group')} | "
+              f"{cyan(f'{scorer.rule_table_size:,} slots/rule')} | {cyan('FNV-1a-64')}")
     except Exception as e:
         print(f"{red('OpenCL initialization failed:')} {e}")
         return
 
-    # Load word batches
-    print(f"{blue('Loading wordlist...')}")
-    word_batches = []
-    word_iter = optimized_wordlist_iterator(wordlist_path, MAX_WORD_LEN, words_per_gpu_batch)
-    for words_np, hashes_np, cnt in word_iter:
-        word_batches.append((words_np, hashes_np, cnt))
-    total_word_batches = len(word_batches)
-    # Fixed missing closing quote below:
-    print(f"{green('Loaded')} {cyan(f'{total_word_batches}')} word batches")
-
-    # Pre‑encode rules into fixed‑length byte arrays for GPU
-    encoded_rules = [encode_rule_fixed(rule['rule_data'], rule['rule_id']) for rule in rules_list]
-
-    # Allocate GPU buffers
-    mf = cl.mem_flags
-    words_buffer_size = words_per_gpu_batch * MAX_WORD_LEN * np.uint8().itemsize
-    hashes_buffer_size = words_per_gpu_batch * np.uint32().itemsize
-    rules_buffer_size = MAX_RULES_IN_BATCH * MAX_RULE_LEN * np.uint8().itemsize
-    counters_size = MAX_RULES_IN_BATCH * np.uint32().itemsize
-    global_map_bytes = int(GLOBAL_HASH_MAP_WORDS) * 4  # BUG FIX: plain int avoids np.uint32 silent overflow on large maps
-    cracked_map_bytes = int(CRACKED_HASH_MAP_WORDS) * 4  # BUG FIX: same
-
-    try:
-        base_words_g = cl.Buffer(context, mf.READ_ONLY, words_buffer_size)
-        base_hashes_g = cl.Buffer(context, mf.READ_ONLY, hashes_buffer_size)
-        rules_g = cl.Buffer(context, mf.READ_ONLY, rules_buffer_size)
-        global_hash_map_g = cl.Buffer(context, mf.READ_WRITE, global_map_bytes)
-        cracked_hash_map_g = cl.Buffer(context, mf.READ_ONLY, cracked_map_bytes)
-        rule_uniqueness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-        rule_effectiveness_g = cl.Buffer(context, mf.READ_WRITE, counters_size)
-        # Pre-allocated indices buffer – reused every iteration to avoid per-iteration cl.Buffer allocation
-        indices_np = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-        indices_g  = cl.Buffer(context, mf.READ_ONLY, counters_size)
-        if cracked_hashes_np.size > 0:
-            cracked_temp_g = cl.Buffer(context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cracked_hashes_np)
-    except cl.MemoryError:
-        print(f"{red('GPU memory allocation failed')}")
-        return
-
-    # Populate cracked hash map
-    if cracked_hashes_np.size > 0:
-        print(f"{blue('Initialising cracked hash map...')}")
-        global_size_init = (int(math.ceil(cracked_hashes_np.size / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-        kernel_init(queue, global_size_init, (LOCAL_WORK_SIZE,),
-                    cracked_hash_map_g, cracked_temp_g,
-                    np.uint32(cracked_hashes_np.size), np.uint32(CRACKED_HASH_MAP_MASK)).wait()
-        print(f"{green('Cracked hash map ready')}")
-
-    # Main MAB loop
     words_processed_total = 0
     total_unique_found = 0
     total_cracked_found = 0
-    mapped_uniqueness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-    mapped_effectiveness = np.zeros(MAX_RULES_IN_BATCH, dtype=np.uint32)
-    # BUG FIX #6: pre-allocate rule-batch host buffers once and reuse them every
-    # iteration. Previously these were re-allocated with np.zeros(...) inside the
-    # hot loop (once per word batch, and again per sub-dispatch), which on large
-    # rule sets runs for thousands to millions of iterations. That caused constant
-    # allocation/free churn, unnecessary heap fragmentation, and rising memory
-    # usage over long runs. Matches the pattern already used for indices_g and
-    # for rules_batch_np in rank_rules_exhaustive.
-    rules_batch_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-    sub_rules_np = np.zeros((MAX_RULES_IN_BATCH, MAX_RULE_LEN), dtype=np.uint8)
-
-    # --- Progress bars: separate for screening and deep testing ---
-    # Each outer MAB iteration processes all word batches, and pbar.update(1) fires once
-    # per word-batch inside the inner loop – so multiply by total_word_batches.
-    total_screening_iters = int(math.ceil(total_rules * screening_trials / MAX_RULES_IN_BATCH)) * total_word_batches
-    screening_pbar = tqdm(total=total_screening_iters, desc="SCREEN Phase", unit="iter",
-                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                          position=0)
-
     iteration = 0
-    phase = "SCREENING"
-    screening_complete = False
-    deep_testing_complete = False
-    deep_pbar = None  # Will be created later
+    # Keep MAB progress on a single in-place terminal line.  Frequent
+    # per-trial prints flood some terminals/IDE consoles, while tqdm gives us
+    # elapsed time, ETA and throughput without spamming new lines.
+    progress_enabled = bool(sys.stderr.isatty() or sys.stdout.isatty())
 
-    while not interrupted and not deep_testing_complete:
-        if phase == "SCREENING":
-            # Check if all active rules have reached screening_trials
-            if rule_bandit.active_rules:
-                active_arr = rule_bandit._get_active_array()
-                min_trials = int(np.min(rule_bandit.trials[active_arr]))
-                if min_trials >= screening_trials:
-                    screening_complete = True
-                    phase = "DEEP_TESTING"
-                    screening_pbar.close()
-                    # Vectorised: compute remaining trials needed for each survivor
-                    remaining_trials = np.maximum(0, final_trials - rule_bandit.trials[active_arr])
-                    needed = int(np.sum(remaining_trials))
-                    if needed == 0:
-                        deep_testing_complete = True
-                        break
-                    total_deep_iters = int(math.ceil(needed / MAX_RULES_IN_BATCH)) * total_word_batches
-                    deep_pbar = tqdm(total=total_deep_iters, desc="DEEP Phase", unit="iter",
-                                     bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-                                     position=0)
-                    print(f"\n{green('SCREENING PHASE COMPLETE')}: {cyan(f'{len(rule_bandit.active_rules):,}')} survivors")
-                    print(f"{blue('Deep testing requires')} {cyan(f'{needed:,}')} {bold('additional trials')} ({cyan(f'{total_deep_iters}')} iterations)")
-                    continue
+    def _estimated_remaining_iterations():
+        active_arr = rule_bandit._get_active_array()
+        if len(active_arr) == 0:
+            return 0
+        remaining_rule_trials = int(np.maximum(
+            0, rule_bandit.final_trials - rule_bandit.trials[active_arr]
+        ).sum())
+        return int(math.ceil(remaining_rule_trials / max(MAX_RULES_IN_BATCH, 1)))
 
-        # Process a full pass through the wordlist
-        for word_batch_idx, (words_np, hashes_np, num_words) in enumerate(word_batches):
-            if interrupted:
-                break
+    initial_total = max(1, _estimated_remaining_iterations())
+    pbar = tqdm(
+        total=initial_total,
+        desc="MAB sampling",
+        unit="sample",
+        position=0,
+        leave=True,
+        dynamic_ncols=True,
+        mininterval=0.75,
+        smoothing=0.10,
+        file=sys.stderr,
+        disable=not progress_enabled,
+        bar_format=(
+            "{desc}: {n_fmt}/{total_fmt} {bar:30} "
+            "| {elapsed} | ETA {remaining} | {rate_fmt} | {postfix}"
+        ),
+    )
 
-            # Upload word batch
-            cl.enqueue_copy(queue, base_words_g, words_np)
-            cl.enqueue_copy(queue, base_hashes_g, hashes_np).wait()
-
-            # Initialise global hash map for this batch
-            cl.enqueue_fill_buffer(queue, global_hash_map_g, np.uint32(0), 0, global_map_bytes).wait()
-            global_size_init = (int(math.ceil(num_words / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
-            kernel_init(queue, global_size_init, (LOCAL_WORK_SIZE,),
-                        global_hash_map_g, base_hashes_g,
-                        np.uint32(num_words), np.uint32(GLOBAL_HASH_MAP_MASK)).wait()
-
-            # Select rules to test in this iteration
-            selected_indices = rule_bandit.select_rules(batch_size=MAX_RULES_IN_BATCH, iteration=iteration)
-            if not selected_indices:
-                # Fallback: select rules with lowest trials (vectorised)
-                fallback_arr = rule_bandit._get_active_array()
-                if len(fallback_arr) == 0:
-                    break
-                order = np.argsort(rule_bandit.trials[fallback_arr])
-                selected_indices = fallback_arr[order[:MAX_RULES_IN_BATCH]].tolist()
-            num_rules = len(selected_indices)
-
-            # Prepare rules buffer – vectorised row copy into the pre-allocated array
-            # (reused every iteration; BUG FIX #6, see allocation above the main loop)
-            rules_batch_np[:num_rules] = [encoded_rules[idx] for idx in selected_indices[:num_rules]]
-            rules_batch_np[num_rules:] = 0
-            sel_slice = selected_indices[:num_rules]
-
-            # Split the rules batch into sub-dispatches to avoid OUT_OF_RESOURCES.
-            # A single dispatch of (num_words * num_rules) work-items can exceed the
-            # GPU driver's per-submission limit or trigger the watchdog timer (TDR/DRM)
-            # when both dimensions are large (e.g. 150k words × 1024 rules = 153M items).
-            # MAX_DISPATCH_ITEMS is set at the top of this file and can be lowered if needed.
-            rules_per_sub = max(1, min(MAX_RULES_IN_BATCH,
-                                       MAX_DISPATCH_ITEMS // max(num_words, 1)))
-
-            # Accumulators across sub-batches (indexed by position in sel_slice)
-            u_arr = np.zeros(num_rules, dtype=np.int64)
-            e_arr = np.zeros(num_rules, dtype=np.int64)
-
-            for sub_start in range(0, num_rules, rules_per_sub):
-                sub_end = min(sub_start + rules_per_sub, num_rules)
-                sub_num = sub_end - sub_start
-
-                # Upload this slice of the pre-built rules array using the
-                # pre-allocated sub_rules_np (reused every sub-dispatch; BUG FIX #6)
-                sub_rules_np[:sub_num] = rules_batch_np[sub_start:sub_end]
-                sub_rules_np[sub_num:] = 0
-                cl.enqueue_copy(queue, rules_g, sub_rules_np).wait()
-
-                # Zero counters for this sub-batch (wait() required before kernel launch)
-                cl.enqueue_fill_buffer(queue, rule_uniqueness_g,   np.uint32(0), 0, counters_size).wait()
-                cl.enqueue_fill_buffer(queue, rule_effectiveness_g, np.uint32(0), 0, counters_size).wait()
-
-                # Map kernel slot 0..sub_num-1 to rule positions
-                indices_np[:sub_num] = np.arange(sub_num, dtype=np.uint32)
-                cl.enqueue_copy(queue, indices_g, indices_np).wait()
-
-                global_size_aligned = (int(math.ceil(num_words * sub_num / LOCAL_WORK_SIZE))
-                                       * LOCAL_WORK_SIZE,)
-                kernel_ranker(queue, global_size_aligned, (LOCAL_WORK_SIZE,),
-                              base_words_g, rules_g,
-                              indices_g,
-                              global_hash_map_g, cracked_hash_map_g,
-                              rule_uniqueness_g, rule_effectiveness_g,
-                              np.uint32(num_words), np.uint32(sub_num),
-                              np.uint32(MAX_WORD_LEN), np.uint32(MAX_OUTPUT_LEN)).wait()
-
-                cl.enqueue_copy(queue, mapped_uniqueness,   rule_uniqueness_g).wait()
-                cl.enqueue_copy(queue, mapped_effectiveness, rule_effectiveness_g).wait()
-
-                u_arr[sub_start:sub_end] = mapped_uniqueness[:sub_num].astype(np.int64)
-                e_arr[sub_start:sub_end] = mapped_effectiveness[:sub_num].astype(np.int64)
-
-            # Update MAB with the number of successes (effectiveness counts)
-            rule_bandit.update(selected_indices, e_arr[:num_rules].astype(np.uint32), num_words)
-            for i, idx in enumerate(sel_slice):
-                rule_bandit.all_rules[idx]['uniqueness_score']  += int(u_arr[i])
-                rule_bandit.all_rules[idx]['effectiveness_score'] += int(e_arr[i])
-                rule_bandit.all_rules[idx]['total_successes'] = rule_bandit.all_rules[idx].get('total_successes', 0) + int(e_arr[i])
-                rule_bandit.all_rules[idx]['total_trials']    = rule_bandit.all_rules[idx].get('total_trials', 0)    + num_words
-                rule_bandit.all_rules[idx]['times_tested']    = rule_bandit.all_rules[idx].get('times_tested', 0)    + 1
-            batch_unique  = int(np.sum(u_arr))
-            batch_cracked = int(np.sum(e_arr))
-
-            total_unique_found += batch_unique
-            total_cracked_found += batch_cracked
-            words_processed_total += num_words
-            update_progress_stats(words_processed_total, total_unique_found, total_cracked_found)
-
-            # Update progress bar
-            iteration += 1
-            stats = rule_bandit.get_statistics()
-            if phase == "SCREENING":
-                need = stats['rules_needing_screening']
-                screening_pbar.set_description(f"SCREEN | Active: {stats['active_rules']:,} | Need: {need:,} | Elim: {stats['eliminated_rules']:,}")
-                screening_pbar.update(1)
-            else:
-                need = stats['rules_needing_final']
-                if deep_pbar is not None:
-                    deep_pbar.set_description(f"DEEP   | Active: {stats['active_rules']:,} | Need: {need:,} | Elim: {stats['eliminated_rules']:,}")
-                    deep_pbar.update(1)
-
-            # Check for completion of deep testing
-            if phase == "DEEP_TESTING" and stats['rules_needing_final'] == 0:
-                deep_testing_complete = True
-                break
-
-        if deep_testing_complete:
+    while not interrupted and rule_bandit.active_rules:
+        selected_indices = rule_bandit.select_rules(batch_size=MAX_RULES_IN_BATCH, iteration=iteration)
+        if not selected_indices:
             break
 
-    if deep_pbar is not None:
-        deep_pbar.close()
-    else:
-        screening_pbar.close()
+        # One fresh sample is intentionally shared by all rules selected in
+        # this MAB iteration, making their trial observations comparable.
+        words_np, num_words = _read_stratified_word_sample(
+            wordlist_path, MAX_WORD_LEN, sample_words,
+            seed=(0x9E3779B9 + iteration * 0x85EBCA6B) & 0xFFFFFFFFFFFFFFFF,
+        )
+        if num_words == 0:
+            break
 
-    if interrupted:
-        print(f"\n{yellow('Processing interrupted, results saved.')}")
-        return
+        encoded_selected = encoded_rules[np.asarray(selected_indices, dtype=np.int32)]
+        u_arr, e_arr = scorer.score(words_np, encoded_selected)
+        rule_bandit.update(selected_indices, e_arr.astype(np.uint32), num_words)
 
-    # Final statistics and saving
-    end_time = time()
+        for i, idx in enumerate(selected_indices):
+            rule_bandit.all_rules[idx]['uniqueness_score'] = rule_bandit.all_rules[idx].get('uniqueness_score', 0) + int(u_arr[i])
+            rule_bandit.all_rules[idx]['effectiveness_score'] = rule_bandit.all_rules[idx].get('effectiveness_score', 0) + int(e_arr[i])
+            rule_bandit.all_rules[idx]['total_successes'] = rule_bandit.all_rules[idx].get('total_successes', 0) + int(e_arr[i])
+            rule_bandit.all_rules[idx]['total_trials'] = rule_bandit.all_rules[idx].get('total_trials', 0) + int(num_words)
+            rule_bandit.all_rules[idx]['times_tested'] = rule_bandit.all_rules[idx].get('times_tested', 0) + 1
+
+        total_unique_found += int(np.sum(u_arr))
+        total_cracked_found += int(np.sum(e_arr))
+        words_processed_total += int(num_words) * len(selected_indices)
+        pbar.update(1)
+
+        stats = rule_bandit.get_statistics()
+        # Re-estimate remaining work after eliminations. This keeps the ETA
+        # meaningful even when early elimination removes large rule batches.
+        estimated_remaining = _estimated_remaining_iterations()
+        pbar.total = max(pbar.n, pbar.n + estimated_remaining)
+        pbar.set_postfix_str(
+            f"active={stats['active_rules']:,} | "
+            f"screen={stats['rules_needing_screening']:,} | "
+            f"final={stats['rules_needing_final']:,} | "
+            f"elim={stats['eliminated_rules']:,} | sample={num_words:,}",
+            refresh=False,
+        )
+        iteration += 1
+
+        if stats['rules_needing_screening'] == 0 and stats['rules_needing_final'] == 0:
+            break
+
+    pbar.close()
+
     final_stats = rule_bandit.get_statistics()
-    top_rules = rule_bandit.get_top_rules(20)
-
-    print(f"\n{green('=' * 80)}")
-    print(f"{bold('MULTI-PASS MAB RANKING COMPLETE')}")
-    print(f"{green('=' * 80)}")
-    print(f"{blue('Total Words Processed:')} {cyan(f'{words_processed_total:,}')}")
-    print(f"{blue('Total Unique Words:')} {cyan(f'{total_unique_found:,}')}")
-    print(f"{blue('Total Cracks Found:')} {cyan(f'{total_cracked_found:,}')}")
-    print(f"{blue('Execution Time:')} {cyan(f'{end_time - start_time:.2f} s')}")
-    print(f"\n{blue('Early Elimination Summary:')}")
-    print("   " + blue('Original rules:')  + " " + cyan(f"{final_stats['total_rules']:,}"))
-    print("   " + blue('Surviving rules:') + " " + cyan(f"{final_stats['active_rules']:,}"))
-    print("   " + blue('Eliminated rules:') + " " + cyan(f"{final_stats['eliminated_rules']:,}") + f" ({final_stats['eliminated_percentage']:.1f}%)")
-    print(f"\n{blue('Top 10 Surviving Rules:')}")
-    for i, r in enumerate(top_rules[:10], 1):
-        print(f"   {blue(f'{i:2}.')} {cyan(r['rule_data']):30} success={r['success_probability']:.6f} trials={r['trials']:,}")
-
-    # Mark eliminated rules in the list
     for rule in rules_list:
         idx = rule['rule_id']
-        if idx in rule_bandit.eliminated_rules:
-            rule['eliminated'] = True
-            if rule_bandit.successes[idx] <= 1.0:
-                rule['eliminate_reason'] = 'zero_success'
-            else:
-                rule['eliminate_reason'] = 'low_success_rate'
-        else:
-            rule['eliminated'] = False
-        rule['mab_trials'] = rule_bandit.trials[idx]
-        rule['selections'] = rule_bandit.selection_count[idx]
-        rule['mab_success_prob'] = (rule_bandit.successes[idx] - 1) / ((rule_bandit.successes[idx] + rule_bandit.failures[idx] - 2) + 1e-9)
-        rule['combined_score'] = rule.get('effectiveness_score', 0) * 10 + rule.get('uniqueness_score', 0) + rule['mab_success_prob'] * 1000
+        rule['eliminated'] = idx in rule_bandit.eliminated_rules
+        rule['eliminate_reason'] = 'low_success_rate' if rule['eliminated'] else ''
+        rule['mab_trials'] = int(rule_bandit.trials[idx])
+        rule['selections'] = int(rule_bandit.selection_count[idx])
+        denom = (rule_bandit.successes[idx] + rule_bandit.failures[idx] - 2.0)
+        rule['mab_success_prob'] = float((rule_bandit.successes[idx] - 1.0) / denom) if denom > 0 else 0.0
+        rule['combined_score'] = (
+            rule.get('effectiveness_score', 0) * 10
+            + rule.get('uniqueness_score', 0)
+            + rule['mab_success_prob'] * 1000
+        )
 
-    # Save results
+    end_time = time()
+    print(f"\n{green('=' * 80)}")
+    print(f"{bold('SAMPLE-BASED MAB RANKING COMPLETE')}")
+    print(f"{green('=' * 80)}")
+    print(f"{blue('Rule-word evaluations:')} {cyan(f'{words_processed_total:,}')}")
+    print(f"{blue('Unique outputs counted:')} {cyan(f'{total_unique_found:,}')}")
+    print(f"{blue('Cracked outputs counted:')} {cyan(f'{total_cracked_found:,}')}")
+    print(f"{blue('Execution Time:')} {cyan(f'{end_time - start_time:.2f} s')}")
+    print(f"{blue('Surviving rules:')} {cyan(str(final_stats['active_rules']))}")
+    print(f"{blue('Eliminated rules:')} {cyan(str(final_stats['eliminated_rules']))} ({final_stats['eliminated_percentage']:.1f}%)")
+
     csv_path = save_ranking_data(rules_list, ranking_output_path, legacy=False)
     if top_k > 0 and csv_path:
-        optimized_path = os.path.splitext(ranking_output_path)[0] + "_optimized.rule"
-        save_top_k_rules(rules_list, optimized_path, top_k)
+        save_top_k_rules(rules_list, os.path.splitext(ranking_output_path)[0] + "_optimized.rule", top_k)
+
 
 # ====================================================================
 # --- MAIN ENTRY POINT ---
@@ -2640,7 +2482,8 @@ def build_arg_parser():
     # MAB options
     parser.add_argument('--mab-exploration', type=float, default=2.0, help='MAB exploration factor')
     parser.add_argument('--mab-final-trials', type=int, default=50, help='Final trials for survivors')
-    parser.add_argument('--mab-screening-trials', type=int, default=5, help='Trials before elimination')
+    parser.add_argument('--mab-screening-trials', type=int, default=5, help='Sample trials before elimination')
+    parser.add_argument('--mab-sample-words', type=int, default=8192, help='Words sampled from stratified wordlist slices per MAB trial')
     parser.add_argument('--mab-no-zero-eliminate', action='store_false', dest='mab_zero_success_elimination',
                         help='Disable zero‑success elimination')
 
@@ -2665,14 +2508,16 @@ def main(argv=None):
         sys.exit(0)
 
     print(f"{green('=' * 80)}")
-    print(f"{bold('HASHCAT RULE RANKER v5.2')}")
+    print(f"{bold('HASHCAT RULE RANKER v6.0')}")
     if args.legacy:
         print(f"{bold('LEGACY MODE (v3.2) – Exhaustive Ranking')}")
     else:
         print(f"{bold('MULTI-PASS MAB MODE – Early Elimination')}")
     print(f"{green('=' * 80)}")
-    print(f"{blue('GPU Rules:')} Full Hashcat rule set with {MAX_RULE_LEN}‑char support")
+    print(f"{blue('GPU Rules:')} Validated Hashcat-compatible subset with {MAX_RULE_LEN}‑char support")
+    print(f"{blue('Fingerprinting:')} FNV-1a-64 with independent per-rule open-addressing tables")
     print(f"{blue('Validation:')} Rules are filtered using rulest’s HashcatRuleValidator (banned ops excluded)")
+    print(f"{blue('MAB sampling:')} fresh stratified wordlist samples per trial")
     print(f"{blue('Interrupt:')} Ctrl+C saves progress")
     print(f"{green('=' * 80)}")
 
@@ -2704,7 +2549,8 @@ def main(argv=None):
             mab_exploration_factor=args.mab_exploration,
             mab_final_trials=args.mab_final_trials,
             mab_screening_trials=args.mab_screening_trials,
-            mab_zero_success_elimination=args.mab_zero_success_elimination
+            mab_zero_success_elimination=args.mab_zero_success_elimination,
+            mab_sample_words=args.mab_sample_words
         )
 
 

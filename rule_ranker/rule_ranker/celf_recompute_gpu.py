@@ -65,6 +65,8 @@ import numpy as np
 import pyopencl as cl
 from tqdm import tqdm
 
+from .hashing import build_open_addressing_table_uint64, table_size_for_count
+
 from .ranker_postprocess import (
     MAX_WORD_LEN, MAX_OUTPUT_LEN, MAX_RULE_LEN, LOCAL_WORK_SIZE,
     DEFAULT_WORDS_PER_GPU_BATCH, MAX_DISPATCH_ITEMS,
@@ -94,9 +96,9 @@ unsigned int char_to_pos(unsigned char c) {
     if (c >= 'a' && c <= 'z') return c - 'a' + 10;
     return 0xFFFFFFFF;
 }
-unsigned int fnv1a_hash_32(const unsigned char* data, unsigned int len) {
-    unsigned int hash = 2166136261U;
-    for (unsigned int i = 0; i < len; i++) { hash ^= data[i]; hash *= 16777619U; }
+ulong fnv1a_hash_64(const unsigned char* data, unsigned int len) {
+    ulong hash = 14695981039346656037UL;
+    for (unsigned int i = 0; i < len; i++) { hash ^= (ulong)data[i]; hash *= 1099511628211UL; }
     return hash;
 }
 // Return 0 on success, -2 on output-length overflow.
@@ -273,32 +275,33 @@ void apply_hashcat_rule(const unsigned char* word, int word_len,
     for (int i=0;i<in_len;i++) output[i]=in_buf[i];
     *changed = final_changed;
 }
-// Open-addressed hash table lookup.  The old implementation used a
-// binary search over the sorted cracked-hash array (O(log2(N)) random
-// global-memory reads for every word/rule pair).  On GPUs that random
-// memory traffic becomes the dominant cost once rule transforms are cheap.
-// The table is deliberately kept at <=50% load, so a lookup normally needs
-// only 1-2 probes.  `occupied` is separate because every uint32 hash value is
-// valid, including 0 and UINT_MAX.
-int lookup_cracked_slot(__global const unsigned int* hash_table,
+// Open-addressed lookup over 64-bit FNV-1a fingerprints. `occupied` is a
+// bitset indexed by table slot, so fingerprint 0 remains a valid key.
+ulong mix64(ulong x) {{
+    x += 0x9E3779B97F4A7C15UL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9UL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBUL;
+    return x ^ (x >> 31);
+}}
+
+int lookup_cracked_slot(__global const ulong* hash_table,
                         __global const unsigned int* occupied,
-                        unsigned int table_mask, unsigned int key) {
-    unsigned int slot = key * 2654435761U;
-    slot &= table_mask;
+                        unsigned int table_mask, ulong key) {{
+    unsigned int slot = (unsigned int)(mix64(key) & (ulong)table_mask);
     unsigned int word = slot >> 5;
     unsigned int bit = slot & 31U;
-    for (unsigned int probe = 0; probe <= table_mask; probe++) {
-        if (occupied[word] & (1U << bit)) {
+    for (unsigned int probe = 0; probe <= table_mask; probe++) {{
+        if (occupied[word] & (1U << bit)) {{
             if (hash_table[slot] == key) return (int)slot;
-        } else {
+        }} else {{
             return -1;
-        }
+        }}
         slot = (slot + 1U) & table_mask;
         word = slot >> 5;
         bit = slot & 31U;
-    }
+    }}
     return -1;
-}
+}}
 """
 
 
@@ -334,7 +337,7 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void score_against_active_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rules_in,
-    __global const unsigned int* hash_table,
+    __global const ulong* hash_table,
     __global const unsigned int* hash_table_occupied,
     __global const unsigned int* active,
     __global int* gains,
@@ -372,7 +375,7 @@ void score_against_active_kernel(
     apply_hashcat_rule(word, word_len, rule_str, rule_len, result_temp, &out_len, &changed);
     if (changed <= 0 || out_len <= 0) return;
 
-    unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
+    ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);
     int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
     if (slot < 0) return;
 
@@ -391,7 +394,7 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void apply_and_clear_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rule_in,
-    __global const unsigned int* hash_table,
+    __global const ulong* hash_table,
     __global const unsigned int* hash_table_occupied,
     __global unsigned int* active,
     __global int* cleared_count,
@@ -419,7 +422,7 @@ void apply_and_clear_kernel(
     apply_hashcat_rule(word, word_len, rule_str, (int)rule_len, result_temp, &out_len, &changed);
     if (changed <= 0 || out_len <= 0) return;
 
-    unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
+    ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);
     int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
     if (slot < 0) return;
 
@@ -443,7 +446,7 @@ __kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
 void score_single_and_record_kernel(
     __global const unsigned char* base_words_in,
     __global const unsigned char* rule_in,
-    __global const unsigned int* hash_table,
+    __global const ulong* hash_table,
     __global const unsigned int* hash_table_occupied,
     __global const unsigned int* active,
     __global unsigned int* hit_slots,
@@ -472,7 +475,7 @@ void score_single_and_record_kernel(
     apply_hashcat_rule(word, word_len, rule_str, (int)rule_len, result_temp, &out_len, &changed);
     if (changed <= 0 || out_len <= 0) return;
 
-    unsigned int h = fnv1a_hash_32(result_temp, (unsigned int)out_len);
+    ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);
     int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
     if (slot < 0) return;
 
@@ -678,85 +681,12 @@ class _ResidentWordlistMixin:
 
 
 def _build_open_addressing_table(cracked_hashes_sorted, hash_table_size, hash_table_mask):
-    """Vectorized (NumPy, all-CPU) construction of the open-addressing
-    hash table + occupied bitset uploaded to the GPU by _GpuScorer.
-
-    An earlier version of this built the table with a plain Python
-    `for h in ...: while occupied[...]: ...` loop -- correct, but pure
-    per-element Python/NumPy-scalar overhead, which is fine for
-    thousands of cracked entries but becomes the dominant one-time
-    startup cost at real hashcat-scale cracked lists (multi-million
-    entries; ~14M was observed taking tens of seconds in the loop
-    form, all of it before the GPU does any useful work).
-
-    This does the same linear-probing open-addressing insertion, but
-    processes all keys in parallel "waves" instead of one Python
-    `while` per key:
-      1. Compute every key's initial probe slot in one vectorized op.
-      2. Each wave: for every slot requested by more than one pending
-         key this wave, arbitrarily pick ONE winner (np.unique's first
-         occurrence) -- the others retry next wave. A winner is only
-         actually placed if its slot isn't already occupied (from an
-         earlier wave); if it is, it also retries next wave, slot+1.
-      3. Repeat until no keys are pending.
-
-    This still performs strictly sequential linear probing overall (no
-    key is placed further from its ideal slot than the loop version
-    would place SOME valid assignment), it just resolves an entire
-    wave's worth of non-conflicting placements per NumPy call instead
-    of one per Python-level loop iteration. Total wave count is
-    bounded by the longest probe chain any key needs (typically small
-    at the ~50% max load factor this table is sized for -- dozens of
-    waves even at 14M keys, each wave O(pending) vectorized NumPy work),
-    not by n_keys itself.
-
-    Insertion ORDER differs from the sequential-loop version (ties for
-    a slot within a wave are broken arbitrarily, not by original list
-    order), but this doesn't affect correctness: open addressing with
-    linear probing only requires that a key's insertion follow
-    contiguous forward probing from its hash slot with no gaps left
-    before its final resting slot, which every key here still does --
-    lookup (unchanged, still a GPU-side linear probe from the same
-    hash slot) finds exactly the same key regardless of where
-    colliding keys ended up relative to each other.
-
-    Returns (hash_table, occupied_words) in the exact same dtypes/
-    layout __init__ previously built directly: hash_table is
-    (hash_table_size,) uint32, occupied_words is
-    (ceil(hash_table_size/32),) uint32 with bit (slot & 31) of word
-    (slot >> 5) set for occupied slots -- i.e. bit-for-bit identical
-    format/convention to the original loop's output, verified against
-    it for correctness (see tests)."""
-    keys = np.asarray(cracked_hashes_sorted, dtype=np.uint32)
-    hash_table = np.zeros(hash_table_size, dtype=np.uint32)
-    occ_bool = np.zeros(hash_table_size, dtype=bool)
-
-    mask64 = np.uint64(hash_table_mask)
-    pend_keys = keys
-    pend_slot = ((keys.astype(np.uint64) * np.uint64(2654435761)) & mask64).astype(np.int64)
-
-    while pend_keys.size:
-        uniq_slots, first_pos = np.unique(pend_slot, return_index=True)
-        winner_mask = np.zeros(pend_keys.size, dtype=bool)
-        winner_mask[first_pos] = True
-
-        cand_slots = pend_slot[winner_mask]
-        cand_keys = pend_keys[winner_mask]
-        free_mask = ~occ_bool[cand_slots]
-        hash_table[cand_slots[free_mask]] = cand_keys[free_mask]
-        occ_bool[cand_slots[free_mask]] = True
-
-        placed_local = np.zeros(cand_slots.size, dtype=bool)
-        placed_local[free_mask] = True
-        retry_mask = ~winner_mask
-        winner_pos = np.nonzero(winner_mask)[0]
-        retry_mask[winner_pos[~placed_local]] = True
-
-        pend_keys = pend_keys[retry_mask]
-        pend_slot = (pend_slot[retry_mask] + 1) & hash_table_mask
-
-    occ_bytes = np.packbits(occ_bool, bitorder='little')
-    pad = (-len(occ_bytes)) % 4
+    """Build the uint64 cracked table plus compact active bitmap."""
+    hash_table, states = build_open_addressing_table_uint64(
+        np.asarray(cracked_hashes_sorted, dtype=np.uint64), int(hash_table_size))
+    occupied_bool = states == 2
+    occ_bytes = np.packbits(occupied_bool, bitorder='little')
+    pad = (-len(occ_bytes)) % np.dtype(np.uint32).itemsize
     if pad:
         occ_bytes = np.concatenate([occ_bytes, np.zeros(pad, dtype=np.uint8)])
     occupied_words = occ_bytes.view(np.uint32).copy()
@@ -815,7 +745,7 @@ class _GpuScorer(_ResidentWordlistMixin):
 
         mf = cl.mem_flags
         # Build a compact GPU open-addressing table.  `occupied` is a bitset
-        # rather than a sentinel value so all 2^32 FNV hashes remain valid.
+        # rather than a sentinel value so all 2^64 FNV-1a fingerprints remain valid.
         # Vectorized (NumPy, wave-based) rather than a per-key Python loop --
         # see _build_open_addressing_table()'s docstring; this is the
         # dominant startup cost at multi-million-entry cracked lists
