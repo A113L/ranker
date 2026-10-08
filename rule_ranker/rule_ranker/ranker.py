@@ -43,7 +43,6 @@ import argparse
 import csv
 import json
 import heapq
-from tqdm import tqdm
 import math
 import warnings
 import os
@@ -53,6 +52,8 @@ import signal
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+
+from .progress import ProgressBar
 
 from .hashing import (
     build_open_addressing_table_uint64,
@@ -562,9 +563,7 @@ def load_cracked_hashes(path, max_len):
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 pos = 0
                 file_size = len(mm)
-                with tqdm(total=file_size, unit='B', unit_scale=True, unit_divisor=1024,
-                          desc=cyan('Cracked list'), colour='cyan',
-                          bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                with ProgressBar(total=file_size, desc=cyan('Cracked list'), unit='B', min_interval=0.5) as pbar:
                     while pos < file_size:
                         end_pos = mm.find(b'\n', pos)
                         if end_pos == -1:
@@ -1841,8 +1840,8 @@ def _encode_rules_matrix(rules_list):
 
 
 def _write_progress_bytes(text):
-    """Write progress immediately, bypassing Python stdout buffering when possible."""
-    data = text.encode('utf-8', errors='replace')
+    """Compatibility writer used by the legacy progress tests/renderer."""
+    data = text.encode("utf-8", errors="replace")
     try:
         os.write(sys.stdout.fileno(), data)
     except (AttributeError, OSError, ValueError):
@@ -1850,112 +1849,24 @@ def _write_progress_bytes(text):
         sys.stdout.flush()
 
 
-class _LegacyProgress:
-    """Terminal/pipe-safe progress renderer for the legacy GPU pass.
+class _LegacyProgress(ProgressBar):
+    """Backward-compatible name backed by the unified ProgressBar."""
 
-    Unlike tqdm, this renderer does not depend on TTY detection and does not
-    rely on Python's normal stdout buffering. In a real terminal it redraws one
-    line; when stdout is piped/captured it emits throttled complete lines so
-    progress remains visible in IDEs, GUI launchers, log collectors, and pipes.
-    A lightweight heartbeat thread keeps elapsed/throughput information moving
-    even while one long OpenCL dispatch is still running.
-    """
+    def __init__(self, total, desc, unit, stream=None, interval=0.5, **kwargs):
+        super().__init__(
+            total=total,
+            desc=desc,
+            unit=unit,
+            stream=stream,
+            min_interval=interval,
+            **kwargs,
+        )
+        # Preserve the old test/diagnostic attribute name.
+        self._heartbeat = self._stop
 
-    def __init__(self, total, desc, unit, stream=None, interval=0.5):
-        self.total = max(1, int(total))
-        self.desc = str(desc)
-        self.unit = str(unit)
-        self.n = 0
-        self.postfix = ''
-        self.interval = max(0.25, float(interval))
-        self.start = time()
-        self.last_render = 0.0
-        self.closed = False
-        self._lock = threading.Lock()
-        self._tty = bool(getattr(stream or sys.stdout, 'isatty', lambda: False)())
-        self._heartbeat = threading.Event()
-        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._thread.start()
-        self.refresh(force=True)
+    def _write(self, text):
+        _write_progress_bytes(text)
 
-    def _heartbeat_loop(self):
-        while not self._heartbeat.wait(self.interval):
-            self.refresh()
-
-    @staticmethod
-    def _format_eta(seconds):
-        if seconds <= 0 or not math.isfinite(seconds):
-            return '--:--'
-        seconds = int(seconds)
-        hours, rem = divmod(seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
-
-    def refresh(self, force=False):
-        with self._lock:
-            if self.closed:
-                return
-            now = time()
-            if not force and (now - self.last_render) < self.interval:
-                return
-            self.last_render = now
-            elapsed = max(0.0, now - self.start)
-            rate = self.n / elapsed if elapsed > 0 else 0.0
-            fraction = min(1.0, max(0.0, self.n / self.total))
-            percent = fraction * 100.0
-            width = 30
-            filled = int(width * fraction)
-            bar = '#' * filled + '-' * (width - filled)
-            eta = (self.total - self.n) / rate if rate > 0 else 0.0
-            rate_text = f"{rate:,.1f} {self.unit}/s" if rate > 0 else f"-- {self.unit}/s"
-            postfix = f" | {self.postfix}" if self.postfix else ''
-            line = (
-                f"{self.desc} [{bar}] {percent:5.1f}% "
-                f"{self.n:,}/{self.total:,} | elapsed {self._format_eta(elapsed)} "
-                f"| ETA {self._format_eta(eta)} | {rate_text}{postfix}"
-            )
-            if self._tty:
-                _write_progress_bytes('\r' + line + '\x1b[K')
-            else:
-                # Complete lines are intentionally used for non-TTY output: CR-only
-                # updates are commonly hidden until process termination by GUI/IDE
-                # consoles, while a flushed line is observable immediately.
-                _write_progress_bytes(line + '\n')
-
-    def update(self, value, refresh=True):
-        with self._lock:
-            self.n += max(0, int(value))
-        if refresh:
-            self.refresh(force=True)
-
-    def set_total(self, total, refresh=True):
-        with self._lock:
-            self.total = max(1, int(total), self.n)
-        if refresh:
-            self.refresh(force=True)
-
-    def set_postfix_str(self, text, refresh=True):
-        with self._lock:
-            self.postfix = str(text)
-        if refresh:
-            self.refresh(force=True)
-
-    def close(self):
-        with self._lock:
-            if self.closed:
-                return
-            self.closed = True
-        self._heartbeat.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=max(0.5, self.interval * 2))
-        # Final frame is rendered before marking closed so the exact 100% line
-        # is present for normal completion.
-        if self.n >= self.total:
-            self.closed = False
-            self.refresh(force=True)
-            self.closed = True
-        if self._tty:
-            _write_progress_bytes('\n')
 
 
 # ====================================================================
@@ -1998,22 +1909,11 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
     total_dispatches = max(1, math.ceil(len(rules_list) / MAX_RULES_IN_BATCH))
     completed_dispatches = 0
 
-    # Do not rely on tqdm for legacy progress. Some GUI/IDE runners and
-    # subprocess wrappers do not render carriage-return progress until the
-    # child process exits. _LegacyProgress explicitly writes immediately and
-    # falls back to complete lines when stdout is not a TTY.
-    word_pbar = _LegacyProgress(
-        total=total_rule_words_estimate,
-        desc="LEGACY GPU",
-        unit="rule·word",
-        stream=sys.stdout,
-        interval=0.5,
-    )
-    word_pbar.set_postfix_str(
-        f"GPU init | words=0/{total_words:,} | rules=0/{len(rules_list):,} | batch={words_per_gpu_batch:,}",
-        refresh=True,
-    )
-
+    # GPU init (device/context/kernel setup) happens before any word is
+    # processed, so no bar is created yet - there's nothing to show progress
+    # of during init, and a bar sitting there during init just looks stalled.
+    # It's created right below, after init succeeds and there's real work to
+    # report.
     try:
         scorer = IndependentRuleGpuScorer(
             device_id=device_id,
@@ -2026,11 +1926,20 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         print(f"{blue('Independent scorer:')} {cyan(f'{scorer.max_rules} rules/dispatch group')} | "
               f"{cyan(f'{scorer.rule_table_size:,} slots/rule')} | {cyan('FNV-1a-64')}")
     except Exception as e:
-        word_pbar.set_postfix_str(f"OpenCL initialization failed: {e}", refresh=True)
-        word_pbar.close()
         print(f"{red('OpenCL initialization failed:')} {e}")
         return
 
+    # Do not rely on an external progress implementation for legacy progress. Some GUI/IDE runners and
+    # subprocess wrappers do not render carriage-return progress until the
+    # child process exits. _LegacyProgress explicitly writes immediately and
+    # falls back to complete lines when stdout is not a TTY.
+    word_pbar = _LegacyProgress(
+        total=total_rule_words_estimate,
+        desc="LEGACY GPU",
+        unit="rule·word",
+        stream=sys.stdout,
+        interval=0.5,
+    )
     word_pbar.set_postfix_str(
         f"GPU ready | words=0/{total_words:,} | rules=0/{len(rules_list):,} | batch={words_per_gpu_batch:,}",
         refresh=True,
@@ -2048,12 +1957,21 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         completed_dispatches += 1
 
         # The initial word count is an estimate. If the real file contains more
-        # words than estimated, grow the total rather than letting tqdm cap at
+        # words than estimated, grow the total rather than letting the renderer cap at
         # 100% before the job actually finishes.
         if processed_rule_words > word_pbar.total:
             word_pbar.set_total(processed_rule_words, refresh=False)
         word_pbar.update(dispatch_work, refresh=False)
-        completed_words = processed_words + (current_batch_words if end_rule >= total_rules_in_score else 0)
+        # A word in the current batch isn't "done" until every rule has been
+        # dispatched against it, but waiting for that to show any movement at
+        # all means `words=` sits at the previous batch's count for the
+        # entire batch - with the default batch size covering the whole
+        # wordlist in one batch, that looked permanently stuck at 0. Scale by
+        # how far through this batch's rules we are instead, so the figure
+        # climbs steadily and only reaches current_batch_words once the batch
+        # genuinely finishes.
+        batch_fraction = min(1.0, end_rule / total_rules_in_score) if total_rules_in_score else 1.0
+        completed_words = processed_words + int(current_batch_words * batch_fraction)
         word_pbar.set_postfix_str(
             f"GPU dispatch {completed_dispatches}/{total_dispatches} | "
             f"words={completed_words:,}/{total_words:,} | "
@@ -2577,26 +2495,19 @@ def rank_rules_mab(wordlist_path, rules_path, cracked_list_path, ranking_output_
     total_cracked_found = 0
     iteration = 0
     # Keep MAB progress on a single in-place terminal line.  Frequent
-    # per-trial prints flood some terminals/IDE consoles, while tqdm gives us
+    # per-trial prints flood some terminals/IDE consoles, while the shared renderer gives us
     # elapsed time, ETA and throughput without spamming new lines.
-    progress_enabled = bool(sys.stderr.isatty() or sys.stdout.isatty())
+    progress_enabled = True
 
     initial_total = max(1, _estimate_mab_remaining_iterations(rule_bandit))
-    pbar = tqdm(
+    pbar = ProgressBar(
         total=initial_total,
         desc="MAB sampling",
         unit="sample",
-        position=0,
-        leave=True,
-        dynamic_ncols=True,
-        mininterval=0.75,
-        smoothing=0.10,
-        file=sys.stderr,
-        disable=not progress_enabled,
-        bar_format=(
-            "{desc}: {n_fmt}/{total_fmt} {bar:30} "
-            "| {elapsed} | ETA {remaining} | {rate_fmt} | {postfix}"
-        ),
+        stream=sys.stdout,
+        min_interval=0.5,
+        enabled=progress_enabled,
+        heartbeat=True,
     )
 
     while not interrupted and rule_bandit.active_rules:

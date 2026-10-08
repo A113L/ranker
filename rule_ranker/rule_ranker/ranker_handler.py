@@ -30,7 +30,7 @@ import multiprocessing
 from functools import lru_cache
 import time
 from typing import List, Dict, Tuple, Set, Optional
-from tqdm import tqdm
+from .progress import ProgressBar
 
 # ====================================================================
 # --- OPTIMIZED RULE SUMMARY ANALYZER ---
@@ -112,7 +112,7 @@ def parse_ranking_file_fast(filepath: str, chunk_size: int = 10000, show_progres
             
             # Create progress bar if requested
             if show_progress:
-                pbar = tqdm(total=total_lines, 
+                pbar = ProgressBar(total=total_lines, 
                            desc=f"{cyan('File')} Reading {filename[:20]}",
                            unit=" lines",
                            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
@@ -202,7 +202,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     
     if show_progress:
         print(f"{blue('->')} {bold('Analyzing')} {cyan(fmt_num(total_rules_to_process))} {bold('rules...')}")
-        pbar = tqdm(total=total_rules_to_process, 
+        pbar = ProgressBar(total=total_rules_to_process, 
                    desc=f"{magenta('->')} Processing rules",
                    unit=" rules",
                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
@@ -254,7 +254,7 @@ def analyze_rules_fast(rules_data_list: List[List[Dict]], top_n: Optional[int] =
     # Extract top N rules using heap (O(n log k) instead of O(n log n))
     if show_progress:
         print(f"{blue('->')} {bold('Sorting and extracting top rules...')}")
-        sort_pbar = tqdm(total=total_rules, 
+        sort_pbar = ProgressBar(total=total_rules, 
                         desc=f"{yellow('->')} Sorting",
                         unit=" rules",
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
@@ -435,7 +435,7 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             print(f"{blue('Write')} {bold('Writing')} {cyan(fmt_num(len(top_rules)))} {bold('top rules...')}")
             chunk_size = 1000
             
-            with tqdm(total=len(top_rules), desc=f"{green('Write')} Writing rules", unit=" rules") as pbar:
+            with ProgressBar(total=len(top_rules), desc=f"{green('Write')} Writing rules", unit=" rules") as pbar:
                 for i in range(0, len(top_rules), chunk_size):
                     chunk = top_rules[i:i + chunk_size]
                     for j, rule in enumerate(chunk, i + 1):
@@ -459,7 +459,7 @@ def save_summary_fast(analysis_results: Dict, output_file: str, top_n: Optional[
             
             # Limit detailed view to first 100 rules
             detailed_limit = min(100, len(top_rules))
-            with tqdm(total=detailed_limit, desc=f"{yellow('Write')} Writing details", unit=" rules") as pbar:
+            with ProgressBar(total=detailed_limit, desc=f"{yellow('Write')} Writing details", unit=" rules") as pbar:
                 for i in range(detailed_limit):
                     rule = top_rules[i]
                     buffer.append(f"#{i + 1}: {rule['cleaned_rule']}\n")
@@ -514,7 +514,7 @@ def save_clean_rules_fast(analysis_results: Dict, output_file: str, top_n: Optio
             # IMPORTANT: Add the colon rule first (empty rule) as standard Hashcat practice
             buffer.append(":\n")
             
-            with tqdm(total=len(clean_rules_list), desc=f"{green('Write')} Writing clean rules", unit=" rules") as pbar:
+            with ProgressBar(total=len(clean_rules_list), desc=f"{green('Write')} Writing clean rules", unit=" rules") as pbar:
                 for clean_rule in clean_rules_list:
                     buffer.append(f"{clean_rule}\n")
                     
@@ -550,7 +550,7 @@ def save_clean_rules_with_scores_fast(analysis_results: Dict, output_file: str, 
             writer = csv.writer(f)
             writer.writerow(['Rank', 'Combined_Score', 'Effectiveness_Score', 'Uniqueness_Score', 'Rule_Data'])
             
-            with tqdm(total=len(rules_to_save), desc=f"{green('Write')} Writing rules with scores", unit=" rules") as pbar:
+            with ProgressBar(total=len(rules_to_save), desc=f"{green('Write')} Writing rules with scores", unit=" rules") as pbar:
                 for i, rule in enumerate(rules_to_save, 1):
                     writer.writerow([
                         rule.get('rank', i),

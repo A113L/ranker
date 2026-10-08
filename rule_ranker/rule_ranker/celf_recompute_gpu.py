@@ -63,7 +63,7 @@ import time
 
 import numpy as np
 import pyopencl as cl
-from tqdm import tqdm
+from .progress import ProgressBar
 
 from .hashing import build_open_addressing_table_uint64, table_size_for_count
 
@@ -1049,8 +1049,8 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     # upper bounds for every later round because coverage is monotone.
     upper_bound = np.zeros(n_rules, dtype=np.int64)
     total_batches = math.ceil(n_rules / rule_batch_size)
-    pbar = tqdm(total=total_batches, desc=cyan("Upper-bound pass (rule batches)"),
-                unit="batch", colour="cyan")
+    pbar = ProgressBar(total=total_batches, desc=cyan("Upper-bound pass (rule batches)"),
+                unit="batch")
     for start in range(0, n_rules, rule_batch_size):
         end = min(start + rule_batch_size, n_rules)
         idx_chunk = np.arange(start, end)
@@ -1085,8 +1085,8 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     total_rescored_rules = 0
     round_t0 = time.time()
 
-    pbar = tqdm(total=limit, desc=cyan("CELF greedy select [recompute-gpu+heap]"),
-                unit="rule", colour="cyan")
+    pbar = ProgressBar(total=limit, desc=cyan("CELF greedy select [recompute-gpu+heap]"),
+                unit="rule")
 
     # Round 1: top full-target bound is already exact; no rescoring needed.
     if candidate_heap and limit > 0:
