@@ -477,6 +477,13 @@ def main(argv=None):
     ap.add_argument('--print-output-len-estimate', action='store_true',
                     help="Print the recommended --max-output-len and exit without touching the GPU.")
     ap.add_argument('-d', '--device', type=int, default=None)
+    ap.add_argument('--cost-alpha', type=float, default=0.0,
+                    help="Cost-weighted CELF: heap priority becomes gain / "
+                         "max(1, token_count)**cost_alpha instead of raw "
+                         "gain, so a cheaper (shorter) rule is preferred "
+                         "over a pricier one at equal or near-equal "
+                         "marginal coverage. 0.0 (default) = equal-cost "
+                         "greedy, unchanged from before.")
     ap.add_argument('--strategy', choices=['recompute-gpu'], default='recompute-gpu',
                     help="Coverage/selection strategy. Only recompute-gpu is supported: no coverage matrix is materialized.")
     args = ap.parse_args(argv)
@@ -530,6 +537,7 @@ def main(argv=None):
         words_per_gpu_batch=args.words_batch_size,
         device_id=args.device,
         budget=run_budget,
+        cost_alpha=args.cost_alpha,
     )
 
     if budgets:

@@ -27,7 +27,9 @@ rounds is:
   - `upper_bound` : (n_rules,) int32 -- each rule's static full-target
     popcount, computed ONCE in a single streaming pass, accumulating one
     atomic counter per rule instead of writing a coverage row.
-  - `candidate_heap` : a heap of `(negative_upper_bound, rule_index)`
+  - `candidate_heap` : a heap of `(-priority, rule_index, raw_gain)`, where
+    priority is raw_gain/cost(rule) (cost is 1.0 for every rule unless
+    cost_alpha > 0 is passed, in which case this is cost-weighted CELF)
     entries for candidates with at least one hit. After a candidate is
     rescored, its exact marginal gain becomes a tighter heap bound. This
     keeps true lazy-greedy/CELF ordering without repeatedly scanning a
@@ -305,6 +307,35 @@ int lookup_cracked_slot(__global const ulong* hash_table,
 """
 
 
+def _rule_cost(rule, cost_alpha):
+    """Cost of a candidate rule used to normalize marginal gain into a
+    gain-per-cost priority (gain / cost) for the CELF heap.
+
+    cost_alpha <= 0 (default) means every rule costs 1.0 -- an ordinary
+    equal-cost greedy, identical to this module's previous behavior.
+    cost_alpha > 0 makes longer/more token-heavy rules progressively more
+    expensive, so the greedy prefers a cheaper rule over a pricier one
+    that covers the same (or only marginally more) of the active target
+    set -- mirrors rulest's `_rule_cost`/cost-weighted CELF.
+    """
+    if cost_alpha <= 0:
+        return 1.0
+    return max(1, len(rule.split())) ** float(cost_alpha)
+
+
+class _ConstantCosts:
+    """costs[index] == value for any index, without allocating a
+    len(rules) list -- used for the (default) cost_alpha<=0 case where
+    every rule's cost is the same 1.0."""
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __getitem__(self, _index):
+        return self.value
+
+
 def get_recompute_kernel_source(num_cracked, hash_table_size):
     """Two kernels sharing the same rule-transform/hash plumbing as the
     scorer's common kernel body; neither kernel writes per-rule coverage rows:
@@ -485,6 +516,79 @@ void score_single_and_record_kernel(
 
     int pos = atomic_add(hit_count, 1);
     hit_slots[pos] = (unsigned int)slot;
+}}
+
+// Multi-rule exact/deduplicated recording pass: like
+// score_single_and_record_kernel, but for a small BATCH of rules at
+// once (one kernel dispatch instead of one per candidate). Each rule
+// gets its own hit-count slot and its own fixed-capacity segment of
+// `hit_slots` (segment i = hit_slots[i*words_per_rule_cap .. +cap)).
+// words_per_rule_cap must be >= num_words so no rule's segment can
+// overflow (a rule hits at most one target per word, so at most
+// num_words hits per rule per chunk). This exists purely to amortize
+// GPU round-trip latency across several CELF candidates that each
+// need an exact (post-dedup) gain this round -- raw counts from
+// score_against_active_kernel are NOT safe to use here, same reason
+// as score_single_and_record_kernel: two different words landing on
+// the same still-active target must count once, not twice, and only
+// the host-side np.unique over each rule's recorded slot segment
+// (done by the Python caller) establishes that.
+__kernel __attribute__((reqd_work_group_size({LOCAL_WORK_SIZE}, 1, 1)))
+void score_exact_batch_kernel(
+    __global const unsigned char* base_words_in,
+    __global const unsigned char* rules_in,
+    __global const ulong* hash_table,
+    __global const unsigned int* hash_table_occupied,
+    __global const unsigned int* active,
+    __global unsigned int* hit_slots,
+    __global int* hit_counts,
+    const unsigned int num_words,
+    const unsigned int num_rules_in_batch,
+    const unsigned int words_per_rule_cap,
+    const unsigned int max_word_len,
+    const unsigned int table_mask)
+{{
+    unsigned int global_id = get_global_id(0);
+    unsigned int total = num_words * num_rules_in_batch;
+    if (global_id >= total) return;
+
+    unsigned int rule_idx = global_id / num_words;
+    unsigned int word_idx = global_id % num_words;
+
+    unsigned char word[MAX_WORD_LEN];
+    unsigned int word_len = 0;
+    for (unsigned int i = 0; i < max_word_len; i++) {{
+        unsigned char c = base_words_in[word_idx * max_word_len + i];
+        if (c == 0) break;
+        word[i] = c; word_len++;
+    }}
+
+    unsigned int rule_start = rule_idx * MAX_RULE_LEN;
+    unsigned char rule_str[MAX_RULE_LEN];
+    unsigned int rule_len = 0;
+    for (unsigned int i = 0; i < MAX_RULE_LEN; i++) {{
+        unsigned char c = rules_in[rule_start + i];
+        if (c == 0) break;
+        rule_str[i] = c; rule_len++;
+    }}
+
+    unsigned char result_temp[MAX_OUTPUT_LEN];
+    int out_len = 0, changed = 0;
+    apply_hashcat_rule(word, word_len, rule_str, rule_len, result_temp, &out_len, &changed);
+    if (changed <= 0 || out_len <= 0) return;
+
+    ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);
+    int slot = lookup_cracked_slot(hash_table, hash_table_occupied, table_mask, h);
+    if (slot < 0) return;
+
+    unsigned int word_pos = (unsigned int)slot >> 5;
+    unsigned int bit_pos = (unsigned int)slot & 31U;
+    if ((active[word_pos] & (1U << bit_pos)) == 0) return;  // already covered
+
+    int pos = atomic_add(&hit_counts[rule_idx], 1);
+    if ((unsigned int)pos < words_per_rule_cap) {{
+        hit_slots[rule_idx * words_per_rule_cap + (unsigned int)pos] = (unsigned int)slot;
+    }}
 }}
 
 // Clears a small, EXPLICIT list of previously-recorded hash-table
@@ -741,6 +845,7 @@ class _GpuScorer(_ResidentWordlistMixin):
         self.score_kernel = prg.score_against_active_kernel
         self.clear_kernel = prg.apply_and_clear_kernel
         self.record_kernel = prg.score_single_and_record_kernel
+        self.exact_batch_kernel = prg.score_exact_batch_kernel
         self.clear_recorded_kernel = prg.clear_recorded_slots_kernel
 
         mf = cl.mem_flags
@@ -800,6 +905,39 @@ class _GpuScorer(_ResidentWordlistMixin):
         self.hit_slots_g = cl.Buffer(self.context, mf.READ_WRITE,
                                       max(1, max_chunk_words) * np.uint32().itemsize)
         self.hit_count_g = cl.Buffer(self.context, mf.READ_WRITE, np.int32().itemsize)
+        # Reused host-side scratch for the single-candidate count readback
+        # (one per CELF round, 50k+ times for a typical run) -- avoids a
+        # fresh np.zeros(1) allocation on every call.
+        self._single_count_host = np.empty(1, dtype=np.int32)
+        # Micro-opt: _score_single_recording's hit_slots_g sub-region
+        # depends only on num_words, which is constant across calls in
+        # the (default) GPU-resident wordlist case -- cache it by
+        # num_words instead of calling get_sub_region() fresh on every
+        # one of the 50k+ seed_exact calls per run. Pure host-side
+        # object-creation overhead, not round-trip latency, so the
+        # expected win here is small (low single-digit %), not another
+        # big structural fix like the batching ones.
+        self._single_slots_region_cache = {}
+        # EXACT_BATCH_CAP candidates can be exact/deduplicated-scored in
+        # ONE score_exact_batch_kernel dispatch instead of one dispatch
+        # each -- each gets its own words_per_rule_cap-sized segment of
+        # exact_hit_slots_g, sized identically to hit_slots_g's single-rule
+        # capacity (a rule can't hit more targets than there are words in
+        # the chunk). This is purely a GPU round-trip-latency optimization:
+        # it amortizes dispatch overhead across several CELF candidates
+        # that each still need a true deduplicated gain this round;
+        # correctness/dedup happens exactly as in _score_single_recording,
+        # just for several rules' segments at once.
+        self.exact_batch_cap = max(1, int(os.environ.get('RANKER_EXACT_BATCH', '64')))
+        self._exact_words_per_rule_cap = max(1, max_chunk_words)
+        self.exact_hit_slots_g = cl.Buffer(
+            self.context, mf.READ_WRITE,
+            self._exact_words_per_rule_cap * self.exact_batch_cap * np.uint32().itemsize)
+        self.exact_hit_counts_g = cl.Buffer(
+            self.context, mf.READ_WRITE, self.exact_batch_cap * np.int32().itemsize)
+        # Reused host-side scratch for the counts readback in
+        # score_exact_batch -- avoids a fresh allocation on every call.
+        self._exact_counts_host = np.empty(self.exact_batch_cap, dtype=np.int32)
         # (rule_idx, slots ndarray) for the most recent SINGLE-rule
         # score_batch() call, if any -- consumed by apply_winner_and_clear()
         # when that same rule turns out to be the round's winner, and
@@ -910,11 +1048,13 @@ class _GpuScorer(_ResidentWordlistMixin):
         rule_len = int(self.rule_lens[rule_idx])
         cl.enqueue_copy(self.queue, self.single_rule_g,
                          np.ascontiguousarray(self.encoded[rule_idx]))
-        total_gain = 0
         slot_parts = []
         for words_g, num_words in self._iter_word_chunks(wordlist_path):
-            hit_slots_region_g = self.hit_slots_g.get_sub_region(
-                0, max(1, num_words) * np.uint32().itemsize)
+            hit_slots_region_g = self._single_slots_region_cache.get(num_words)
+            if hit_slots_region_g is None:
+                hit_slots_region_g = self.hit_slots_g.get_sub_region(
+                    0, max(1, num_words) * np.uint32().itemsize)
+                self._single_slots_region_cache[num_words] = hit_slots_region_g
             cl.enqueue_fill_buffer(self.queue, self.hit_count_g, np.int32(0), 0,
                                     np.int32().itemsize)
             global_size = (int(math.ceil(num_words / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
@@ -924,18 +1064,126 @@ class _GpuScorer(_ResidentWordlistMixin):
                                 hit_slots_region_g, self.hit_count_g,
                                 np.uint32(num_words), np.uint32(rule_len),
                                 np.uint32(MAX_WORD_LEN), np.uint32(self.hash_table_mask))
-            host_count = np.zeros(1, dtype=np.int32)
-            cl.enqueue_copy(self.queue, host_count, self.hit_count_g).wait()
-            cnt = int(host_count[0])
+            # The slots copy is unavoidably dependent on the count (we
+            # can't size/issue it before the kernel tells us how many
+            # hits there were), so this is a genuine 2-round-trip
+            # dependency chain, not an artifact of how the code is
+            # written. An earlier version of this comment claimed
+            # reading back a worst-case-sized (max_chunk_words) slots
+            # buffer unconditionally would collapse this to one round
+            # trip -- it does remove a .wait(), but at RANKER_EXACT_BATCH
+            # / large-chunk scale it traded a cheap latency wait for an
+            # expensive host-side np.zeros() allocation+memset AND a
+            # PCIe transfer sized to the chunk instead of to the actual
+            # (usually much smaller) hit count, which measured SLOWER
+            # end-to-end. Reverted: read the count, then copy exactly
+            # `cnt` elements into a reused (not freshly allocated) host
+            # buffer, so the only recurring per-call cost is the two
+            # waits plus a transfer proportional to real data.
+            cl.enqueue_copy(self.queue, self._single_count_host, self.hit_count_g).wait()
+            cnt = int(self._single_count_host[0])
             if cnt:
-                host_slots = np.zeros(cnt, dtype=np.uint32)
+                host_slots = np.empty(cnt, dtype=np.uint32)
                 cl.enqueue_copy(self.queue, host_slots,
-                                 self.hit_slots_g.get_sub_region(
+                                 hit_slots_region_g.get_sub_region(
                                      0, cnt * np.uint32().itemsize)).wait()
                 slot_parts.append(host_slots)
-            total_gain += cnt
-        slots = np.concatenate(slot_parts) if slot_parts else np.zeros(0, dtype=np.uint32)
+        # DEDUPLICATE across the whole wordlist before this becomes the
+        # round's "exact" gain. Two different base words can both produce
+        # the same cracked output under one rule (e.g. two words that
+        # collapse to the same string after a truncate/lowercase rule, or
+        # simply two independent words that happen to equal the same
+        # cracked password); each is a separate recorded hit but they
+        # cover the SAME target. Counting them separately -- as the raw
+        # per-chunk `cnt` used to -- inflates the candidate's gain above
+        # its true marginal coverage, exactly the gap rulest's
+        # `_celf_select_from_upper_bounds` docstring calls out: only a
+        # deduplicated score may ever decide a round's winner. The old
+        # code here (and the batch score_against_active_kernel path
+        # callers must not treat as exact) counted raw hits, which is why
+        # a rule that happened to re-cover already-picked ground many
+        # times over could out-rank a rule with genuinely higher unique
+        # coverage.
+        slots = (np.unique(np.concatenate(slot_parts)) if slot_parts
+                 else np.zeros(0, dtype=np.uint32))
+        total_gain = int(slots.shape[0])
         return total_gain, slots
+
+    def score_exact_batch(self, rule_indices, wordlist_path):
+        """Exact (deduplicated) gains for up to self.exact_batch_cap rules
+        at once, in one GPU dispatch per wordlist chunk rather than one
+        dispatch per rule. Returns a dict rule_idx -> (gain, slots), where
+        `slots` is that rule's deduplicated hit-slot array (same shape/use
+        as _score_single_recording's return, so it can feed the same
+        apply_winner_and_clear() fast path if this rule goes on to win).
+
+        Chunked exactly like _score_single_recording: hit_counts is reset
+        every chunk and per-rule segments are deduplicated and
+        concatenated across chunks before the final np.unique.
+        """
+        n = len(rule_indices)
+        if n == 0:
+            return {}
+        if n > self.exact_batch_cap:
+            raise ValueError(
+                f"score_exact_batch got {n} rules, exceeds exact_batch_cap={self.exact_batch_cap}")
+        cap = self._exact_words_per_rule_cap
+        rules_batch_np = np.ascontiguousarray(self.encoded[np.asarray(rule_indices, dtype=np.int64)])
+        rules_region_g = self.rules_g.get_sub_region(0, n * MAX_RULE_LEN)
+        cl.enqueue_copy(self.queue, rules_region_g, rules_batch_np)
+
+        slot_parts = {int(ridx): [] for ridx in rule_indices}
+        counts_region_g = self.exact_hit_counts_g.get_sub_region(0, n * np.int32().itemsize)
+        if self._exact_counts_host is None or self._exact_counts_host.shape[0] < n:
+            self._exact_counts_host = np.empty(self.exact_batch_cap, dtype=np.int32)
+        host_counts = self._exact_counts_host[:n]
+        for words_g, num_words in self._iter_word_chunks(wordlist_path):
+            cl.enqueue_fill_buffer(self.queue, counts_region_g, np.int32(0), 0,
+                                    n * np.int32().itemsize)
+            global_size = (int(math.ceil(num_words * n / LOCAL_WORK_SIZE)) * LOCAL_WORK_SIZE,)
+            self.exact_batch_kernel(self.queue, global_size, (LOCAL_WORK_SIZE,),
+                                     words_g, rules_region_g, self.hash_table_g,
+                                     self.hash_table_occupied_g, self.active_g,
+                                     self.exact_hit_slots_g, counts_region_g,
+                                     np.uint32(num_words), np.uint32(n),
+                                     np.uint32(cap), np.uint32(MAX_WORD_LEN),
+                                     np.uint32(self.hash_table_mask))
+            # Must know each rule's count before its slots copy can be
+            # sized, so this first readback is a hard dependency -- one
+            # wait, unavoidable.
+            cl.enqueue_copy(self.queue, host_counts, counts_region_g).wait()
+            # But the per-rule slots copies that follow do NOT depend on
+            # each other, only on this same count readback -- so issue
+            # all of them back-to-back on the in-order queue WITHOUT an
+            # intermediate .wait() each (that per-candidate blocking is
+            # what made this call latency-dominated: up to exact_batch_cap
+            # serialized round trips), then block ONCE for all of them
+            # together. Each copy is still sized to that rule's true cnt,
+            # never to the cap -- unlike reading back the whole n*cap
+            # region unconditionally, this keeps the transferred bytes
+            # proportional to real data regardless of how large
+            # exact_batch_cap is tuned.
+            pending = []
+            for local_i, ridx in enumerate(rule_indices):
+                cnt = min(int(host_counts[local_i]), cap)  # capped segment, see kernel comment
+                if cnt:
+                    seg_g = self.exact_hit_slots_g.get_sub_region(
+                        (local_i * cap) * np.uint32().itemsize, cnt * np.uint32().itemsize)
+                    buf = np.empty(cnt, dtype=np.uint32)
+                    evt = cl.enqueue_copy(self.queue, buf, seg_g)
+                    pending.append((ridx, buf, evt))
+            if pending:
+                cl.wait_for_events([evt for _, _, evt in pending])
+                for ridx, buf, _ in pending:
+                    slot_parts[int(ridx)].append(buf)
+
+        out = {}
+        for ridx in rule_indices:
+            ridx = int(ridx)
+            parts = slot_parts[ridx]
+            slots = np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.uint32)
+            out[ridx] = (int(slots.shape[0]), slots)
+        return out
 
     def apply_winner_and_clear(self, rule_idx, rule_str, wordlist_path):
         """Runs the winning rule once against the wordlist, clearing
@@ -1001,7 +1249,7 @@ class _GpuScorer(_ResidentWordlistMixin):
 
 def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
                                rule_batch_size, words_per_gpu_batch,
-                               device_id=None, budget=None):
+                               device_id=None, budget=None, cost_alpha=0.0):
     """Lazy-greedy max-coverage selection using a batched CELF heap.
 
     The previous implementation kept a fixed array sorted by the original
@@ -1016,9 +1264,36 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     exact winner. This preserves the CELF lazy-greedy invariant and the
     original deterministic tie-break: smaller rule index wins equal gain.
 
+    cost_alpha enables cost-weighted CELF (ported from rulest's
+    `_celf_select_from_upper_bounds`): the heap is ordered by
+    gain / cost(rule) instead of raw gain, where cost(rule) grows with
+    token count as max(1, len(rule.split())) ** cost_alpha. With the
+    default cost_alpha=0.0 every rule costs 1.0 and this is byte-for-byte
+    the old equal-cost greedy -- selection order and output are unchanged.
+    With cost_alpha > 0, a cheaper rule that covers the same (or only
+    marginally more) of the active target set is preferred over a pricier
+    one, which is the one capability the old equal-cost greedy had no way
+    to express at all.
+
     RANKER_GREEDY_RESCORE_BATCH controls speculative contenders rescored
-    together after the first candidate (default 32). Smaller values reduce
-    speculative work; larger values reduce kernel-launch overhead.
+    together after the first candidate (default 128, raised from an
+    earlier default of 32 after profiling on an RTX 3060 Ti showed no
+    VRAM or correctness regression at this size -- see
+    RANKER_EXACT_BATCH below for the matching exact-resolve default).
+    Smaller values reduce speculative work; larger values reduce
+    kernel-launch overhead.
+
+    RANKER_EXACT_BATCH (read in _GpuScorer.__init__) controls how many
+    lazily-promoted candidates get resolved to an exact, deduplicated
+    gain in one GPU dispatch (default 64, raised from 8). This only
+    costs extra VRAM in exact_hit_slots_g, sized
+    max_chunk_words * RANKER_EXACT_BATCH * 4 bytes -- for a ~130k-word
+    resident chunk that's roughly 32 MB at 64 versus 4 MB at 8, trivial
+    next to the cracked-hash table (which dominates VRAM use and scales
+    with the cracked list size, not with either of these two knobs).
+    Both defaults can still be overridden via their environment
+    variables for memory-constrained GPUs or very different
+    candidate-pool/wordlist sizes.
     """
     import heapq
 
@@ -1041,9 +1316,43 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
         encoded[i, :len(rb)] = np.frombuffer(rb, dtype=np.uint8)
         rule_lens[i] = len(rb)
 
+    t_scorer0 = time.time()
     scorer = _GpuScorer(encoded, len(cracked_hashes_sorted), cracked_hashes_sorted,
                          rule_batch_size, words_per_gpu_batch, device_id,
                          wordlist_path=wordlist_path, rule_lens=rule_lens)
+    t_scorer_init = time.time() - t_scorer0
+
+    # --- Profiling (RANKER_GREEDY_PROFILE=1) -----------------------------
+    # Per-stage {count, total_seconds} so a tuning pass can see WHERE the
+    # time actually goes -- GPU-dispatch latency (many small round-trips),
+    # kernel compute time against a big resident wordlist, or Python/heap
+    # overhead -- instead of guessing from the overall rules/s figure.
+    # Overhead when disabled is one bool check per call site.
+    profiling = os.environ.get('RANKER_GREEDY_PROFILE', '0') == '1'
+    prof = {} if profiling else None
+    resolve_batch_sizes = [] if profiling else None
+
+    def _prof(name, dt, n=1):
+        if prof is None:
+            return
+        c, t = prof.get(name, (0, 0.0))
+        prof[name] = (c + n, t + dt)
+
+    class _Timed:
+        __slots__ = ('name', 'n', 't0')
+        def __init__(self, name, n=1):
+            self.name = name
+            self.n = n
+        def __enter__(self):
+            if profiling:
+                self.t0 = time.time()
+            return self
+        def __exit__(self, *exc):
+            if profiling:
+                _prof(self.name, time.time() - self.t0, self.n)
+
+    if profiling:
+        log(f"{dim(f'[CELF profile] scorer init (hash table + wordlist preload): {t_scorer_init:.2f}s')}")
 
     # Pass 1: exact score against the full target set. These values are valid
     # upper bounds for every later round because coverage is monotone.
@@ -1054,15 +1363,29 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     for start in range(0, n_rules, rule_batch_size):
         end = min(start + rule_batch_size, n_rules)
         idx_chunk = np.arange(start, end)
-        upper_bound[start:end] = scorer.score_batch(idx_chunk, wordlist_path)
+        with _Timed("upper_bound_pass", n=end - start):
+            upper_bound[start:end] = scorer.score_batch(idx_chunk, wordlist_path)
         pbar.update(1)
     pbar.close()
 
-    # Max-heap by upper bound; smaller rule index wins ties naturally because
-    # heap entries are (-gain, rule_index). A candidate's exact gain replaces
-    # its older, looser bound after it is rescored.
+    # costs[index] is read every round by priority()/push(), including for
+    # rules that start out with bound=0 and never enter the heap, so it has
+    # to stay a full-length, O(1)-indexable sequence either way -- but it
+    # skips all per-rule Python work in the (default) cost_alpha<=0 case,
+    # where cost is always 1.0 and priority == raw gain.
+    if cost_alpha <= 0:
+        costs = _ConstantCosts(1.0)
+    else:
+        costs = [_rule_cost(r, cost_alpha) for r in rules]
+
+    # Max-heap by gain/cost priority; smaller rule index wins ties naturally
+    # because heap entries are (-priority, rule_index, raw_gain). A
+    # candidate's exact gain replaces its older, looser bound after it is
+    # rescored. The raw gain is carried alongside the priority so winner
+    # bookkeeping (cleared counts, apply_winner_and_clear) always deals in
+    # true coverage counts, never in cost-normalized scores.
     candidate_heap = [
-        (-int(upper_bound[i]), int(i))
+        (-int(upper_bound[i]) / costs[i], int(i), int(upper_bound[i]))
         for i in range(n_rules)
         if upper_bound[i] > 0
     ]
@@ -1073,7 +1396,7 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     limit = budget if budget else n_active
     greedy_rescore_batch = max(
         1,
-        int(os.environ.get('RANKER_GREEDY_RESCORE_BATCH', '32')),
+        int(os.environ.get('RANKER_GREEDY_RESCORE_BATCH', '128')),
     )
     greedy_rescore_batch = min(
         greedy_rescore_batch,
@@ -1088,100 +1411,157 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
     pbar = ProgressBar(total=limit, desc=cyan("CELF greedy select [recompute-gpu+heap]"),
                 unit="rule")
 
-    # Round 1: top full-target bound is already exact; no rescoring needed.
-    if candidate_heap and limit > 0:
-        _neg_gain, best_idx = heapq.heappop(candidate_heap)
-        true_cleared = scorer.apply_winner_and_clear(
-            best_idx, rules[best_idx], wordlist_path)
-        selected.append((rules[best_idx], true_cleared))
-        round_num = 1
-        n_active -= 1
-        pbar.update(1)
-        round_elapsed = time.time() - round_t0
-        round_t0 = time.time()
-        pbar.set_postfix({
-            "round": round_num,
-            "gpu_dispatches": 1,
-            "rescored": 0,
-            "heap": n_active,
-            "s/round": f"{round_elapsed:.1f}",
-        })
+    def _can_beat(bound, idx, cur_priority, cur_idx):
+        p = bound / costs[idx]
+        return p > cur_priority or (p == cur_priority and idx < cur_idx)
+
+    has_exact_batch = hasattr(scorer, 'score_exact_batch')
+    exact_resolve_cap = max(1, int(getattr(scorer, 'exact_batch_cap', 1)))
 
     while len(selected) < limit and candidate_heap:
         round_num += 1
         dispatches_this_pick = 0
         rescored_this_pick = 0
 
-        # Seed this round with one exact evaluation. The scorer's singleton
-        # path also records hit slots, allowing an in-place clear if this
-        # candidate wins the round without another wordlist pass.
-        _neg_bound, seed_idx = heapq.heappop(candidate_heap)
-        seed_gain = int(scorer.score_batch(
-            np.asarray([seed_idx], dtype=np.int64), wordlist_path)[0])
+        # Seed this round with one EXACT (deduplicated) evaluation -- never
+        # trust the pass-1 upper_bound or a batch-tightened bound as the
+        # round winner outright, even for round 1 and even for the heap's
+        # current top: score_against_active_kernel (used for the upper-bound
+        # pass and for multi-rule batch rescoring below) counts every
+        # (word, rule) hit on an active target, so it can overcount a
+        # candidate whose rule maps several different words onto the same
+        # still-uncovered cracked password. Only _score_single_recording's
+        # deduplicated slot set -- what score_batch() of length 1 now
+        # returns -- is trustworthy as an exact gain. This mirrors rulest's
+        # `_celf_select_from_upper_bounds`, which never lets a batch bound
+        # pick a winner either; it only ever tightens the heap.
+        _neg_priority, seed_idx, _bound = heapq.heappop(candidate_heap)
+        seed_idx = int(seed_idx)
+        with _Timed("seed_exact"):
+            seed_gain = int(scorer.score_batch(
+                np.asarray([seed_idx], dtype=np.int64), wordlist_path)[0])
         dispatches_this_pick += 1
         rescored_this_pick += 1
         total_rescored_rules += 1
 
-        best_idx = int(seed_idx)
+        best_idx = seed_idx
         best_gain = seed_gain
+        best_priority = best_gain / costs[best_idx]
+        # Indices whose heap entry is currently a batch-tightened bound,
+        # not yet an exact score -- they must be singly exact-scored before
+        # they are allowed to beat/replace best_idx this round.
+        fresh_this_round = set()
 
         while candidate_heap:
-            top_bound = int(-candidate_heap[0][0])
+            top_bound = int(candidate_heap[0][2])
             top_idx = int(candidate_heap[0][1])
-            # No unseen candidate can beat the exact winner. For equal gain,
-            # only a smaller original index could replace it.
-            if top_bound < best_gain or (
-                top_bound == best_gain and top_idx >= best_idx
-            ):
+            # No unseen candidate can beat the exact winner's priority. For
+            # equal priority, only a smaller original index could replace it.
+            if not _can_beat(top_bound, top_idx, best_priority, best_idx):
                 break
+
+            if top_idx in fresh_this_round:
+                # This candidate's heap entry is a batch bound, not an
+                # exact score yet. Gather a small group of fresh
+                # contenders that still beat the current best and resolve
+                # them in ONE dedup-exact dispatch (score_exact_batch)
+                # instead of one GPU round-trip per candidate -- the
+                # per-candidate version of this is what made round
+                # latency dominate after the correctness fix (every
+                # promoted candidate used to cost a full wordlist-pass
+                # round-trip on its own). Correctness is unchanged: each
+                # resolved candidate still gets a true deduplicated gain
+                # before it is allowed to contend for the win, same as a
+                # single score_batch([idx]) call would give.
+                resolve_batch = []
+                while candidate_heap and len(resolve_batch) < exact_resolve_cap:
+                    top_bound = int(candidate_heap[0][2])
+                    top_idx = int(candidate_heap[0][1])
+                    if top_idx not in fresh_this_round:
+                        break
+                    if not _can_beat(top_bound, top_idx, best_priority, best_idx):
+                        break
+                    heapq.heappop(candidate_heap)
+                    fresh_this_round.discard(top_idx)
+                    resolve_batch.append(top_idx)
+                if not resolve_batch:
+                    continue
+                if profiling:
+                    resolve_batch_sizes.append(len(resolve_batch))
+
+                if has_exact_batch:
+                    with _Timed("fresh_resolve_exact_batch", n=len(resolve_batch)):
+                        exact = scorer.score_exact_batch(resolve_batch, wordlist_path)
+                    dispatches_this_pick += 1
+                else:
+                    # Fallback for scorers without score_exact_batch (e.g.
+                    # the pure-Python test fake, which is already exact
+                    # per-call and not GPU-latency bound).
+                    exact = {}
+                    with _Timed("fresh_resolve_fallback", n=len(resolve_batch)):
+                        for ridx in resolve_batch:
+                            g = int(scorer.score_batch(
+                                np.asarray([ridx], dtype=np.int64), wordlist_path)[0])
+                            exact[ridx] = (g, None)
+                    dispatches_this_pick += len(resolve_batch)
+                rescored_this_pick += len(resolve_batch)
+                total_rescored_rules += len(resolve_batch)
+
+                for ridx in resolve_batch:
+                    gain, slots = exact[ridx]
+                    priority = gain / costs[ridx]
+                    if priority > best_priority or (
+                        priority == best_priority and ridx < best_idx
+                    ):
+                        if best_gain > 0:
+                            heapq.heappush(
+                                candidate_heap, (-best_priority, best_idx, best_gain))
+                        best_idx, best_gain, best_priority = ridx, gain, priority
+                        if slots is not None:
+                            scorer._last_single_hits = (ridx, slots)
+                    elif gain > 0:
+                        heapq.heappush(candidate_heap, (-priority, ridx, gain))
+                continue
 
             batch = []
             while candidate_heap and len(batch) < greedy_rescore_batch:
-                top_bound = int(-candidate_heap[0][0])
+                top_bound = int(candidate_heap[0][2])
                 top_idx = int(candidate_heap[0][1])
-                if top_bound < best_gain or (
-                    top_bound == best_gain and top_idx >= best_idx
-                ):
+                if not _can_beat(top_bound, top_idx, best_priority, best_idx):
+                    break
+                if top_idx in fresh_this_round:
                     break
                 heapq.heappop(candidate_heap)
                 batch.append(top_idx)
 
             if not batch:
-                break
+                continue
 
-            gains = scorer.score_batch(
-                np.asarray(batch, dtype=np.int64), wordlist_path)
+            # score_against_active_kernel's raw per-rule counts: admissible
+            # (never smaller than true marginal gain) but possibly inflated
+            # by duplicate word->target hits, so these only TIGHTEN each
+            # candidate's bound -- they never get compared against
+            # best_priority directly, and never replace best_idx.
+            with _Timed("batch_tighten", n=len(batch)):
+                gains = scorer.score_batch(
+                    np.asarray(batch, dtype=np.int64), wordlist_path)
             dispatches_this_pick += 1
             rescored_this_pick += len(batch)
             total_rescored_rules += len(batch)
 
-            old_best_idx = best_idx
-            old_best_gain = best_gain
             for local_i, ridx in enumerate(batch):
+                ridx = int(ridx)
                 gain = int(gains[local_i])
-                if gain > best_gain or (
-                    gain == best_gain and int(ridx) < best_idx
-                ):
-                    best_gain = gain
-                    best_idx = int(ridx)
-
-            # Every exact-but-not-winning contender remains in the heap with
-            # its tighter bound. Zero-gain candidates are dropped permanently.
-            for local_i, ridx in enumerate(batch):
-                gain = int(gains[local_i])
-                if int(ridx) != best_idx and gain > 0:
-                    heapq.heappush(candidate_heap, (-gain, int(ridx)))
-
-            # If a batch candidate displaced the seed, return the seed's exact
-            # gain to the heap rather than losing it.
-            if old_best_idx != best_idx and old_best_gain > 0:
-                heapq.heappush(candidate_heap, (-old_best_gain, int(old_best_idx)))
+                if gain > 0:
+                    heapq.heappush(candidate_heap, (-gain / costs[ridx], ridx, gain))
+                    fresh_this_round.add(ridx)
 
         if best_gain <= 0:
             break
 
-        true_cleared = scorer.apply_winner_and_clear(
-            best_idx, rules[best_idx], wordlist_path)
+        with _Timed("apply_winner_and_clear"):
+            true_cleared = scorer.apply_winner_and_clear(
+                best_idx, rules[best_idx], wordlist_path)
         selected.append((rules[best_idx], true_cleared))
         n_active -= 1
 
@@ -1200,10 +1580,59 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
 
     remaining = scorer.remaining_active_count()
     total_covered = len(cracked_hashes_sorted) - remaining
-    if os.environ.get('RANKER_GREEDY_PROFILE', '0') == '1':
+    if profiling:
         log(f"{blue('Greedy profile:')} {cyan(f'{total_rescored_rules:,}')} "
             f"candidate rescoring(s) after the initial pass; "
-            f"rescore_batch={cyan(str(greedy_rescore_batch))}.")
+            f"rescore_batch={cyan(str(greedy_rescore_batch))}, "
+            f"exact_batch_cap={cyan(str(exact_resolve_cap))}.")
+
+        total_time = sum(t for _, t in prof.values())
+        log(f"{blue('--- CELF stage breakdown (RANKER_GREEDY_PROFILE) ---')}")
+        for name in ("upper_bound_pass", "seed_exact", "fresh_resolve_exact_batch",
+                     "fresh_resolve_fallback", "batch_tighten", "apply_winner_and_clear"):
+            if name not in prof:
+                continue
+            count, secs = prof[name]
+            pct = (secs / total_time * 100) if total_time else 0.0
+            avg_ms = (secs / count * 1000) if count else 0.0
+            log(f"  {cyan(name):<32} calls={count:>7,}  total={secs:>7.1f}s "
+                f"({pct:4.1f}%)  avg={avg_ms:7.2f}ms/call")
+        log(f"  {cyan('TOTAL (instrumented)'):<32} {dim(f'{total_time:.1f}s')}")
+
+        if resolve_batch_sizes:
+            sizes = np.asarray(resolve_batch_sizes)
+            at_cap = int((sizes >= exact_resolve_cap).sum())
+            resolve_msg = (
+                f"[CELF profile] fresh-resolve batches: n={len(sizes):,}, "
+                f"mean size={sizes.mean():.1f}, at cap={at_cap:,}/{len(sizes):,}"
+            )
+            log(dim(resolve_msg))
+            if len(sizes) and at_cap / len(sizes) > 0.3:
+                hint_msg = (
+                    "[CELF profile] >30% of fresh-resolve batches hit exact_batch_cap -- "
+                    f"try a higher RANKER_EXACT_BATCH (currently {exact_resolve_cap}) "
+                    "to cut dispatch count further."
+                )
+                log(yellow(hint_msg))
+            elif len(sizes) and sizes.mean() < max(2, exact_resolve_cap / 4):
+                hint_msg = (
+                    "[CELF profile] fresh-resolve batches are small relative to "
+                    "exact_batch_cap -- GPU round-trip latency is likely not the "
+                    "bottleneck here; look at batch_tighten/upper_bound_pass instead."
+                )
+                log(dim(hint_msg))
+
+        if "batch_tighten" in prof and "fresh_resolve_exact_batch" in prof:
+            bt_count, bt_secs = prof["batch_tighten"]
+            fr_count, fr_secs = prof["fresh_resolve_exact_batch"]
+            if bt_count and fr_count:
+                bt_ms = bt_secs / bt_count * 1000
+                fr_ms = fr_secs / fr_count * 1000
+                profile_msg = (
+                    f"[CELF profile] avg batch_tighten dispatch: {bt_ms:.2f}ms/candidate vs "
+                    f"avg fresh_resolve_exact_batch dispatch: {fr_ms:.2f}ms/candidate"
+                )
+                log(dim(profile_msg))
 
     log(f"{green('Done.')} {bold('Selected')} {cyan(f'{len(selected):,}')} {bold('rules,')} "
         f"{bold('covering')} {cyan(f'{total_covered:,}')}/{cyan(f'{len(cracked_hashes_sorted):,}')} "

@@ -1906,14 +1906,13 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
     processed_rule_words = 0
     processed_words = 0
     total_rule_words_estimate = max(1, int(total_words)) * len(rules_list)
-    total_dispatches = max(1, math.ceil(len(rules_list) / MAX_RULES_IN_BATCH))
     completed_dispatches = 0
 
-    # GPU init (device/context/kernel setup) happens before any word is
-    # processed, so no bar is created yet - there's nothing to show progress
-    # of during init, and a bar sitting there during init just looks stalled.
-    # It's created right below, after init succeeds and there's real work to
-    # report.
+    # Do not create a progress bar while OpenCL is initializing. A visible 0%
+    # task bar during context/program setup looks frozen and is not useful.
+    print(f"{blue('GPU initialization:')} {cyan('starting...')}")
+
+    word_pbar = None
     try:
         scorer = IndependentRuleGpuScorer(
             device_id=device_id,
@@ -1929,20 +1928,17 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         print(f"{red('OpenCL initialization failed:')} {e}")
         return
 
-    # Do not rely on an external progress implementation for legacy progress. Some GUI/IDE runners and
-    # subprocess wrappers do not render carriage-return progress until the
-    # child process exits. _LegacyProgress explicitly writes immediately and
-    # falls back to complete lines when stdout is not a TTY.
+    # Use the actual GPU rule capacity when reporting dispatch progress.
+    total_dispatches = max(1, math.ceil(len(rules_list) / max(1, int(scorer.max_rules))))
+
+    # The unified progress bar starts only after GPU initialization is fully
+    # complete. This keeps initialization output separate from task progress.
     word_pbar = _LegacyProgress(
         total=total_rule_words_estimate,
         desc="LEGACY GPU",
         unit="rule·word",
         stream=sys.stdout,
         interval=0.5,
-    )
-    word_pbar.set_postfix_str(
-        f"GPU ready | words=0/{total_words:,} | rules=0/{len(rules_list):,} | batch={words_per_gpu_batch:,}",
-        refresh=True,
     )
     current_batch_words = 0
 
@@ -1962,19 +1958,13 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
         if processed_rule_words > word_pbar.total:
             word_pbar.set_total(processed_rule_words, refresh=False)
         word_pbar.update(dispatch_work, refresh=False)
-        # A word in the current batch isn't "done" until every rule has been
-        # dispatched against it, but waiting for that to show any movement at
-        # all means `words=` sits at the previous batch's count for the
-        # entire batch - with the default batch size covering the whole
-        # wordlist in one batch, that looked permanently stuck at 0. Scale by
-        # how far through this batch's rules we are instead, so the figure
-        # climbs steadily and only reaches current_batch_words once the batch
-        # genuinely finishes.
-        batch_fraction = min(1.0, end_rule / total_rules_in_score) if total_rules_in_score else 1.0
-        completed_words = processed_words + int(current_batch_words * batch_fraction)
+        # The current word batch is already being processed once the first
+        # rule chunk completes. Show it as in-flight instead of leaving
+        # words=processed_words at 0 for the entire multi-dispatch batch.
+        in_flight_words = min(total_words, processed_words + current_batch_words)
         word_pbar.set_postfix_str(
             f"GPU dispatch {completed_dispatches}/{total_dispatches} | "
-            f"words={completed_words:,}/{total_words:,} | "
+            f"words={in_flight_words:,}/{total_words:,} | "
             f"rules={end_rule:,}/{total_rules_in_score:,} | batch={current_batch_words:,}",
             refresh=True,
         )
@@ -2001,8 +1991,9 @@ def rank_rules_exhaustive(wordlist_path, rules_path, cracked_list_path, ranking_
             current_batch_words = int(num_words)
             # Refresh before the first GPU dispatch so the user immediately sees
             # that this batch has started, even when a dispatch takes a long time.
+            in_flight_words = min(total_words, processed_words + current_batch_words)
             word_pbar.set_postfix_str(
-                f"words={processed_words:,}/{total_words:,} | "
+                f"words={in_flight_words:,}/{total_words:,} | "
                 f"rules=0/{len(rules_list):,} | batch={current_batch_words:,} | GPU dispatch",
                 refresh=True,
             )
