@@ -53,7 +53,8 @@ class _FakeScorer:
         return len(self.active)
 
 
-def _run(monkeypatch, rules, coverage, cracked_size, budget=None, rule_batch_size=2):
+def _run(monkeypatch, rules, coverage, cracked_size, budget=None, rule_batch_size=2,
+         cost_alpha=0.0):
     fake = _FakeScorer(rules, coverage, cracked_size)
     monkeypatch.setattr(crg, "_GpuScorer", lambda *a, **k: fake)
     encoded_unused = np.zeros((len(rules), 4), dtype=np.uint8)  # _GpuScorer ctor args are ignored by the fake
@@ -61,7 +62,7 @@ def _run(monkeypatch, rules, coverage, cracked_size, budget=None, rule_batch_siz
     selected = crg.celf_select_recompute_gpu(
         rules, wordlist_path="unused.txt", cracked_hashes_sorted=cracked_hashes_sorted,
         rule_batch_size=rule_batch_size, words_per_gpu_batch=1000,
-        device_id=None, budget=budget,
+        device_id=None, budget=budget, cost_alpha=cost_alpha,
     )
     return selected, fake
 
@@ -129,20 +130,20 @@ class TestGreedyRoundLogic:
         assert [r for r, _g in selected] == ["a"]
         assert fake.remaining_active_count() == 0
 
-    def test_round_one_never_dispatches_a_gpu_rescore(self, monkeypatch):
-        # Round 1's pick is read directly off the already-computed
-        # upper_bound array (see the block comment in
-        # celf_select_recompute_gpu): the first score_batch() call, if
-        # any, should only happen in round 2 onward.
+    def test_round_one_is_exact_scored_not_read_off_the_raw_bound(self, monkeypatch):
+        # Round 1 must NOT trust the pass-1 upper_bound as an exact score:
+        # that bound comes from the raw (possibly duplicate-inflated)
+        # counting kernel, so even the first pick gets one singleton
+        # rescore before it is accepted as the round's winner -- the same
+        # exact-vs-bound separation rulest's _celf_select_from_upper_bounds
+        # enforces. Calls: 1 for the upper-bound pass, 1 singleton
+        # exact-score for round 1's pick ("a"), 1 singleton exact-score for
+        # round 2's pick ("b") -- three score_batch calls total.
         rules = ["a", "b"]
         coverage = {"a": {0, 1}, "b": {2}}
         selected, fake = _run(monkeypatch, rules, coverage, cracked_size=3)
         assert [r for r, _g in selected] == ["a", "b"]
-        # One call for the upper-bound pass, one for round 2's
-        # revalidation of "b" -- round 1 itself must contribute zero
-        # (its pick comes straight from the already-computed
-        # upper_bound array, no rescore needed).
-        assert fake.score_batch_calls == 2
+        assert fake.score_batch_calls == 3
 
     def test_ties_broken_by_lower_original_index(self, monkeypatch):
         rules = ["first", "second"]
@@ -260,7 +261,7 @@ def test_opencl_source_keeps_fnv1a64_as_uint64_before_lookup():
     # CELF uses FNV-1a-64. Truncating the kernel result to uint32 makes
     # every lookup effectively search for the low 32 bits in a uint64 table,
     # which can turn a valid cracked universe into zero hits.
-    assert src.count('ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);') == 3
+    assert src.count('ulong h = fnv1a_hash_64(result_temp, (unsigned int)out_len);') == 4
     assert src.count('unsigned int h = fnv1a_hash_64(result_temp, (unsigned int)out_len);') == 0
 
 
@@ -299,3 +300,52 @@ def test_opencl_source_contains_empty_rotate_guard_and_overflow_abort():
     assert 'if (in_len*2>MAX_OUTPUT_LEN) return -2;' in src
     assert 'if (in_len+1>MAX_OUTPUT_LEN) return -2;' in src
     assert 'if (result < 0)' in src
+
+
+class TestCostWeightedCelf:
+    """cost_alpha ported from rulest's `_celf_select_from_upper_bounds`:
+    heap priority becomes gain / cost(rule) instead of raw gain, where
+    cost(rule) = max(1, token_count) ** cost_alpha."""
+
+    def test_default_cost_alpha_is_unchanged_equal_cost_greedy(self, monkeypatch):
+        rules = ["a", "b", "c"]
+        coverage = {"a": {0, 1, 2}, "b": {2, 3}, "c": {4}}
+        selected, _fake = _run(monkeypatch, rules, coverage, cracked_size=5, budget=2,
+                                cost_alpha=0.0)
+        picked = [r for r, _g in selected]
+        assert picked == ["a", "b"]
+        assert [g for _r, g in selected] == [3, 1]
+
+    def test_cost_alpha_prefers_cheaper_rule_at_equal_gain(self, monkeypatch):
+        # "short rule" and "much longer four word rule" cover the same 2
+        # hashes -- equal raw gain, so the equal-cost greedy (cost_alpha=0)
+        # falls back to the deterministic tie-break (lower original index),
+        # picking whichever rule happens to come first in the candidate
+        # list regardless of length.
+        rules = ["much longer four word rule", "short rule"]
+        coverage = {
+            "much longer four word rule": {0, 1},
+            "short rule": {0, 1},
+        }
+        selected_equal_cost, _ = _run(monkeypatch, rules, coverage, cracked_size=2,
+                                       budget=1, cost_alpha=0.0)
+        assert selected_equal_cost[0][0] == "much longer four word rule"
+
+        # With cost_alpha > 0, the 2-token rule is cheaper than the 5-token
+        # one, so gain/cost ranks it higher even though it comes second in
+        # `rules` -- this is the one thing the old equal-cost greedy could
+        # not express at all.
+        selected_cost_weighted, _ = _run(monkeypatch, rules, coverage, cracked_size=2,
+                                          budget=1, cost_alpha=1.0)
+        assert selected_cost_weighted[0][0] == "short rule"
+
+    def test_cost_alpha_does_not_change_raw_gain_bookkeeping(self, monkeypatch):
+        # Reported/returned gains must stay true coverage counts, never
+        # cost-normalized scores, no matter what cost_alpha is.
+        rules = ["one two three four five", "x"]
+        coverage = {"one two three four five": {0, 1, 2}, "x": {0, 1, 2}}
+        selected, fake = _run(monkeypatch, rules, coverage, cracked_size=3, budget=1,
+                               cost_alpha=2.0)
+        assert selected[0][0] == "x"
+        assert selected[0][1] == 3  # raw gain, not gain/cost
+        assert fake.remaining_active_count() == 0
