@@ -1306,8 +1306,7 @@ def celf_select_recompute_gpu(rules, wordlist_path, cracked_hashes_sorted,
 
     n_rules = len(rules)
     log(f"{blue('Recompute-GPU greedy select:')} {cyan(f'{n_rules:,}')} {bold('candidates,')} "
-        f"{cyan(f'{len(cracked_hashes_sorted):,}')} {bold('cracked universe')} "
-        f"-- {green('no coverage matrix allocated (RAM or disk)')}")
+        f"{cyan(f'{len(cracked_hashes_sorted):,}')} {bold('cracked universe')}")
 
     encoded = np.zeros((n_rules, MAX_RULE_LEN), dtype=np.uint8)
     rule_lens = np.zeros(n_rules, dtype=np.uint32)
