@@ -161,7 +161,9 @@ Every rule is applied to every word in the wordlist. The implementation still us
 
 The lazy-greedy selector (`celf_recompute_gpu.py`) keeps candidates in a max-heap by upper bound, stored as a min-heap of `(-upper_bound, rule_index)` pairs via `heapq`. Each round pops the current best bound and re-scores it exactly on the GPU; if no remaining bound can beat that exact gain, the round ends immediately without touching the rest of the heap — that's the "lazy" part. Otherwise a small batch of next-best bounds is popped and re-scored together, losers are pushed back with their now-exact gain as a tighter bound, and zero-gain candidates are dropped for good. Ties go to the smaller rule index. This replaces an older flat-array approach that needed more full rescans per round as the uncovered-target set shrank — the heap always surfaces just the most promising unresolved candidate instead.
 
-A smaller heap is also used when loading candidates from a ranking CSV (`ranker_postprocess.py`): with `--candidates` set, rows are streamed and only the current top-C by `Combined_Score` are kept in a bounded heap, so the full CSV never has to sit in memory.
+Picking the best k rules to maximize password coverage is Maximum Coverage — NP-hard in general. But coverage gain is submodular: each new rule helps less than the last, since it overlaps with rules already picked. That structure guarantees a greedy selection gets within 63% (1 − 1/e) of optimal — not a workaround for P≠NP, just proof you don’t need the exact optimum to get a result indistinguishable from it in practice.
+
+CELF exploits that same submodularity to make greedy fast: gains only shrink as more rules get picked, so a heap keeps rules sorted by marginal gain and lazily re-evaluates only the top candidate instead of rescoring everything each round — 10–700× faster than naive greedy, same 1−1/e guarantee.
 
 ### Memory model
 
